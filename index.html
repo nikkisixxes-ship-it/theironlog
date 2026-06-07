@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>IRON LOG</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+</head>
+<body>
+
+<!-- AUTH SCREEN -->
+<div id="auth-screen" style="display:none">
+  <div class="auth-box">
+    <div class="auth-title">IRON LOG</div>
+    <div class="auth-sub">TRACK · PROGRESS · DOMINATE</div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="auth-tab-login" onclick="switchAuthTab('login')">Login</button>
+      <button class="auth-tab" id="auth-tab-register" onclick="switchAuthTab('register')">Register</button>
+    </div>
+    <div class="form-group"><label>Email</label><input type="email" id="auth-email" placeholder="you@email.com" autocomplete="email"></div>
+    <div class="form-group"><label>Password</label><input type="password" id="auth-password" placeholder="Password" autocomplete="current-password"></div>
+    <div class="auth-err" id="auth-err"></div>
+    <button class="btn btn-primary" style="width:100%;margin-top:8px;font-size:17px;padding:14px" id="auth-submit-btn" onclick="authSubmit()">Login</button>
+    <div style="text-align:center;margin-top:14px"><span style="font-size:14px;color:var(--text3);cursor:pointer" onclick="authForgot()">Forgot password?</span></div>
+  </div>
+</div>
+
+<!-- LOADING SCREEN -->
+<div id="loading-screen">
+  <div style="font-family:'Barlow Condensed',sans-serif;font-size:42px;font-weight:900;color:var(--accent);letter-spacing:0.06em">IRON LOG</div>
+  <div style="margin-top:8px;color:var(--text3);font-size:15px;letter-spacing:0.04em">SYNCING DATA...</div>
+  <div class="load-spinner"></div>
+</div>
+
+<!-- MAIN APP -->
+<div id="app">
+  <div id="main">
+
+    <!-- TRAIN PAGE -->
+    <div class="page active" id="page-home">
+      <div class="page-header">
+        <div class="page-title">IRON <span>LOG</span></div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div class="unit-toggle">
+            <button class="unit-btn active" id="unit-lbs" onclick="setUnit('lbs')">LBS</button>
+            <button class="unit-btn" id="unit-kg" onclick="setUnit('kg')">KG</button>
+          </div>
+          <button class="btn-icon" onclick="openSettingsModal()" title="Settings" style="padding:7px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          </button>
+          <button class="btn-icon" onclick="signOut()" title="Sign Out" style="padding:7px">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="active-bar" onclick="goToActiveWorkout()">
+        <span id="active-bar-label">▶ Workout in progress</span>
+        <span id="active-bar-time">0:00</span>
+      </div>
+      <div style="padding:12px 16px 14px;display:flex;gap:10px">
+        <button class="btn btn-primary" style="flex:1" onclick="startNewWorkout()">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          New Workout
+        </button>
+        <button class="btn btn-secondary" style="flex:1" onclick="openProgramPickerModal()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          Programmed
+        </button>
+      </div>
+      <div class="section-label">Recent Workouts</div>
+      <div id="home-recent"></div>
+    </div>
+
+    <!-- WORKOUT LOGGER PAGE -->
+    <div class="page" id="page-log">
+      <div class="log-header">
+        <div class="log-session-name" id="log-session-name-display">NEW WORKOUT</div>
+        <div class="log-timer-pill" id="log-timer-display">0:00</div>
+        <button class="log-menu-btn" onclick="openLogHeaderMenu(event)">•••</button>
+      </div>
+      <div class="log-content">
+        <div id="workout-exercises"></div>
+        <div class="log-actions">
+          <button class="btn log-actions btn-add-exercise" onclick="openAddExerciseModal()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            Add Exercise
+          </button>
+          <button class="btn log-actions btn-finish" onclick="finishWorkout()">Finish Workout</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- HISTORY PAGE -->
+    <div class="page" id="page-history">
+      <div class="page-header">
+        <div class="page-title">History</div>
+        <button class="btn btn-secondary btn-sm" onclick="openImportExportModal()">Import / Export</button>
+      </div>
+      <div class="stat-grid" id="history-stats" style="margin-top:4px"></div>
+      <div id="history-list"></div>
+    </div>
+
+    <!-- EXERCISES PAGE -->
+    <div class="page" id="page-db">
+      <div class="page-header">
+        <div class="page-title">Exercises</div>
+        <button class="btn btn-primary btn-sm" onclick="openCustomExerciseModal(null)">+ Custom</button>
+      </div>
+      <div class="search-wrap">
+        <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="db-search" placeholder="Search exercises..." oninput="renderDB()">
+      </div>
+      <div class="tabs" id="db-tabs"></div>
+      <div style="padding:0 16px 10px">
+        <select id="db-sort" onchange="renderDB()" style="font-size:14px;padding:8px 11px">
+          <option value="alpha">A – Z</option>
+          <option value="recent">Recently Used</option>
+        </select>
+      </div>
+      <div id="db-list"></div>
+    </div>
+
+    <!-- PROGRAMS PAGE -->
+    <div class="page" id="page-programs">
+      <div class="page-header">
+        <div class="page-title">Programs</div>
+        <button class="btn btn-primary btn-sm" onclick="openNewProgramModal()">+ New</button>
+      </div>
+      <div id="programs-list"></div>
+    </div>
+
+  </div><!-- /#main -->
+
+  <nav id="nav">
+    <button class="nav-btn active" onclick="showPage('page-home')" data-page="page-home">
+      <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="10" y="12.5" width="8" height="3" rx="1.5" fill="currentColor"/><rect x="7.5" y="11.5" width="2.5" height="5" rx="1" fill="currentColor"/><rect x="3" y="9.5" width="4.5" height="9" rx="1.5" fill="currentColor"/><rect x="18" y="11.5" width="2.5" height="5" rx="1" fill="currentColor"/><rect x="20.5" y="9.5" width="4.5" height="9" rx="1.5" fill="currentColor"/></svg>
+      Train
+    </button>
+    <button class="nav-btn" onclick="showPage('page-history')" data-page="page-history">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="12 8 12 12 14 14"/><path d="M3.05 11a9 9 0 1 0 .5-4"/><polyline points="3 3 3 7 7 7"/></svg>
+      History
+    </button>
+    <button class="nav-btn" onclick="showPage('page-db')" data-page="page-db">
+      <svg viewBox="0 0 28 28" fill="none" stroke="currentColor" stroke-width="1.5" xmlns="http://www.w3.org/2000/svg"><circle cx="14" cy="4.5" r="2.5" fill="currentColor" stroke="none"/><line x1="4" y1="9.5" x2="24" y2="9.5" stroke-width="2" stroke-linecap="round"/><rect x="1.5" y="6" width="2.5" height="7" rx="1" fill="currentColor" stroke="none"/><rect x="24" y="6" width="2.5" height="7" rx="1" fill="currentColor" stroke="none"/><line x1="14" y1="10" x2="6" y2="9.5" stroke-linecap="round"/><line x1="14" y1="10" x2="22" y2="9.5" stroke-linecap="round"/><line x1="14" y1="10" x2="14" y2="18" stroke-linecap="round"/><line x1="14" y1="18" x2="10" y2="26" stroke-linecap="round"/><line x1="14" y1="18" x2="18" y2="26" stroke-linecap="round"/></svg>
+      Exercises
+    </button>
+    <button class="nav-btn" onclick="showPage('page-programs')" data-page="page-programs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+      Programs
+    </button>
+  </nav>
+</div><!-- /#app -->
+
+<!-- DROPDOWN -->
+<div id="dropdown-backdrop" onclick="closeDropdown()"></div>
+<div id="dropdown-menu" class="dropdown-menu" style="display:none"></div>
+
+<!-- ADD EXERCISE MODAL -->
+<div class="modal-overlay" id="modal-add-exercise">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Add Exercise</div><button class="btn-icon" onclick="closeModal('modal-add-exercise')">✕</button></div>
+    <div style="position:relative;margin-bottom:12px">
+      <svg style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input type="text" id="modal-ex-search" placeholder="Search exercises..." style="padding-left:40px" oninput="renderModalExList()">
+    </div>
+    <div class="tabs" id="modal-ex-tabs" style="padding:0 0 12px;flex-wrap:wrap;gap:6px"></div>
+    <div id="modal-ex-list" style="max-height:45vh;overflow-y:auto"></div>
+    <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:8px">
+      <button class="btn btn-ghost" style="width:100%" onclick="openCustomExFromLogger()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        Create Custom Exercise
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- CHANGE EXERCISE MODAL -->
+<div class="modal-overlay" id="modal-change-exercise">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Change Exercise</div><button class="btn-icon" onclick="closeModal('modal-change-exercise')">✕</button></div>
+    <div style="position:relative;margin-bottom:12px">
+      <svg style="position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--text3);pointer-events:none" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input type="text" id="change-ex-search" placeholder="Search exercises..." style="padding-left:40px" oninput="renderChangeExList()">
+    </div>
+    <div class="tabs" id="change-ex-tabs" style="padding:0 0 12px;flex-wrap:wrap;gap:6px"></div>
+    <div id="change-ex-list" style="max-height:45vh;overflow-y:auto"></div>
+  </div>
+</div>
+
+<!-- CUSTOM EXERCISE MODAL -->
+<div class="modal-overlay" id="modal-custom-ex">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title" id="custom-ex-modal-title">Custom Exercise</div><button class="btn-icon" onclick="closeCustomExModal()">✕</button></div>
+    <div class="form-group"><label>Exercise Name</label><input type="text" id="custom-ex-name" placeholder="e.g. Hack Squat"></div>
+    <div class="form-group"><label>Body Part / Category</label>
+      <select id="custom-ex-bodypart">
+        <option>Quadriceps</option><option>Hamstrings</option><option>Calves</option><option>Glutes</option>
+        <option>Back</option><option>Chest</option><option>Shoulders</option><option>Biceps</option>
+        <option>Triceps</option><option>Forearms</option><option>Core</option><option>Cardio</option>
+        <option>Full Body</option><option>Other</option>
+      </select>
+    </div>
+    <div class="form-group"><label>Default Tracking</label>
+      <select id="custom-ex-tracking">
+        <option value="weight_reps">Weight + Reps</option><option value="weight_time">Weight + Time</option>
+        <option value="bodyweight_reps">Bodyweight + Reps</option><option value="time">Time Only</option>
+      </select>
+    </div>
+    <div class="form-group"><label>Notes (optional)</label><textarea id="custom-ex-notes" placeholder="Setup cues, notes..."></textarea></div>
+    <div class="form-group">
+      <label>Reference Video Links (optional)</label>
+      <div id="custom-ex-videos-list"></div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input type="text" id="custom-ex-video-input" placeholder="Paste video URL..." style="font-size:14px;padding:9px 11px">
+        <button class="btn btn-ghost btn-sm" onclick="addCustomExVideo()" style="white-space:nowrap">+ Add</button>
+      </div>
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="saveCustomExercise()">Save Exercise</button>
+  </div>
+</div>
+
+<!-- NOTES EDIT MODAL -->
+<div class="modal-overlay" id="modal-notes-edit">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title" id="notes-edit-modal-title">Notes</div><button class="btn-icon" onclick="closeModal('modal-notes-edit')">✕</button></div>
+    <div class="form-group"><textarea id="notes-edit-textarea" placeholder="Add setup cues, notes..." style="min-height:120px"></textarea></div>
+    <button class="btn btn-primary" style="width:100%" onclick="saveNotesFromModal()">Save Note</button>
+  </div>
+</div>
+
+<!-- LOG BODYWEIGHT MODAL -->
+<div class="modal-overlay" id="modal-log-bw">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Log Bodyweight</div><button class="btn-icon" onclick="closeModal('modal-log-bw')">✕</button></div>
+    <div class="form-group">
+      <label>Bodyweight (<span id="bw-modal-unit">lbs</span>)</label>
+      <input type="number" id="bw-modal-input" placeholder="e.g. 185" step="0.5">
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="saveBWFromModal()">Save</button>
+  </div>
+</div>
+
+<!-- REORDER EXERCISES MODAL -->
+<div class="modal-overlay" id="modal-reorder">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Reorder Exercises</div><button class="btn-icon" onclick="closeModal('modal-reorder')">✕</button></div>
+    <div id="reorder-list"></div>
+    <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="closeModal('modal-reorder')">Done</button>
+  </div>
+</div>
+
+<!-- NEW PROGRAM MODAL -->
+<div class="modal-overlay" id="modal-program">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">New Program</div><button class="btn-icon" onclick="closeModal('modal-program')">✕</button></div>
+    <div class="form-group"><label>Program Name</label><input type="text" id="prog-name" placeholder="e.g. 12-Week Hypertrophy"></div>
+    <div class="form-group"><label>Description (optional)</label><textarea id="prog-notes" placeholder="Goals, description..."></textarea></div>
+    <button class="btn btn-primary" style="width:100%;margin-top:4px" onclick="saveProgram()">Create Program</button>
+  </div>
+</div>
+
+<!-- SESSION MODAL -->
+<div class="modal-overlay" id="modal-session">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title" id="session-modal-title">Session</div><button class="btn-icon" onclick="closeModal('modal-session')">✕</button></div>
+    <div id="session-modal-body"></div>
+  </div>
+</div>
+
+<!-- PROGRAM PICKER MODAL -->
+<div class="modal-overlay" id="modal-prog-picker">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Choose Program</div><button class="btn-icon" onclick="closeModal('modal-prog-picker')">✕</button></div>
+    <div id="prog-picker-list"></div>
+  </div>
+</div>
+
+<!-- EXPORT MODAL -->
+<div class="modal-overlay" id="modal-copy">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Export Workout</div><button class="btn-icon" onclick="closeModal('modal-copy')">✕</button></div>
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <button class="btn btn-secondary btn-sm" id="copy-btn-txt" onclick="setCopyFormat('txt')">Plain Text</button>
+      <button class="btn btn-primary btn-sm" id="copy-btn-phpbb" onclick="setCopyFormat('phpbb')">PHPBB</button>
+    </div>
+    <div class="copy-output" id="copy-output"></div>
+    <button class="btn btn-primary" style="width:100%;margin-top:12px" onclick="copyToClipboard()">Copy to Clipboard</button>
+  </div>
+</div>
+
+<!-- IMPORT / EXPORT MODAL -->
+<div class="modal-overlay" id="modal-import-export">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Import / Export</div><button class="btn-icon" onclick="closeModal('modal-import-export')">✕</button></div>
+    <div id="import-export-body"></div>
+  </div>
+</div>
+
+<!-- EXERCISE HISTORY MODAL -->
+<div class="modal-overlay" id="modal-ex-history">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title" id="ex-history-modal-title">Exercise History</div><button class="btn-icon" onclick="closeModal('modal-ex-history')">✕</button></div>
+    <div id="ex-history-modal-body"></div>
+  </div>
+</div>
+
+<!-- MOVE TO WEEK MODAL -->
+<div class="modal-overlay" id="modal-move-week">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Move Day to Week</div><button class="btn-icon" onclick="closeModal('modal-move-week')">✕</button></div>
+    <div id="move-week-body"></div>
+  </div>
+</div>
+
+<!-- SETTINGS MODAL -->
+<div class="modal-overlay" id="modal-settings">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Settings</div><button class="btn-icon" onclick="closeModal('modal-settings')">✕</button></div>
+    <div class="form-group">
+      <label>E1RM Formula</label>
+      <select id="settings-e1rm-formula" onchange="saveSettings()">
+        <option value="epley">Epley (default)</option>
+        <option value="brzycki">Brzycki</option>
+        <option value="wathan">Wathan</option>
+      </select>
+      <div style="font-size:13px;color:var(--text3);margin-top:6px;line-height:1.5">Controls how estimated 1-rep max is calculated throughout the app.</div>
+    </div>
+    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+      <button class="btn btn-danger" style="width:100%" onclick="signOut()">Sign Out</button>
+    </div>
+  </div>
+</div>
+
+<!-- VIDEOS MODAL -->
+<div class="modal-overlay" id="modal-ex-videos">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title" id="ex-videos-modal-title">Videos</div><button class="btn-icon" onclick="closeModal('modal-ex-videos')">✕</button></div>
+    <div id="ex-videos-modal-body"></div>
+  </div>
+</div>
+
+<!-- TM PROMPT OVERLAY -->
+<div id="tm-prompt-overlay">
+  <div id="tm-prompt-box">
+    <div class="tm-prompt-title">Set Up Progressions</div>
+    <div class="tm-prompt-sub">These exercises use automated progressions. Set a baseline for each before starting.</div>
+    <div id="tm-prompt-exercises"></div>
+    <button class="btn btn-primary" style="width:100%;margin-top:8px" onclick="closeTMPrompt()">Start Workout</button>
+  </div>
+</div>
+
+<!-- CONFIRM DIALOG -->
+<div id="confirm-overlay">
+  <div id="confirm-box">
+    <h3 id="confirm-title">Confirm</h3>
+    <p id="confirm-msg">Are you sure?</p>
+    <div class="btns">
+      <button class="btn btn-secondary" style="flex:1" onclick="confirmReject()">Cancel</button>
+      <button class="btn btn-danger" style="flex:1" id="confirm-accept-btn" onclick="confirmAccept()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="firebase.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
