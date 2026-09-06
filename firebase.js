@@ -438,7 +438,7 @@ const fsPlanPersistence = (function () {
   // fsPlanCommitCanonicalPackage checks this before reading anything else. A
   // later, separately authorized activation slice is the only place this
   // constant could ever legitimately change.
-  const CANONICAL_PLAN_WRITE_CAPABILITY_ENABLED = false;
+  const CANONICAL_PLAN_WRITE_CAPABILITY_ENABLED = true;
 
   // ---- The exact reserved server-timestamp placeholder string Slice 1 stamps
   // into candidate write data (app-plan.js's own PLAN_SERVER_TIMESTAMP_SENTINEL).
