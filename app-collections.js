@@ -488,7 +488,7 @@ function collValidateAndPlanTransfers(destinationPayload, pendingTransfers, sour
     const mEntry = membershipEntries.get(t.exerciseId);
     const liveRole = mEntry && mEntry.data && mEntry.data.consolidationRole;
     if (!liveRole || liveRole.collectionId !== t.sourceCollectionId || liveRole.role !== 'member') {
-      throw collTransferConflictError('Exercise\u2019s live consolidation role no longer matches the expected source');
+      throw collTransferConflictError('Exercise’s live consolidation role no longer matches the expected source');
     }
 
     const sourceDoc = sourceDocs.get(t.sourceCollectionId);
@@ -499,7 +499,7 @@ function collValidateAndPlanTransfers(destinationPayload, pendingTransfers, sour
       throw collTransferConflictError('Source Collection no longer lists this Exercise as a consolidated member');
     }
     if (sCons.displayExerciseId === t.exerciseId) {
-      throw collTransferConflictError('Exercise is the source Collection\u2019s Display Exercise');
+      throw collTransferConflictError('Exercise is the source Collection’s Display Exercise');
     }
 
     // Cache-informed competing-claim re-verification (bounded -- see the header
@@ -623,7 +623,7 @@ function collConsolidationSummaryHtml(c) {
     const n = c.consolidation.consolidatedExerciseIds.length;
     return `<div class="coll-consol-summary coll-consol-summary--on">
       <div class="coll-consol-summary-label">List Consolidation</div>
-      <div class="coll-consol-summary-val">Display: ${disp ? escapeHtml(disp.name) : '\u2014'} &middot; ${n} Consolidated Member${n !== 1 ? 's' : ''}</div>
+      <div class="coll-consol-summary-val">Display: ${disp ? escapeHtml(disp.name) : '—'} &middot; ${n} Consolidated Member${n !== 1 ? 's' : ''}</div>
     </div>`;
   }
   return `<div class="coll-consol-summary coll-consol-summary--off">
@@ -778,7 +778,7 @@ function collOpenMenuDropdown(e) {
     items.push({ label: 'Create Collection', icon: '+', action: 'collOpenNewFromBrowser()' });
     items.push({ divider: true });
   }
-  items.push({ label: 'Sort A - Z', icon: '', toggle: '\u2713 ' });
+  items.push({ label: 'Sort A - Z', icon: '', toggle: '✓ ' });
   items.push({ label: 'Reset Search', icon: '', action: 'collResetSearchFromMenu()' });
   showDropdown(e.currentTarget, items);
 }
@@ -1005,9 +1005,9 @@ function collRemovePendingTransfer(exerciseId) {
 }
 
 function collUnavailableStatusText(status) {
-  if (status.reason === 'display') return `Display Exercise for \u201c${status.collectionName}\u201d`;
-  if (status.reason === 'sourceZero') return `Transfer would leave \u201c${status.collectionName}\u201d without a consolidated member`;
-  if (status.reason === 'ambiguous') return `Claimed by more than one Collection \u2014 cannot be transferred`;
+  if (status.reason === 'display') return `Display Exercise for “${status.collectionName}”`;
+  if (status.reason === 'sourceZero') return `Transfer would leave “${status.collectionName}” without a consolidated member`;
+  if (status.reason === 'ambiguous') return `Claimed by more than one Collection — cannot be transferred`;
   return 'Not currently available for transfer';
 }
 
@@ -1018,7 +1018,7 @@ function collUnavailableStatusText(status) {
 // collUnavailableStatusText: this describes something still actionable
 // (deliberate transfer or removal), not something blocked.
 function collNeedsReviewTransferText(status) {
-  return `Now consolidated under \u201c${status.sourceCollectionName}\u201d \u2014 requires deliberate transfer authorization or removal from this role`;
+  return `Now consolidated under “${status.sourceCollectionName}” — requires deliberate transfer authorization or removal from this role`;
 }
 
 // Context-aware "open controlling Collection" operation for the Variants
@@ -1208,12 +1208,12 @@ function collBuildDeletionDisclosureMessage(disclosure) {
   if (!disclosure.collections.length) return 'Remove this custom exercise?';
   return disclosure.collections.map(c => {
     if (c.branch === 'lastMember') {
-      return `Deleting this exercise will also disable List Consolidation for \u201c${c.collectionName}\u201d, since it is the only remaining consolidated member.`;
+      return `Deleting this exercise will also disable List Consolidation for “${c.collectionName}”, since it is the only remaining consolidated member.`;
     }
     if (c.branch === 'nonLastMember') {
-      return `This exercise will be removed from consolidation for \u201c${c.collectionName}\u201d.`;
+      return `This exercise will be removed from consolidation for “${c.collectionName}”.`;
     }
-    return `This exercise will be removed from \u201c${c.collectionName}\u201d.`;
+    return `This exercise will be removed from “${c.collectionName}”.`;
   }).join(' ');
 }
 
@@ -1244,7 +1244,7 @@ async function collDeleteCustomExerciseWithDisclosure(exId, callbacks, attempt) 
     // the disclosed consequence.
     confirm2(
       'Cannot Delete Exercise',
-      `\u201c${disclosure.exerciseName}\u201d has a Collection-membership inconsistency that can\u2019t be safely resolved automatically. Please review its Collections before deleting it.`,
+      `“${disclosure.exerciseName}” has a Collection-membership inconsistency that can’t be safely resolved automatically. Please review its Collections before deleting it.`,
       () => {},
       'OK',
       false,
@@ -1255,10 +1255,10 @@ async function collDeleteCustomExerciseWithDisclosure(exId, callbacks, attempt) 
   }
 
   if (disclosure.blockedByDisplay) {
-    const names = disclosure.blockedByDisplay.map(b => `\u201c${b.collectionName}\u201d`).join(', ');
+    const names = disclosure.blockedByDisplay.map(b => `“${b.collectionName}”`).join(', ');
     confirm2(
       'Cannot Delete Exercise',
-      `\u201c${disclosure.exerciseName}\u201d is the Display Exercise for ${names}. Replace the Display Exercise, disable consolidation, or keep the Exercise before deleting it.`,
+      `“${disclosure.exerciseName}” is the Display Exercise for ${names}. Replace the Display Exercise, disable consolidation, or keep the Exercise before deleting it.`,
       () => {},
       'OK',
       false,
@@ -1418,10 +1418,10 @@ async function collRunCustomExerciseDeletion(exId, disclosure, callbacks) {
       if (nextAttempt > 2) {
         // Bounded retry: exactly one refresh per deletion attempt. A second stale
         // result stops here -- never loops indefinitely.
-        showToast('This exercise\u2019s Collection details keep changing. Please try deleting it again.', 'error');
+        showToast('This exercise’s Collection details keep changing. Please try deleting it again.', 'error');
         return;
       }
-      showToast('This exercise\u2019s Collection memberships changed. Showing the latest details.', 'error');
+      showToast('This exercise’s Collection memberships changed. Showing the latest details.', 'error');
       collDeleteCustomExerciseWithDisclosure(exId, callbacks, nextAttempt);
       return;
     }
@@ -1568,7 +1568,7 @@ function collRenderEditor() {
 
   const staleHtml = collectionConflictState ? collStalePanelHtml() : '';
   const saveDisabled = collPendingOperation || !!collectionConflictState;
-  const saveLabel = collPendingOperation ? 'Saving\u2026' : 'Save';
+  const saveLabel = collPendingOperation ? 'Saving…' : 'Save';
   // While create/save/delete/Reload Latest is in flight, the entire editor is
   // visibly read-only -- every control that could mutate the draft or enter a
   // nested editor is disabled. The matching functions below (collUpdateDraftName,
@@ -1632,7 +1632,7 @@ function collDuplicateNameWarningHtml(name) {
   if (!match) return '';
   return `<div class="coll-dup-warning">
     <div class="coll-dup-warning-label">Duplicate Name</div>
-    <div class="coll-dup-warning-val">Another Collection is already named \u201c${escapeHtml(match.name)}.\u201d Collection names do not need to be unique.</div>
+    <div class="coll-dup-warning-val">Another Collection is already named “${escapeHtml(match.name)}.” Collection names do not need to be unique.</div>
   </div>`;
 }
 
@@ -2069,7 +2069,7 @@ function collConfirmDeleteCollection() {
   const name = collectionDraft.name;
   confirm2(
     'Delete Collection?',
-    `\u201c${name}\u201d and its consolidation settings will be removed. Exercises and their history, PRs, and programs are not affected.`,
+    `“${name}” and its consolidation settings will be removed. Exercises and their history, PRs, and programs are not affected.`,
     () => collDeleteCollectionNow(collectionDraft.id),
     'Delete',
     true
@@ -2262,7 +2262,7 @@ function collApplyMemberSelection() {
     // Case 3: at least one consolidated member remains after this removal.
     confirm2(
       'Remove Consolidated Members?',
-      `${consolidatedRemovals.length} exercise(s) \u2014 ${nameList} \u2014 are consolidated members of this Collection. Removing them will also remove them from consolidation. Continue?`,
+      `${consolidatedRemovals.length} exercise(s) — ${nameList} — are consolidated members of this Collection. Removing them will also remove them from consolidation. Continue?`,
       () => {
         collectionDraft.memberIds = newIds;
         collectionDraft.consolidation.consolidatedExerciseIds = remainingConsolidated;
@@ -2276,7 +2276,7 @@ function collApplyMemberSelection() {
     // Case 4: every consolidated member is being removed -- combined disclosure.
     confirm2(
       'Disable List Consolidation?',
-      `${consolidatedRemovals.length} exercise(s) \u2014 ${nameList} \u2014 are consolidated members of this Collection. Removing them will also disable List Consolidation for this Collection, since no consolidated members would remain. Continue?`,
+      `${consolidatedRemovals.length} exercise(s) — ${nameList} — are consolidated members of this Collection. Removing them will also disable List Consolidation for this Collection, since no consolidated members would remain. Continue?`,
       () => {
         collectionDraft.memberIds = newIds;
         collectionDraft.consolidation = { enabled: false, displayExerciseId: null, consolidatedExerciseIds: [] };
@@ -2482,7 +2482,7 @@ function collToggleConsolidatedMember(exId) {
     const destName = (collectionDraft.name || '').trim() || 'this Collection';
     confirm2(
       'Transfer Consolidation Role?',
-      `\u201c${exName}\u201d is currently consolidated under \u201c${status.sourceCollectionName}.\u201d Transfer its consolidation role to \u201c${destName}\u201d? It will remain a member of any Collections it already belongs to.`,
+      `“${exName}” is currently consolidated under “${status.sourceCollectionName}.” Transfer its consolidation role to “${destName}”? It will remain a member of any Collections it already belongs to.`,
       () => {
         consolidationDraft.consolidatedExerciseIds.push(exId);
         collAddPendingTransfer(exId, status.sourceCollectionId, 'member');
@@ -2659,7 +2659,7 @@ function collChooseDisplayExercise(exId) {
     const destName = (collectionDraft.name || '').trim() || 'this Collection';
     confirm2(
       'Transfer Consolidation Role?',
-      `\u201c${exName}\u201d is currently consolidated under \u201c${status.sourceCollectionName}.\u201d Transfer its consolidation role to \u201c${destName}\u201d? It will remain a member of any Collections it already belongs to.`,
+      `“${exName}” is currently consolidated under “${status.sourceCollectionName}.” Transfer its consolidation role to “${destName}”? It will remain a member of any Collections it already belongs to.`,
       () => { collAddPendingTransfer(exId, status.sourceCollectionId, 'display'); commit(); },
       'Transfer',
       false

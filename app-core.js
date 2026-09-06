@@ -184,6 +184,12 @@ auth.onAuthStateChanged(async user => {
   // new session.
   firestoreListeners.forEach(u => u());
   firestoreListeners = [];
+  // Canonical Program/progression state is user-scoped just like the legacy
+  // listeners above. Clear it on every sign-in, sign-out, and account switch
+  // before any new owner's references or asynchronous work can begin.
+  if (typeof planResetCanonicalUserScopedState === 'function') {
+    planResetCanonicalUserScopedState();
+  }
   appReady = false;
   resetImportedSetsState();
   // Reset preference defaults on every transition too, before the next user's
@@ -219,6 +225,51 @@ auth.onAuthStateChanged(async user => {
     document.getElementById('loading-screen').style.display = 'none';
     console.log(DIAG, 'startup complete — imported sets NOT loaded (deferred until HISTORY/Import/Export needs them)');
     renderHome();
+
+    // SLICE 5A completion correction -- the ONLY entry point for the new
+    // parallel canonical Program editor (app-plan.js, "SLICE 5A COMPLETION
+    // CORRECTION" section). Deliberately hidden from normal navigation: no
+    // nav button, no showPage() case, nothing reachable by clicking
+    // anything in the app. Gated on a URL query parameter nothing else in
+    // the app ever sets or reads, checked once, here, only after full boot
+    // and real authentication have both already completed -- a normal user
+    // who never adds this exact parameter to the URL never triggers it.
+    // This is the approved development/test entry mechanism; it is the
+    // only change this correction makes to this file.
+    if (typeof planCanonicalEditorBoot === 'function' &&
+        new URLSearchParams(location.search).get(typeof PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM === 'string' ? PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM : 'slice5aCanonicalEditor') === '1') {
+      planCanonicalEditorBoot();
+    }
+
+    // SLICE 5B correction round 1 (finding 6) -- the ONLY entry point for
+    // the new manual progression starting-value/correction UI
+    // (app-plan.js, planProgressionManualDevBoot). Same pattern as the
+    // Slice 5A canonical-editor entry directly above: deliberately hidden
+    // from normal navigation (no nav button, no showPage() case), gated on
+    // two URL query parameters nothing else in the app ever sets or reads,
+    // checked once, here, only after full boot and real authentication have
+    // both already completed. A normal user who never adds these exact
+    // parameters to the URL never triggers it. While either the canonical
+    // read or the progression capability remains disabled (both hardcoded
+    // false in production), this can wire itself up but cannot perform any
+    // database I/O -- corrected round 3: the two disabled gates fail in two
+    // different shapes, not one uniform return value. The progression
+    // capability's real functions THROW a disabled error synchronously; the
+    // canonical reader's disabled path REJECTS with its own, differently-
+    // typed disabled error. planProgressionManualDevBoot (app-plan.js)
+    // catches both, independently, and resolves this call to
+    // {outcome:'disabled'} either way, after visibly mounting the disabled
+    // message into the real manual-progression container -- it never
+    // reaches this .catch() below for either disabled case.
+    if (typeof planProgressionManualDevBoot === 'function') {
+      const _progParams = new URLSearchParams(location.search);
+      const _progTemplateId = _progParams.get('progressionTemplateId');
+      const _progAssignmentId = _progParams.get('progressionAssignmentId');
+      if (_progParams.get(typeof PLAN_PROGRESSION_MANUAL_DEV_QUERY_PARAM === 'string' ? PLAN_PROGRESSION_MANUAL_DEV_QUERY_PARAM : 'slice5bProgressionManual') === '1'
+          && _progTemplateId && _progAssignmentId) {
+        planProgressionManualDevBoot(_progTemplateId, _progAssignmentId).catch(err => console.error(DIAG, 'planProgressionManualDevBoot failed:', err));
+      }
+    }
   } catch (err) {
     if (mySession !== initSession) return;
     console.error(DIAG, 'initialization failed:', err);
@@ -457,7 +508,7 @@ function renderHomeCarousel() {
     const sess = mc.sessions[next.sessionIdx];
     const mcName = mc.name || `Micro ${next.microcycleIdx + 1}`;
     const sessName = sess.name || `Session ${next.sessionIdx + 1}`;
-    const sessionLabel = `${mcName} \u2022 ${sessName}`;
+    const sessionLabel = `${mcName} • ${sessName}`;
     const dotsHtml = homeCarouselProgs.length > 1
       ? homeCarouselProgs.map((_, di) => `<div class="home-carousel-dot ${di === i ? 'active' : ''}"></div>`).join('')
       : '';
@@ -558,10 +609,10 @@ function startWorkoutFromActiveCard(activeId) {
 function openActiveProgCardMenu(e, activeId) {
   e.stopPropagation();
   const items = [
-    { label: 'Choose Session', icon: '\u2630', action: `openChooseSessionModal('${activeId}')` },
-    { label: 'Open Template', icon: '\u2192', action: `openTemplateFromActiveCard('${activeId}')` },
+    { label: 'Choose Session', icon: '☰', action: `openChooseSessionModal('${activeId}')` },
+    { label: 'Open Template', icon: '→', action: `openTemplateFromActiveCard('${activeId}')` },
     { divider: true },
-    { label: 'End Program', icon: '\u2715', action: `endActiveProgram('${activeId}')`, danger: true },
+    { label: 'End Program', icon: '✕', action: `endActiveProgram('${activeId}')`, danger: true },
   ];
   showDropdown(e.currentTarget, items);
 }
@@ -600,9 +651,9 @@ function openChooseSessionModal(activeId) {
       const isDone = completed.includes(key);
       const name = sess.name || `Session ${si + 1}`;
       if (isDone) {
-        html += `<div style="display:flex;align-items:center;gap:8px;padding:10px 12px;color:var(--text3);font-family:var(--font-display);font-size:15px;font-weight:700;text-transform:uppercase"><span style="color:var(--green)">\u2713</span> ${escapeHtml(name)}</div>`;
+        html += `<div style="display:flex;align-items:center;gap:8px;padding:10px 12px;color:var(--text3);font-family:var(--font-display);font-size:15px;font-weight:700;text-transform:uppercase"><span style="color:var(--green)">✓</span> ${escapeHtml(name)}</div>`;
       } else {
-        html += `<div onclick="chooseSessionAndStart('${activeId}',${mi},${si})" style="display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px;font-family:var(--font-display);font-size:15px;font-weight:700;text-transform:uppercase;color:var(--text)"><span style="color:var(--text3)">\u25CB</span> ${escapeHtml(name)}</div>`;
+        html += `<div onclick="chooseSessionAndStart('${activeId}',${mi},${si})" style="display:flex;align-items:center;gap:8px;padding:10px 12px;cursor:pointer;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:6px;font-family:var(--font-display);font-size:15px;font-weight:700;text-transform:uppercase;color:var(--text)"><span style="color:var(--text3)">○</span> ${escapeHtml(name)}</div>`;
       }
     });
   });
@@ -650,7 +701,7 @@ function finalizeStartActiveWorkout(activeId, mi, si) {
   const sess = mc.sessions[si]; if (!sess) return;
   const mcName = mc.name || `Micro ${mi + 1}`;
   const sessName = sess.name || `Session ${si + 1}`;
-  const name = `${mcName} \u00b7 ${sessName}`;
+  const name = `${mcName} · ${sessName}`;
 
   currentWorkout = {
     id: uid(), name, date: Date.now(), exercises: [], rpeEnabled: false, duration: 0, bodyweight: null,
@@ -1099,7 +1150,7 @@ function showActiveWorkingLoadPrompt(activeId, missingExercises, continueCallbac
     if (suggestion) {
       const dateStr = new Date(suggestion.date).toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
       const repsOrTime = suggestion.reps ? `${suggestion.reps} reps` : (suggestion.time ? `${suggestion.time}s` : '');
-      evidenceHtml = `<div class="tm-display">Last completed: ${suggestion.weight} ${unit}${repsOrTime ? ' \u00d7 ' + repsOrTime : ''}, ${dateStr}</div>`;
+      evidenceHtml = `<div class="tm-display">Last completed: ${suggestion.weight} ${unit}${repsOrTime ? ' × ' + repsOrTime : ''}, ${dateStr}</div>`;
       suggestionHtml = `<div class="tm-display" style="margin-top:3px">Suggested Working Load: ${suggestion.weight} ${unit}</div>`;
       prefill = suggestion.weight;
     } else {
@@ -1309,8 +1360,8 @@ function openExerciseMenu(e, idx) {
     { label: 'Change Exercise', icon: '⇄', action: `openChangeExModal(${idx})` },
     ...(hasProg ? [{ label: 'Reset TM / Baseline', icon: '↺', action: `openSingleTMPrompt(${idx})` }] : []),
     ...(hasTM ? [{ label: 'Set / Edit Training Max', icon: '⚖', action: `openActiveTMEditModal(${idx})` }] : []),
-    ...(has1RM ? [{ label: 'Set / Edit 1RM', icon: '\u25C9', action: `openActive1RMEditModal(${idx})` }] : []),
-    ...(hasWL ? [{ label: 'Set / Edit Working Load', icon: '\u2795', action: `openActiveWorkingLoadEditModal(${idx})` }] : []),
+    ...(has1RM ? [{ label: 'Set / Edit 1RM', icon: '◉', action: `openActive1RMEditModal(${idx})` }] : []),
+    ...(hasWL ? [{ label: 'Set / Edit Working Load', icon: '➕', action: `openActiveWorkingLoadEditModal(${idx})` }] : []),
     { divider: true },
     { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true },
   ];
@@ -1618,7 +1669,7 @@ function evaluateGatewaySet(loggedSets, prescribedSets, gatewaySetIndex) {
   return {
     status,
     targetDescription: `Gateway Set ${idx + 1} target: ${threshold.value} ${unitLabel}`,
-    actualDescription: `Actual: ${actual !== null ? actual : '\u2014'} ${unitLabel}`
+    actualDescription: `Actual: ${actual !== null ? actual : '—'} ${unitLabel}`
   };
 }
 
@@ -1768,7 +1819,7 @@ function evaluateWorkoutProgression(workout, activeProgram) {
     const result = evaluateExerciseProgression(loggedEx, sessEx, activeProgram);
     if (result.adjustmentType === 'increaseTM' && result.canSuggestTMIncrease) {
       if (seenActionableTMExerciseIds.has(result.exerciseId)) {
-        console.warn('[progression] duplicate increaseTM suggestion for', result.exerciseId, '\u2014 only the first is actionable this workout.');
+        console.warn('[progression] duplicate increaseTM suggestion for', result.exerciseId, '— only the first is actionable this workout.');
         result.canSuggestTMIncrease = false;
         result.message = 'Target met, but a Training Max increase was already suggested for this exercise this workout.';
       } else {
@@ -1777,7 +1828,7 @@ function evaluateWorkoutProgression(workout, activeProgram) {
     }
     if (result.loadReferenceType === 'workingLoad' && result.canSuggestLoadIncrease) {
       if (seenActionableWLExerciseIds.has(result.exerciseId)) {
-        console.warn('[progression] duplicate Working Load suggestion for', result.exerciseId, '\u2014 only the first is actionable this workout.');
+        console.warn('[progression] duplicate Working Load suggestion for', result.exerciseId, '— only the first is actionable this workout.');
         result.canSuggestLoadIncrease = false;
         result.message = 'Target met, but a Working Load increase was already suggested for this exercise this workout.';
       } else {
@@ -2153,10 +2204,10 @@ function buildProgressionReviewRow(r, idx, pending, active) {
 
   let detailHtml;
   if (r.status === 'passed' && canSuggest) {
-    const targetLine = `${escapeHtml(r.targetDescription || '')}${r.actualDescription ? ' \u2014 ' + escapeHtml(r.actualDescription) : ''}`;
+    const targetLine = `${escapeHtml(r.targetDescription || '')}${r.actualDescription ? ' — ' + escapeHtml(r.actualDescription) : ''}`;
     let refLine = '';
-    if (isTM) refLine = `<div class="prog-review-detail" style="margin-top:4px">Training Max: ${r.currentTM} \u2192 ${r.suggestedTM} ${unit}</div>`;
-    else if (isWL) refLine = `<div class="prog-review-detail" style="margin-top:4px">Working Load: ${r.currentWorkingLoad} \u2192 ${r.suggestedWorkingLoad} ${unit}</div>`;
+    if (isTM) refLine = `<div class="prog-review-detail" style="margin-top:4px">Training Max: ${r.currentTM} → ${r.suggestedTM} ${unit}</div>`;
+    else if (isWL) refLine = `<div class="prog-review-detail" style="margin-top:4px">Working Load: ${r.currentWorkingLoad} → ${r.suggestedWorkingLoad} ${unit}</div>`;
     detailHtml = `<div class="prog-review-detail">${targetLine}</div>${refLine}`;
   } else {
     detailHtml = `<div class="prog-review-detail">${escapeHtml(r.message || '')}</div>`;
@@ -2178,7 +2229,7 @@ function buildProgressionReviewRow(r, idx, pending, active) {
     controlsHtml = `<div class="${tagClass}">${tagText}</div>`;
   } else if (r.status === 'passed' && canSuggest) {
     if (active.status === 'complete') {
-      controlsHtml = `<div class="prog-review-detail" style="color:var(--text3);font-style:italic;margin-top:6px">Program complete \u2014 no future sessions to update.</div>`;
+      controlsHtml = `<div class="prog-review-detail" style="color:var(--text3);font-style:italic;margin-top:6px">Program complete — no future sessions to update.</div>`;
     } else if (r._editing) {
       if (isTM) {
         controlsHtml = `
@@ -2229,7 +2280,7 @@ function buildProgressionReviewRow(r, idx, pending, active) {
   return `
     <div class="prog-review-row">
       <div class="prog-review-name">${escapeHtml(r.exerciseName || r.exerciseId)}</div>
-      <div class="prog-review-status" style="color:${statusColor}">${statusLabel} \u2022 ${evalLabel}</div>
+      <div class="prog-review-status" style="color:${statusColor}">${statusLabel} • ${evalLabel}</div>
       ${detailHtml}
       ${controlsHtml}
     </div>
@@ -2289,7 +2340,7 @@ function runProgressionDecision(pendingId, idx, customValue) {
   const r = pending.results[idx]; if (!r) return;
 
   if (active.status === 'complete') {
-    showToast('Program complete \u2014 no future sessions to update', 'error');
+    showToast('Program complete — no future sessions to update', 'error');
     return;
   }
 
@@ -2526,7 +2577,7 @@ function openExHistoryModal(exId) {
   if (!workoutsWithEx.length) { body.innerHTML = '<div class="empty-state" style="padding:30px 0"><h3>No History</h3><p>Not logged yet</p></div>'; openModal('modal-ex-history'); return; }
   body.innerHTML = workoutsWithEx.map(w => {
     const ex = w.exercises.find(e => e.exerciseId === exId); const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
-    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${ex.sets.map((s,i)=>{ let line=`Set ${i+1}: `; if(s.weight&&+s.weight>0)line+=`${s.weight}${appDb.unit} \u00d7 ${s.reps||s.time||'\u2014'}`; else if(s.reps)line+=`BW \u00d7 ${s.reps}`; else if(s.time)line+=`${s.time}s`; else line+='\u2014'; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
+    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${ex.sets.map((s,i)=>{ let line=`Set ${i+1}: `; if(s.weight&&+s.weight>0)line+=`${s.weight}${appDb.unit} × ${s.reps||s.time||'—'}`; else if(s.reps)line+=`BW × ${s.reps}`; else if(s.time)line+=`${s.time}s`; else line+='—'; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
   }).join('');
   openModal('modal-ex-history');
 }
@@ -2537,8 +2588,8 @@ function openProgramPickerModal() {
   const sorted = [...appDb.programs].sort((a,b) => (b.lastUsed||0)-(a.lastUsed||0));
   document.getElementById('prog-picker-list').innerHTML = sorted.map(p => {
     const next = getNextSessionForProgram(p); const totalSessions = p.microcycles.reduce((a,mc) => a + mc.sessions.length, 0); const completed = (p.completedSessionIndices||[]).length;
-    let statusText = next === null ? 'Program Complete' : (() => { const sname = p.microcycles[next.microcycleIdx].sessions[next.sessionIdx].name || `Day ${next.sessionIdx+1}`; return `Next: Week ${next.microcycleIdx+1} \u00b7 ${sname}`; })();
-    return `<div class="prog-pick-item" onclick="selectProgramForWorkout('${p.id}')"><div><div class="prog-pick-name">${p.name}</div><div class="prog-pick-meta">${statusText} \u00b7 ${completed}/${totalSessions} sessions done</div></div><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" style="color:var(--accent);flex-shrink:0"><polyline points="9 18 15 12 9 6"/></svg></div>`;
+    let statusText = next === null ? 'Program Complete' : (() => { const sname = p.microcycles[next.microcycleIdx].sessions[next.sessionIdx].name || `Day ${next.sessionIdx+1}`; return `Next: Week ${next.microcycleIdx+1} · ${sname}`; })();
+    return `<div class="prog-pick-item" onclick="selectProgramForWorkout('${p.id}')"><div><div class="prog-pick-name">${p.name}</div><div class="prog-pick-meta">${statusText} · ${completed}/${totalSessions} sessions done</div></div><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" style="color:var(--accent);flex-shrink:0"><polyline points="9 18 15 12 9 6"/></svg></div>`;
   }).join('');
   openModal('modal-prog-picker');
 }
@@ -2814,7 +2865,7 @@ function restartProgram(progId){confirm2('Restart Program','Clear all progress a
 function deleteProg(id){confirm2('Delete Program','Permanently delete this program?',()=>{appDb.programs=appDb.programs.filter(p=>p.id!==id);fsDelProgram(id);renderPrograms();showToast('Program deleted');});}
 
 // ==================== SESSION MODAL ====================
-function openSessionModal(progId,mi,si){currentProgramId=progId;currentMicrocycleIdx=mi;currentSessionIdx=si;document.getElementById('session-modal-title').textContent=`Week ${mi+1} \u00b7 Day ${si+1}`;renderSessionView();openModal('modal-session');}
+function openSessionModal(progId,mi,si){currentProgramId=progId;currentMicrocycleIdx=mi;currentSessionIdx=si;document.getElementById('session-modal-title').textContent=`Week ${mi+1} · Day ${si+1}`;renderSessionView();openModal('modal-session');}
 function renderSessionView(){
   const prog=appDb.programs.find(p=>p.id===currentProgramId);
   const session=prog.microcycles[currentMicrocycleIdx].sessions[currentSessionIdx];
@@ -2875,7 +2926,7 @@ function renderCopyOutput(){
   const d=new Date(w.date).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
   let out='';
   if(copyFormat==='txt'){
-    out+=`${w.name.toUpperCase()}\n${d}\n`;if(w.duration)out+=`Duration: ${fmtDuration(w.duration)}\n`;out+='\u2500'.repeat(40)+'\n\n';
+    out+=`${w.name.toUpperCase()}\n${d}\n`;if(w.duration)out+=`Duration: ${fmtDuration(w.duration)}\n`;out+='─'.repeat(40)+'\n\n';
     w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM(e);e.sets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   } else {
     out+=`[u][size=200]${w.name}[/size][/u]\n[i]${d}[/i]\n`;if(w.duration)out+=`[i]Duration: ${fmtDuration(w.duration)}[/i]\n`;out+='\n';
@@ -2883,7 +2934,7 @@ function renderCopyOutput(){
   }
   document.getElementById('copy-output').textContent=out;
 }
-function formatSetStr(s){if(s.weight&&+s.weight>0)return`- ${s.weight}${appDb.unit} x ${s.reps||s.time||'?'}`;if(s.reps)return`- BW x ${s.reps}`;if(s.time)return`- ${s.time}s`;return'- \u2014';}
+function formatSetStr(s){if(s.weight&&+s.weight>0)return`- ${s.weight}${appDb.unit} x ${s.reps||s.time||'?'}`;if(s.reps)return`- BW x ${s.reps}`;if(s.time)return`- ${s.time}s`;return'- —';}
 function getBestPRAndE1RM(ex){let bestPRIdx=-1,bestPRWeight=0,bestE1RMIdx=-1,bestE1RM=0;ex.sets.forEach((s,si)=>{if(s.isPR&&+s.weight>bestPRWeight){bestPRWeight=+s.weight;bestPRIdx=si;}if(s.isNew1RM&&s.weight&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>bestE1RM){bestE1RM=v;bestE1RMIdx=si;}}});return{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM};}
 function copyToClipboard(){navigator.clipboard.writeText(document.getElementById('copy-output').textContent).then(()=>showToast('Copied to clipboard','success')).catch(()=>showToast('Select text manually to copy','error'));}
 

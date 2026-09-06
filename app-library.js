@@ -449,7 +449,7 @@ function buildExerciseRow(ex, variantsInfo) {
   const customBadge = ex.custom ? `<span class="ex-row-custom-badge">Custom</span>` : '';
   const isSelect = libPurpose !== 'browse';
   const variantsHtml = variantsInfo
-    ? `<button class="ex-variants-link" onclick="event.stopPropagation();libOpenControllingCollection('${variantsInfo.collectionId}')">${variantsInfo.count} VARIANT${variantsInfo.count !== 1 ? 'S' : ''} \u203a</button>`
+    ? `<button class="ex-variants-link" onclick="event.stopPropagation();libOpenControllingCollection('${variantsInfo.collectionId}')">${variantsInfo.count} VARIANT${variantsInfo.count !== 1 ? 'S' : ''} ›</button>`
     : '';
 
   return `
@@ -486,20 +486,20 @@ function openLibMenuDropdown(e) {
   const ms = libState.movementStructure;
   const es = libState.executionStyle;
   const items = [
-    { label: 'Sort: A - Z',           icon: '', toggle: libState.sort === 'alpha'  ? '\u2713 ' : '', action: `libOnSort('alpha')`  },
-    { label: 'Sort: Recently Used',    icon: '', toggle: libState.sort === 'recent' ? '\u2713 ' : '', action: `libOnSort('recent')` },
-    { label: 'Show All Individually',  icon: '', toggle: libShowAllIndividually ? '\u2713 ' : '', action: `libToggleShowAllIndividually()` },
+    { label: 'Sort: A - Z',           icon: '', toggle: libState.sort === 'alpha'  ? '✓ ' : '', action: `libOnSort('alpha')`  },
+    { label: 'Sort: Recently Used',    icon: '', toggle: libState.sort === 'recent' ? '✓ ' : '', action: `libOnSort('recent')` },
+    { label: 'Show All Individually',  icon: '', toggle: libShowAllIndividually ? '✓ ' : '', action: `libToggleShowAllIndividually()` },
     { divider: true },
-    { label: 'Compound Only',          icon: '', toggle: ms === 'Compound'   ? '\u2713 ' : '', action: `libToggleMovement('Compound')`   },
-    { label: 'Isolation Only',         icon: '', toggle: ms === 'Isolation'  ? '\u2713 ' : '', action: `libToggleMovement('Isolation')`  },
+    { label: 'Compound Only',          icon: '', toggle: ms === 'Compound'   ? '✓ ' : '', action: `libToggleMovement('Compound')`   },
+    { label: 'Isolation Only',         icon: '', toggle: ms === 'Isolation'  ? '✓ ' : '', action: `libToggleMovement('Isolation')`  },
     { divider: true },
-    { label: 'Bilateral Only',         icon: '', toggle: es === 'Bilateral'  ? '\u2713 ' : '', action: `libToggleExecution('Bilateral')`  },
-    { label: 'Unilateral Only',        icon: '', toggle: es === 'Unilateral' ? '\u2713 ' : '', action: `libToggleExecution('Unilateral')` },
+    { label: 'Bilateral Only',         icon: '', toggle: es === 'Bilateral'  ? '✓ ' : '', action: `libToggleExecution('Bilateral')`  },
+    { label: 'Unilateral Only',        icon: '', toggle: es === 'Unilateral' ? '✓ ' : '', action: `libToggleExecution('Unilateral')` },
     { divider: true },
-    { label: 'Show System Exercises',  icon: '', toggle: libState.displaySystem ? '\u2713 ' : '', action: `libToggleDisplay('system')` },
-    { label: 'Show Custom Exercises',  icon: '', toggle: libState.displayCustom ? '\u2713 ' : '', action: `libToggleDisplay('custom')` },
+    { label: 'Show System Exercises',  icon: '', toggle: libState.displaySystem ? '✓ ' : '', action: `libToggleDisplay('system')` },
+    { label: 'Show Custom Exercises',  icon: '', toggle: libState.displayCustom ? '✓ ' : '', action: `libToggleDisplay('custom')` },
     { divider: true },
-    { label: 'Reset All Filters',      icon: '\u21ba', action: `libResetFilters()` },
+    { label: 'Reset All Filters',      icon: '↺', action: `libResetFilters()` },
   ];
   if (libPurpose === 'browse') {
     items.push({ divider: true });

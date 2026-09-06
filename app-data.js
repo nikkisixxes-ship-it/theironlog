@@ -294,7 +294,7 @@ function getPreviousPerf(exId) {
   if (!prev) return null;
   const ex = prev.exercises.find(e => e.exerciseId === exId);
   const s = ex?.sets?.[0];
-  return s?.weight ? `${s.weight}${appDb.unit} \u00d7 ${s.reps||s.time}` : null;
+  return s?.weight ? `${s.weight}${appDb.unit} × ${s.reps||s.time}` : null;
 }
 
 function getBest1RM(exId, excludeId) {
@@ -378,7 +378,7 @@ function getExerciseStats(exId) {
     if (s.weight && s.reps) { const v = calc1RM(+s.weight, +s.reps); if (v > best1) best1 = v; }
   });
   const recent = all.slice(-3).reverse().map(s =>
-    `${s.weight ? s.weight + appDb.unit + ' \u00d7 ' : ''}${s.reps || s.time || '?'}${s.rpe ? ' @ RPE ' + s.rpe : ''}`
+    `${s.weight ? s.weight + appDb.unit + ' × ' : ''}${s.reps || s.time || '?'}${s.rpe ? ' @ RPE ' + s.rpe : ''}`
   );
   return { bestWeight: bestW || null, best1rm: best1 ? Math.round(best1) : null, totalSets: all.length, recentSets: recent };
 }
