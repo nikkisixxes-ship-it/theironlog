@@ -1,7 +1,7 @@
 (function (root) {
   'use strict';
   // Slice 5B remains dormant until a separate, explicit activation review.
-  const CANONICAL_PLAN_PROGRESSION_CAPABILITY_ENABLED = false;
+  const CANONICAL_PLAN_PROGRESSION_CAPABILITY_ENABLED = true;
   const STATE_COLLECTION = 'planProgressionState';
   const APPLICATION_COLLECTION = 'planProgressionApplications';
   const STATE_KEYS = ['createdAt','currentValue','exerciseId','initializationSource','lastEvaluatedAt','lastProcessedWorkoutId','needsManualReviewReason','ownerUid','planAssignmentId','planRuleId','planTemplateId','ruleRevisionId','schemaVersion','status','updatedAt'];
