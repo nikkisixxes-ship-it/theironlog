@@ -226,26 +226,11 @@ auth.onAuthStateChanged(async user => {
     console.log(DIAG, 'startup complete — imported sets NOT loaded (deferred until HISTORY/Import/Export needs them)');
     renderHome();
 
-    // SLICE 5A completion correction -- the ONLY entry point for the new
-    // parallel canonical Program editor (app-plan.js, "SLICE 5A COMPLETION
-    // CORRECTION" section). Deliberately hidden from normal navigation: no
-    // nav button, no showPage() case, nothing reachable by clicking
-    // anything in the app. Gated on a URL query parameter nothing else in
-    // the app ever sets or reads, checked once, here, only after full boot
-    // and real authentication have both already completed -- a normal user
-    // who never adds this exact parameter to the URL never triggers it.
-    // This is the approved development/test entry mechanism; it is the
-    // only change this correction makes to this file.
-    if (typeof planCanonicalEditorBoot === 'function' &&
-        new URLSearchParams(location.search).get(typeof PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM === 'string' ? PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM : 'slice5aCanonicalEditor') === '1') {
-      planCanonicalEditorBoot();
-    }
-
     // SLICE 5B correction round 1 (finding 6) -- the ONLY entry point for
     // the new manual progression starting-value/correction UI
-    // (app-plan.js, planProgressionManualDevBoot). Same pattern as the
-    // Slice 5A canonical-editor entry directly above: deliberately hidden
-    // from normal navigation (no nav button, no showPage() case), gated on
+    // (app-plan.js, planProgressionManualDevBoot). Unlike the canonical PLAN
+    // editor, this progression-state utility remains deliberately hidden
+    // from normal navigation and gated on
     // two URL query parameters nothing else in the app ever sets or reads,
     // checked once, here, only after full boot and real authentication have
     // both already completed. A normal user who never adds these exact
@@ -457,7 +442,10 @@ function showPage(id) {
   if (id === 'page-home')     renderHome();
   if (id === 'page-history')  loadHistoryThenRender(renderHistory);
   if (id === 'page-db')       renderLibraryRoute();
-  if (id === 'page-programs') renderPlanLibrary();
+  // Canonical PLAN adoption: the regular PLAN destination now owns the
+  // canonical editor. Legacy Program records remain untouched in Firestore,
+  // but the primary navigation no longer routes into their editor/library.
+  if (id === 'page-programs') planOpenCanonicalEditorFromPlanNavigation();
 }
 
 function showHistoryPage() {

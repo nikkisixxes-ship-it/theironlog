@@ -8508,20 +8508,12 @@ async function planReopenCanonicalTemplate(ownerUid, templateId, ctx) {
 // file's Slice 5A section) is completely untouched by this correction --
 // zero lines in that code changed, and nothing here calls into it.
 //
-// Reachability ("hidden from normal production navigation... reachable
-// only through the approved development/test entry mechanism"): this
-// workflow has no entry in showPage()'s page-id dispatch and no nav
-// button anywhere in the app shell. Its ONLY entry point is
-// planCanonicalEditorBoot(), called from exactly one place in the whole
-// app -- a single guarded check in app-core.js, immediately after the
-// normal startup sequence finishes (see that file's own "SLICE 5A" comment
-// near its auth.onAuthStateChanged handler), gated on a URL query
-// parameter (see PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM below) that nothing
-// in normal navigation ever sets or reads. A person who does not know that
-// exact parameter name can never reach this screen by clicking anything in
-// the app. This is the "approved development/test entry mechanism" this
-// correction establishes -- no such convention existed anywhere in the app
-// before it.
+// Reachability: canonical PLAN adoption now routes the app shell's ordinary
+// PLAN destination through planOpenCanonicalEditorFromPlanNavigation(). The
+// old URL-only development gate has been retired. The canonical editor mounts
+// inside page-programs, and revisiting PLAN preserves its current in-memory
+// draft rather than silently resetting it. Legacy Program records remain in
+// Firestore but are no longer the primary PLAN navigation destination.
 //
 // Production identity binding ("do not trust an arbitrary UI-supplied
 // owner UID"): planCanonicalEditorBuildProductionCtx() is the ONLY place
@@ -8555,7 +8547,6 @@ async function planReopenCanonicalTemplate(ownerUid, templateId, ctx) {
 // mirroring the same injection pattern firebase.js's own dormant-delegation
 // wiring already established and this project already accepted.
 
-var PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM = 'slice5aCanonicalEditor';
 var PLAN_CANONICAL_EDITOR_CONTAINER_ID = 'slice5a-canonical-editor-root';
 var PLAN_CANONICAL_EDITOR_DEVICE_ID_STORAGE_KEY = 'slice5aCanonicalEditorDeviceId';
 
@@ -10113,6 +10104,25 @@ function planCanonicalEditorExerciseOptions() {
   return [];
 }
 
+// Regular PLAN navigation entry. Mount the canonical editor inside the
+// existing page-programs page instead of the old fixed development overlay.
+// Re-entering PLAN preserves the current in-memory draft; only the first visit
+// boots a fresh state (and performs the existing recovery-marker check).
+function planOpenCanonicalEditorFromPlanNavigation() {
+  if (typeof document !== 'undefined') {
+    var page = planContainer();
+    if (page) {
+      page.innerHTML = '';
+      var mountedRoot = document.createElement('div');
+      mountedRoot.id = PLAN_CANONICAL_EDITOR_CONTAINER_ID;
+      page.appendChild(mountedRoot);
+    }
+  }
+  if (!planCanonicalEditorState) return planCanonicalEditorBoot();
+  planCanonicalEditorRender();
+  return planCanonicalEditorState;
+}
+
 function planCanonicalEditorRender() {
   if (typeof document === 'undefined') return;
   if (!planCanonicalEditorState) return;
@@ -10354,7 +10364,7 @@ function planCanonicalEditorRender() {
   var reopenLockedAttr = (st.busy || st._pendingSaveAttempt || st.recoveryChecking) ? 'disabled' : '';
 
   root.innerHTML =
-    '<div class="page-title-zone"><h2>Canonical Program Editor (development/test only)</h2></div>' +
+    '<div class="page-title-zone"><h2>Program Editor</h2></div>' +
     outcomeHtml + validationHtml + reloadWarningHtml +
     '<div class="form-group"><label>Program Name</label><input type="text" data-testid="program-name" ' + lockedAttr + ' value="' + escapeHtml(es.name || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'name\',this.value)"></div>' +
     '<div class="form-group"><label>Description</label><textarea data-testid="program-description" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'description\',this.value)">' + escapeHtml(es.description || '') + '</textarea></div>' +
@@ -10388,10 +10398,9 @@ function planCanonicalEditorRender() {
 // this comment used to say so explicitly. The Slice 5A completion
 // correction below (banner: "SLICE 5A COMPLETION CORRECTION") is the
 // "future, separately authorized slice" that comment anticipated: it adds
-// the first and only real browser call sites for those functions, reachable
-// solely through planCanonicalEditorBoot() (see that section for the exact
-// reachability contract -- hidden from normal navigation, no legacy code
-// touched). In Node, this export block lets the standalone test harness
+// the first real browser call sites for those functions. The canonical PLAN
+// adoption correction now reaches them from ordinary PLAN navigation while
+// leaving legacy storage untouched. In Node, this export block lets the standalone test harness
 // `require()` these pure functions (and, now, the new editor's production
 // handler functions) without loading or affecting any browser-only DOM code
 // elsewhere in this file. There is exactly ONE export block for the whole
@@ -10992,10 +11001,10 @@ if (typeof module !== 'undefined' && module.exports) {
     planBuildCanonicalSaveAttempt: planBuildCanonicalSaveAttempt,
     planCommitCanonicalPackageAndClassify: planCommitCanonicalPackageAndClassify,
     // Slice 5A completion correction -- production canonical editor UI
-    PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM: PLAN_CANONICAL_EDITOR_DEV_QUERY_PARAM,
     PLAN_CANONICAL_EDITOR_CONTAINER_ID: PLAN_CANONICAL_EDITOR_CONTAINER_ID,
     planCanonicalEditorFreshState: planCanonicalEditorFreshState,
     planCanonicalEditorGetState: planCanonicalEditorGetState,
+    planOpenCanonicalEditorFromPlanNavigation: planOpenCanonicalEditorFromPlanNavigation,
     planResetCanonicalUserScopedState: planResetCanonicalUserScopedState,
     planCanonicalEditorBuildProductionCtx: planCanonicalEditorBuildProductionCtx,
     planCanonicalEditorBoot: planCanonicalEditorBoot,
