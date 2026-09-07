@@ -9206,29 +9206,26 @@ var PLAN_CANONICAL_EDITOR_PROGRESSION_STRING_FIELDS = ['evaluationType', 'adjust
 function planCanonicalEditorHandleSetProgramField(field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetProgramField')) return;
   planCanonicalEditorState.editorState[field] = rawValue;
-  planCanonicalEditorRender();
 }
 function planCanonicalEditorHandleSetMicrocycleField(mi, field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetMicrocycleField')) return;
   var mc = planCanonicalEditorResolveMicrocycle(mi);
   mc[field] = rawValue;
-  planCanonicalEditorRender();
 }
 function planCanonicalEditorHandleSetSessionField(mi, si, field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetSessionField')) return;
   var s = planCanonicalEditorResolveSession(mi, si);
   s[field] = rawValue;
-  planCanonicalEditorRender();
 }
 function planCanonicalEditorHandleSetExerciseField(mi, si, ei, field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetExerciseField')) return;
   var ex = planCanonicalEditorResolveExercise(mi, si, ei);
   ex[field] = rawValue;
-  planCanonicalEditorRender();
 }
 function planCanonicalEditorHandleSetSetField(mi, si, ei, seti, field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetSetField')) return;
   var set = planCanonicalEditorResolveSet(mi, si, ei, seti);
+  var hadValidationMessage = !!planCanonicalEditorState.validationMessage;
   if (PLAN_CANONICAL_EDITOR_SET_NUMERIC_FIELDS.indexOf(field) !== -1) {
     var parsed = planCanonicalEditorParseOptionalNumber(rawValue);
     if (!parsed.ok) {
@@ -9243,12 +9240,18 @@ function planCanonicalEditorHandleSetSetField(mi, si, ei, seti, field, rawValue)
     planCanonicalAdapterRequire(false, 'planCanonicalEditorHandleSetSetField: unsupported field ' + field);
   }
   planCanonicalEditorState.validationMessage = null;
-  planCanonicalEditorRender();
+  // Ordinary typing must not replace the editor's entire innerHTML: doing so
+  // destroys the focused input after every character. Redraw only when a
+  // discriminator changes which set controls are rendered.
+  if (hadValidationMessage || field === 'loadType' || field === 'repsType' || field === 'effortType' || field === 'timeType') {
+    planCanonicalEditorRender();
+  }
 }
 function planCanonicalEditorHandleSetProgressionField(mi, si, ei, field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetProgressionField')) return;
   var ex = planCanonicalEditorResolveExercise(mi, si, ei);
   planCanonicalAdapterRequire(ex.progression, 'planCanonicalEditorHandleSetProgressionField: progression is not enabled at [' + mi + '][' + si + '][' + ei + ']');
+  var hadValidationMessage = !!planCanonicalEditorState.validationMessage;
   if (PLAN_CANONICAL_EDITOR_PROGRESSION_NUMERIC_FIELDS.indexOf(field) !== -1) {
     var parsedP = planCanonicalEditorParseOptionalNumber(rawValue);
     if (!parsedP.ok) {
@@ -9263,7 +9266,11 @@ function planCanonicalEditorHandleSetProgressionField(mi, si, ei, field, rawValu
     planCanonicalAdapterRequire(false, 'planCanonicalEditorHandleSetProgressionField: unsupported field ' + field);
   }
   planCanonicalEditorState.validationMessage = null;
-  planCanonicalEditorRender();
+  // These two fields change the visible progression controls. Numeric entry,
+  // gateway selection, and fail behavior do not need a structural redraw.
+  if (hadValidationMessage || field === 'evaluationType' || field === 'adjustmentType') {
+    planCanonicalEditorRender();
+  }
 }
 
 // ---- Removal controls (requirement 1: "Add removal controls for sets,
