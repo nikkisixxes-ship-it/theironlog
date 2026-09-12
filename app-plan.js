@@ -8581,19 +8581,11 @@ function planCanonicalEditorGetState() { return planCanonicalEditorState; }
 function planResetCanonicalUserScopedState() {
   planCanonicalEditorState = null;
   planProgressionManualState = null;
-  // Canonical Program library correction (Phase A requirement 2): the
-  // library's fetched list of another owner's Programs is exactly the kind
-  // of state this hard authentication boundary exists to clear -- same
-  // treatment as the editor and manual-progression state above.
-  planCanonicalLibraryState = null;
-  planCanonicalEditorSyncBeforeUnloadGuard(false);
   if (typeof document !== 'undefined') {
     var editorRoot = document.getElementById(PLAN_CANONICAL_EDITOR_CONTAINER_ID);
     if (editorRoot) editorRoot.innerHTML = '';
     var progressionRoot = document.getElementById(PLAN_PROGRESSION_MANUAL_CONTAINER_ID);
     if (progressionRoot) progressionRoot.innerHTML = '';
-    var libraryRoot = document.getElementById(PLAN_CANONICAL_LIBRARY_CONTAINER_ID);
-    if (libraryRoot) libraryRoot.innerHTML = '';
   }
 }
 
@@ -8793,19 +8785,15 @@ function planCanonicalEditorBuildProductionCtx() {
   };
 }
 
-// ---- planCanonicalEditorBuildFreshState(ctx) ----
-// Phase A canonical Program library correction: extracted, byte-identical,
-// from planCanonicalEditorBoot's own state-object literal below (a pure
-// refactor -- no field, default value, or comment describing any field's
-// purpose changed) so the library's own Open-a-card flow
-// (planCanonicalLibraryHandleOpen below) can build a genuinely fresh
-// booted-editor-shaped state around an already-verified reopen result,
-// without duplicating this shape by hand and without triggering
-// planCanonicalEditorBoot's own recovery-marker check or render call (which
-// only make sense for a BRAND NEW Program boot, never for a Program the
-// library just finished verifying).
-function planCanonicalEditorBuildFreshState(ctx) {
-  return {
+// ---- planCanonicalEditorBoot(ctxOverride) ----
+// The sole entry point (see the banner comment above for the full
+// reachability contract). Production callers (app-core.js) always call this
+// with zero arguments. A Node-only test passes an explicit ctx (built with
+// the __test dispatch-for-test seam) to exercise the identical handler
+// chain below without ever touching the real hardcoded capability flags.
+function planCanonicalEditorBoot(ctxOverride) {
+  var ctx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalEditorBuildProductionCtx();
+  var st = {
     editorState: planCanonicalEditorFreshState(),
     ctx: ctx,
     outcome: null,
@@ -8813,15 +8801,6 @@ function planCanonicalEditorBuildFreshState(ctx) {
     lastSavedTemplateId: null,
     reopenTemplateIdInput: '',
     busy: false,
-    // Save-progress/save-performance correction requirement: the current
-    // sub-phase of an in-flight save, distinct from the plain boolean
-    // `busy` above -- 'preparingSave' (adapter/identity + package/manifest
-    // construction, before any I/O), 'saving' (the writer transaction is
-    // in flight), or 'verifyingReopen' (the commit succeeded and the
-    // mandatory automatic reopen is establishing the new _priorCanonicalBase).
-    // null whenever busy is false. Purely a rendering/observability aid --
-    // no handler branches on it, and clearing it never affects any outcome.
-    savePhase: null,
     // Save-lifecycle correction requirement 1: set true whenever a save
     // committed successfully but the immediate follow-up reopen (below)
     // could not confirm the new canonical head -- blocks an ordinary next
@@ -8861,18 +8840,6 @@ function planCanonicalEditorBuildFreshState(ctx) {
     // itself; only what is explicitly passed to that handler does.
     _abandonAcknowledged: false
   };
-}
-
-// ---- planCanonicalEditorBoot(ctxOverride) ----
-// The sole entry point (see the banner comment above for the full
-// reachability contract). Production callers (app-core.js, indirectly via
-// planCanonicalLibraryHandleNew/HandleOpen below) always call this with a
-// real production ctx. A Node-only test passes an explicit ctx (built with
-// the __test dispatch-for-test seam) to exercise the identical handler
-// chain below without ever touching the real hardcoded capability flags.
-function planCanonicalEditorBoot(ctxOverride) {
-  var ctx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalEditorBuildProductionCtx();
-  var st = planCanonicalEditorBuildFreshState(ctx);
   planCanonicalEditorState = st;
 
   // Uncertain-save recovery correction requirement 4: check for a valid,
@@ -8923,20 +8890,6 @@ function planCanonicalEditorApplyBootRecoveryOutcome(st, marker, result) {
       status: 'recoveryResolved', resolution: 'notFound',
       message: 'The previous save attempt (Template Id "' + marker.planTemplateId + '") did not produce a readable Template -- it is safe to save again.'
     };
-    // Phase A correction (finding 2): when this boot-time recovery check
-    // was entered by planOpenCanonicalLibraryFromPlanNavigation (guarding
-    // the canonical Program library, not a direct editor open),
-    // confirmed-absent unlocks the library -- the primary destination --
-    // instead of leaving a bare fresh editor mounted. Every pre-existing
-    // direct caller of planCanonicalEditorBoot never sets this ctx field,
-    // so this branch is inert for them; their behavior (render the fresh
-    // editor with the "safe to save again" message above) is unchanged.
-    if (st.ctx && st.ctx.__planCanonicalReturnToLibraryOnConfirmedAbsent) {
-      var libraryCtxForReturn = st.ctx.__planCanonicalReturnToLibraryOnConfirmedAbsent;
-      if (planCanonicalEditorState === st) planCanonicalEditorState = null;
-      planOpenCanonicalLibraryFromPlanNavigation(libraryCtxForReturn);
-      return;
-    }
     planCanonicalEditorRender();
     return;
   }
@@ -9085,176 +9038,6 @@ function planCanonicalEditorGuardMutable(callerName) {
   return true;
 }
 
-// ---- planCanonicalEditorIsSafeToLeave() ----
-// Save-progress/save-performance correction ("safe to leave" policy). The
-// exact same fail-closed condition planCanonicalEditorHandleNew and the
-// rendered reopenLockedAttr already use (busy, a pending save attempt --
-// live or cancelled-but-unresolved -- or an unresolved boot-time recovery
-// check): none of these guarantee the in-memory editorState is durably
-// reflected in Firestore yet, so leaving now could discard the only record
-// of an attempt that may already have written. No editor booted at all
-// (planCanonicalEditorState === null) is trivially safe -- there is nothing
-// to leave. This is the single source of truth both the rendered "Back to
-// Programs" action (planCanonicalEditorHandleBackToPrograms below) and the
-// beforeunload guard (planCanonicalEditorSyncBeforeUnloadGuard below)
-// consult -- neither duplicates this condition independently.
-function planCanonicalEditorIsSafeToLeave() {
-  var st = planCanonicalEditorState;
-  if (!st) return true;
-  return !(st.busy || st._pendingSaveAttempt || st.recoveryChecking);
-}
-
-// ---- planCanonicalEditorBeforeUnloadHandler(e) / ...SyncBeforeUnloadGuard(unsafe) ----
-// Save-progress/save-performance correction requirement: "register a
-// beforeunload warning for save/verified-reopen/pending-attempt/cancelled-
-// unresolved-attempt/recovery-check; remove the warning promptly once
-// safe." Deliberately NOT a permanently-installed unconditional prompt --
-// planCanonicalEditorSyncBeforeUnloadGuard is called on every render with
-// the CURRENT !planCanonicalEditorIsSafeToLeave() value, so the listener is
-// added the instant the editor becomes unsafe to leave and removed the
-// instant it becomes safe again, never left behind afterward. Guarded so a
-// Node test environment (no `window`, or a fake one with no
-// addEventListener) never throws; a test that wants to observe installation
-// supplies a fake `window` with addEventListener/removeEventListener spies.
-// A committed save whose automatic reopen failed (needsReopenBeforeNextSave)
-// is deliberately NOT included here -- the write already durably succeeded,
-// so leaving the page loses nothing; only the NEXT save is blocked (by
-// planCanonicalEditorHandleSave's own existing check) until a Reopen
-// succeeds.
-var planCanonicalEditorBeforeUnloadInstalled = false;
-function planCanonicalEditorBeforeUnloadHandler(e) {
-  if (e && typeof e.preventDefault === 'function') e.preventDefault();
-  if (e) e.returnValue = '';
-  return '';
-}
-function planCanonicalEditorSyncBeforeUnloadGuard(unsafe) {
-  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function' || typeof window.removeEventListener !== 'function') return;
-  if (unsafe && !planCanonicalEditorBeforeUnloadInstalled) {
-    window.addEventListener('beforeunload', planCanonicalEditorBeforeUnloadHandler);
-    planCanonicalEditorBeforeUnloadInstalled = true;
-  } else if (!unsafe && planCanonicalEditorBeforeUnloadInstalled) {
-    window.removeEventListener('beforeunload', planCanonicalEditorBeforeUnloadHandler);
-    planCanonicalEditorBeforeUnloadInstalled = false;
-  }
-}
-
-// ---- planCanonicalPerfNow() ----
-// Development-only performance instrumentation (requirement 4). A
-// monotonic clock when one is available (the real browser's
-// window.performance.now(), or Node's own global performance.now()),
-// falling back to Date.now() only when neither exists. Used exclusively by
-// the timing capture below, which itself only runs at all when a caller
-// has explicitly supplied ctx.perfObserver -- see
-// planCanonicalEditorHandleSave.
-function planCanonicalPerfNow() {
-  if (typeof performance !== 'undefined' && typeof performance.now === 'function') return performance.now();
-  return Date.now();
-}
-
-// ---- planCanonicalEditorComputeGraphSize(editorState) ----
-// Development-only performance instrumentation (requirement 4, item 6:
-// "graph size"). A pure, read-only count of the editor's own in-memory
-// structure -- never touches Firestore, never alters editorState. Used
-// exclusively for the injected perf observer's benefit; no handler branches
-// on its result.
-function planCanonicalEditorComputeGraphSize(editorState) {
-  var microcycles = (editorState && editorState.microcycles) || [];
-  var sessionCount = 0, exerciseCount = 0, setCount = 0;
-  microcycles.forEach(function (mc) {
-    var sessions = (mc && mc.sessions) || [];
-    sessionCount += sessions.length;
-    sessions.forEach(function (s) {
-      var exercises = (s && s.exercises) || [];
-      exerciseCount += exercises.length;
-      exercises.forEach(function (ex) {
-        setCount += ((ex && ex.sets) || []).length;
-      });
-    });
-  });
-  return { microcycleCount: microcycles.length, sessionCount: sessionCount, exerciseCount: exerciseCount, setCount: setCount };
-}
-
-// ---- planCanonicalComputePlannedReadCount(readPlan) ----
-// Phase A correction, finding 4: the prior instrumentation counted only
-// readPlan.reusedRevisionRefs.length, silently ignoring every other
-// category of document the real executor
-// (planValidateTemplateCommitReads/planBuildTemplateCommitPackage) actually
-// reads. A commitment package's readPlan (built above, around
-// `var readPlan = Object.freeze({...})`) carries exactly seventeen ref
-// categories, matching the `docs` shape planValidateTemplateCommitReads
-// documents and reads slots for:
-//   - six ALWAYS-present singular refs, one read each, unconditionally:
-//     schemaAuthorityRef, operationRef, gatewayRef, templateSubjectRef,
-//     manifestRootRef, projectionRef;
-//   - three OPTIONAL singular refs, counted only when present (non-null) --
-//     priorManifestRootRef/priorOperationRef/priorGatewayRef, frozen only
-//     for a genuine no-change-to-commit attempt (see noChangeToCommit
-//     above);
-//   - eight array-backed categories, each contributing exactly its own
-//     .length (zero when genuinely empty, never assumed non-empty):
-//     childSubjectRefs, reusedRevisionRefs, newRevisionTargetRefs,
-//     predecessorRevisionRefs, removedAssignmentRefs, chunkRefs,
-//     priorChunkRefs, duplicationSourceRefs.
-// Metadata carried on individual ref objects (chunkId, chunkOrdinal,
-// newSubjectId, sourceSubjectId, expectedHeadRevisionId, path, etc.) is
-// never itself counted as a read -- only the number of ref OBJECTS in each
-// category is. Pure and read-only: never mutates readPlan, never rebuilds
-// or re-derives it. Returns null (never an estimate) if any always-present
-// category is unexpectedly missing or any always-array category is
-// unexpectedly not an array -- an honest signal that the real readPlan
-// shape no longer matches what this helper was written against, rather
-// than silently reporting a wrong number.
-var PLAN_READ_PLAN_ALWAYS_SINGULAR_REF_KEYS = ['schemaAuthorityRef', 'operationRef', 'gatewayRef', 'templateSubjectRef', 'manifestRootRef', 'projectionRef'];
-var PLAN_READ_PLAN_OPTIONAL_SINGULAR_REF_KEYS = ['priorManifestRootRef', 'priorOperationRef', 'priorGatewayRef'];
-var PLAN_READ_PLAN_ARRAY_REF_KEYS = ['childSubjectRefs', 'reusedRevisionRefs', 'newRevisionTargetRefs', 'predecessorRevisionRefs', 'removedAssignmentRefs', 'chunkRefs', 'priorChunkRefs', 'duplicationSourceRefs'];
-function planCanonicalComputePlannedReadCount(readPlan) {
-  if (!readPlan || typeof readPlan !== 'object') return null;
-  var count = 0;
-  for (var i = 0; i < PLAN_READ_PLAN_ALWAYS_SINGULAR_REF_KEYS.length; i++) {
-    if (!readPlan[PLAN_READ_PLAN_ALWAYS_SINGULAR_REF_KEYS[i]]) return null;
-    count += 1;
-  }
-  for (var j = 0; j < PLAN_READ_PLAN_OPTIONAL_SINGULAR_REF_KEYS.length; j++) {
-    if (readPlan[PLAN_READ_PLAN_OPTIONAL_SINGULAR_REF_KEYS[j]]) count += 1;
-  }
-  for (var k = 0; k < PLAN_READ_PLAN_ARRAY_REF_KEYS.length; k++) {
-    var arr = readPlan[PLAN_READ_PLAN_ARRAY_REF_KEYS[k]];
-    if (!Array.isArray(arr)) return null;
-    count += arr.length;
-  }
-  return count;
-}
-
-// ---- planCanonicalComputeManifestChunkCount(pkg) ----
-// Phase A correction, finding 4: the prior instrumentation read
-// built.package.manifest.chunkCount, but a commitment package has no
-// top-level `manifest` field at all -- the real shape (see the package
-// object literal built above) is package.graph.manifest (itself carrying
-// its own chunkCount, stamped as chunks.length at manifest-build time) and
-// package.graph.chunks (the actual chunk array). Cross-checks the two
-// independent sources of chunk count against each other -- both are
-// derived from the same underlying chunks array and so must always agree
-// for a validly-built package -- and returns the count only when they do;
-// an honest null (never a silent choice of one over the other) if they
-// disagree or either source is missing/malformed. Pure and read-only:
-// never mutates or rebuilds the package.
-function planCanonicalComputeManifestChunkCount(pkg) {
-  var graph = pkg && pkg.graph;
-  var manifest = graph && graph.manifest;
-  var chunks = graph && graph.chunks;
-  if (!manifest || typeof manifest.chunkCount !== 'number' || !Array.isArray(chunks)) return null;
-  if (manifest.chunkCount !== chunks.length) return null;
-  return manifest.chunkCount;
-}
-
-// ---- planCanonicalComputeCandidateWriteCount(pkg) ----
-// Phase A correction, finding 4: this count was previously omitted
-// entirely despite package.candidateWrites.length being directly
-// available. Pure and read-only: never mutates or rebuilds the package.
-function planCanonicalComputeCandidateWriteCount(pkg) {
-  return (pkg && Array.isArray(pkg.candidateWrites)) ? pkg.candidateWrites.length : null;
-}
-
 // ---- planCanonicalEditorHandleNew() ----
 // The canonical "new Program" action. Discards whatever editor state
 // existed (if any) and replaces it with a completely fresh
@@ -9292,37 +9075,6 @@ function planCanonicalEditorHandleNew() {
   st.lastSavedTemplateId = null;
   st.needsReopenBeforeNextSave = false;
   planCanonicalEditorRender();
-}
-
-// ---- planCanonicalEditorHandleBackToPrograms() ----
-// Canonical Program library correction (Phase A requirement 2): a simple,
-// explicit way back to the library, added only where it is safe. Reuses
-// the exact same planCanonicalEditorIsSafeToLeave() predicate as the
-// beforeunload guard above -- if a save attempt is unresolved, a recovery
-// check is in progress, or an operation is literally in flight, this
-// refuses to leave (the existing fail-closed policy), sets a message, and
-// re-renders instead of discarding that state. Only when it is genuinely
-// safe does this clear the editor's own module state and beforeunload
-// guard and hand off to the library boot entry point.
-function planCanonicalEditorHandleBackToPrograms() {
-  planCanonicalEditorRequireBooted('planCanonicalEditorHandleBackToPrograms');
-  var st = planCanonicalEditorState;
-  if (!planCanonicalEditorIsSafeToLeave()) {
-    st.validationMessage = 'This Program has an unresolved save attempt or check in progress -- resolve it (Retry, Cancel, Check Saved Status, or Abandon) before returning to Programs.';
-    planCanonicalEditorRender();
-    return { status: 'blocked', reason: 'unsafeToLeave', message: st.validationMessage };
-  }
-  planCanonicalEditorState = null;
-  planCanonicalEditorSyncBeforeUnloadGuard(false);
-  // Phase A correction (finding 2): the library's own ctx (never discarded
-  // while an editor session is open -- see planCanonicalLibraryHandleNew/
-  // HandleOpen) is threaded through here so planOpenCanonicalLibraryFromPlanNavigation's
-  // recovery-marker check reuses the SAME injected ctx (production or
-  // test) this session has used throughout, rather than building a fresh
-  // production ctx (which would fail outside a real authenticated
-  // browser). Falls back to the production default when no library
-  // session exists yet, matching this function's own prior behavior.
-  return planOpenCanonicalLibraryFromPlanNavigation(planCanonicalLibraryState ? planCanonicalLibraryState.ctx : undefined);
 }
 
 // ---- planCanonicalEditorHandleEnableProgression(mi, si, ei) ----
@@ -9757,17 +9509,8 @@ function planCanonicalEditorOutcomeIsConclusivelyNoWrite(status) {
 // refuses to let a plain next Save silently pass through -- exactly the
 // condition that used to let an ordinary second Save mint a brand-new
 // Program instead of updating the one just saved.
-async function planCanonicalEditorApplySaveResult(st, result, perf) {
-  // Save-progress/safe-to-leave correction (Phase A requirement 3): st.outcome
-  // must never claim a save fully succeeded before the automatic verified
-  // reopen (below) actually resolves -- so, unlike every other status, the
-  // 'success'/'alreadyCommitted'-with-reopen branch further down deliberately
-  // does NOT publish st.outcome here at the top. It stays whatever HandleSave
-  // already set it to (null, cleared before this call) for the entire
-  // verifyingReopen window, and is only published once the reopen (success or
-  // failure) has resolved -- see the two st.outcome assignments below instead
-  // of one unconditional assignment here.
-  //
+async function planCanonicalEditorApplySaveResult(st, result) {
+  st.outcome = result;
   // Recovery-marker CERTAINTY correction (this round): 'permanent' is
   // planClassifyCanonicalWriteError's catch-all for every writer error that
   // is not specifically recognized as disabled/conflict/retryable -- an
@@ -9790,7 +9533,6 @@ async function planCanonicalEditorApplySaveResult(st, result, perf) {
     // "never reached the server"; for 'permanent', the catch-all itself
     // carries no source-proven guarantee either way. Either way the recovery
     // marker must also survive untouched.
-    st.outcome = result;
     return result;
   }
   // Every other status is terminal for this attempt -- nothing left to retry.
@@ -9821,10 +9563,7 @@ async function planCanonicalEditorApplySaveResult(st, result, perf) {
   if ((result.status === 'success' || result.status === 'alreadyCommitted') && result.draft && typeof result.draft.planTemplateId === 'string' && result.draft.planTemplateId) {
     st.lastSavedTemplateId = result.draft.planTemplateId;
     st.reopenTemplateIdInput = result.draft.planTemplateId;
-    st.savePhase = 'verifyingReopen';
-    var reopenStartedAt = (perf ? planCanonicalPerfNow() : null);
     var reopenResult = await planReopenCanonicalTemplate(st.ctx.ownerUid, result.draft.planTemplateId, st.ctx);
-    if (perf) perf.reopenMs = planCanonicalPerfNow() - reopenStartedAt;
     if (reopenResult.status === 'success' && reopenResult.editorState) {
       st.editorState = reopenResult.editorState;
       st.needsReopenBeforeNextSave = false;
@@ -9843,13 +9582,7 @@ async function planCanonicalEditorApplySaveResult(st, result, perf) {
       // committed, but confirming it failed) across a reload.
     }
     st.outcome = result;
-    return result;
   }
-  // Every status that reaches here (disabled/conflict/blocked/alreadyCommitted
-  // without a usable draft id, etc.) never enters the reopen branch above, so
-  // there is no verifying-reopen window to withhold this from -- publish it
-  // immediately, exactly like before this round's correction.
-  st.outcome = result;
   return result;
 }
 
@@ -9926,39 +9659,11 @@ async function planCanonicalEditorHandleSave() {
   st.busy = true;
   st.outcome = null;
   st.validationMessage = null;
-  st.savePhase = 'preparingSave';
-  // Dev-only performance instrumentation (Phase A requirement 4): entirely
-  // gated behind an optional ctx.perfObserver function. Production's own
-  // planCanonicalEditorBuildProductionCtx() never sets this field, so
-  // ordinary browser use allocates no perf object, times nothing, and calls
-  // no observer -- this branch is provably inactive outside an explicit
-  // test/dev ctx override. Never alters the built package, the manifest, or
-  // any commit behavior; it only reads timestamps and pre-existing counts.
-  var perfActive = typeof st.ctx.perfObserver === 'function';
-  var perf = perfActive ? { totalStartedAt: planCanonicalPerfNow(), prepareMs: null, commitMs: null, reopenMs: null, totalMs: null, graphSize: null, plannedReadCount: null, manifestChunkCount: null, candidateWriteCount: null } : null;
   planCanonicalEditorRender();
   try {
     planCanonicalAdapterRequire(st.ctx && typeof st.ctx === 'object', 'planCanonicalEditorHandleSave: ctx is required');
     planCanonicalAdapterRequire(typeof st.ctx.commitCanonicalPackage === 'function', 'planCanonicalEditorHandleSave: ctx.commitCanonicalPackage must be a function');
-    var prepareStartedAt = perf ? planCanonicalPerfNow() : null;
     var built = planBuildCanonicalSaveAttempt(st.editorState, st.ctx);
-    if (perf) {
-      perf.prepareMs = planCanonicalPerfNow() - prepareStartedAt;
-      perf.graphSize = planCanonicalEditorComputeGraphSize(st.editorState);
-      // Phase A correction, finding 4: complete planned-read count (all
-      // seventeen readPlan ref categories, not just reusedRevisionRefs),
-      // the real package.graph.manifest/graph.chunks-derived chunk count
-      // (not the nonexistent package.manifest.chunkCount), and the
-      // previously-omitted candidate write count -- see the three pure
-      // helpers defined above planCanonicalEditorHandleNew(). built.package
-      // is undefined for a blocked build (built.ok === false); each helper
-      // already returns null for a missing/malformed package, so no extra
-      // guard is needed here.
-      var pkgForPerf = built && built.package;
-      perf.plannedReadCount = planCanonicalComputePlannedReadCount(pkgForPerf && pkgForPerf.readPlan);
-      perf.manifestChunkCount = planCanonicalComputeManifestChunkCount(pkgForPerf);
-      perf.candidateWriteCount = planCanonicalComputeCandidateWriteCount(pkgForPerf);
-    }
     if (!built.ok) {
       var blockedResult = { status: built.status, blockReason: built.blockReason, details: built.details || {}, draft: built.draft };
       st.outcome = blockedResult;
@@ -9983,11 +9688,8 @@ async function planCanonicalEditorHandleSave() {
       operationId: operationIdForMarker,
       createdAt: new Date().toISOString()
     });
-    st.savePhase = 'saving';
-    var commitStartedAt = perf ? planCanonicalPerfNow() : null;
     var result = await planCommitCanonicalPackageAndClassify(st.ctx, built.package, built.draft);
-    if (perf) perf.commitMs = planCanonicalPerfNow() - commitStartedAt;
-    return await planCanonicalEditorApplySaveResult(st, result, perf);
+    return await planCanonicalEditorApplySaveResult(st, result);
   } catch (err) {
     // A synchronous throw here (malformed ctx, or anything
     // planBuildCanonicalSaveAttempt's own adapter/identity/basis/package
@@ -9999,12 +9701,6 @@ async function planCanonicalEditorHandleSave() {
     return classified;
   } finally {
     st.busy = false;
-    st.savePhase = null;
-    if (perf) {
-      perf.totalMs = planCanonicalPerfNow() - perf.totalStartedAt;
-      delete perf.totalStartedAt;
-      st.ctx.perfObserver({ operation: 'save', perf: perf });
-    }
     planCanonicalEditorRender();
   }
 }
@@ -10053,27 +9749,10 @@ async function planCanonicalEditorHandleRetrySave() {
   st.busy = true;
   st.outcome = null;
   st.validationMessage = null;
-  st.savePhase = 'saving';
-  var retryPerfActive = typeof st.ctx.perfObserver === 'function';
-  // Phase A correction, finding 4: Retry never rebuilds -- pending.package
-  // is the exact same object planBuildCanonicalSaveAttempt built for the
-  // first attempt (see planCanonicalEditorHandleSave), so
-  // plannedReadCount/manifestChunkCount/candidateWriteCount are computed
-  // directly from IT here, synchronously, before the retry commit is even
-  // attempted -- never left null, and never re-derived from a fresh build.
-  var retryPerf = retryPerfActive ? {
-    totalStartedAt: planCanonicalPerfNow(), prepareMs: null, commitMs: null, reopenMs: null, totalMs: null,
-    graphSize: planCanonicalEditorComputeGraphSize(st.editorState),
-    plannedReadCount: planCanonicalComputePlannedReadCount(pending.package && pending.package.readPlan),
-    manifestChunkCount: planCanonicalComputeManifestChunkCount(pending.package),
-    candidateWriteCount: planCanonicalComputeCandidateWriteCount(pending.package)
-  } : null;
   planCanonicalEditorRender();
   try {
-    var retryCommitStartedAt = retryPerf ? planCanonicalPerfNow() : null;
     var result = await planCommitCanonicalPackageAndClassify(st.ctx, pending.package, pending.draft);
-    if (retryPerf) retryPerf.commitMs = planCanonicalPerfNow() - retryCommitStartedAt;
-    return await planCanonicalEditorApplySaveResult(st, result, retryPerf);
+    return await planCanonicalEditorApplySaveResult(st, result);
   } catch (err) {
     var classified = planClassifyCanonicalWriteError(err, pending.draft);
     st._pendingSaveAttempt = null;
@@ -10081,12 +9760,6 @@ async function planCanonicalEditorHandleRetrySave() {
     return classified;
   } finally {
     st.busy = false;
-    st.savePhase = null;
-    if (retryPerf) {
-      retryPerf.totalMs = planCanonicalPerfNow() - retryPerf.totalStartedAt;
-      delete retryPerf.totalStartedAt;
-      st.ctx.perfObserver({ operation: 'retrySave', perf: retryPerf });
-    }
     planCanonicalEditorRender();
   }
 }
@@ -10462,15 +10135,6 @@ function planCanonicalEditorRender() {
   }
   var st = planCanonicalEditorState;
   var es = st.editorState;
-  // Save-progress/safe-to-leave correction (Phase A requirement 3): the
-  // beforeunload guard is synced on every render from the SAME
-  // planCanonicalEditorIsSafeToLeave() predicate that already drives
-  // lockedAttr/reopenLockedAttr below (busy || pending save attempt ||
-  // recovery check in progress) -- never a separately-tracked flag that
-  // could drift from what is actually rendered as locked. This means the
-  // warning is installed/removed based on current editor state on every
-  // render, not permanently installed once and left in place.
-  planCanonicalEditorSyncBeforeUnloadGuard(!planCanonicalEditorIsSafeToLeave());
   var busyAttr = st.busy ? 'disabled' : '';
   // Save-lifecycle correction requirement 3 ("Rendered controls must be
   // disabled appropriately"): every control that MUTATES editorState is
@@ -10501,16 +10165,6 @@ function planCanonicalEditorRender() {
   // reload recovery will not be available while the save is unresolved."
   var reloadWarningHtml = st.reloadRecoveryWarning
     ? '<div class="plan-canonical-editor-reload-warning" data-testid="reload-recovery-warning" style="margin:8px 0;padding:8px;border-radius:6px;background:#ffe;color:#740">' + escapeHtml(st.reloadRecoveryWarning) + '</div>'
-    : '';
-  // Save-progress/safe-to-leave correction (Phase A requirement 3): a small,
-  // always-present-when-relevant banner distinguishing the in-flight save
-  // sub-phases (preparing/saving/verifying reopen) from the terminal
-  // outcome banner above. st.savePhase is set/cleared only by
-  // planCanonicalEditorHandleSave/HandleRetrySave/ApplySaveResult -- this
-  // is a pure read of that state, not a second source of truth.
-  var savePhaseLabels = { preparingSave: 'Preparing save...', saving: 'Saving...', verifyingReopen: 'Saved -- verifying...' };
-  var savePhaseHtml = (st.savePhase && savePhaseLabels[st.savePhase])
-    ? '<div class="plan-canonical-editor-save-phase" data-testid="save-phase" style="margin:8px 0;padding:8px;border-radius:6px;background:#eef">' + escapeHtml(savePhaseLabels[st.savePhase]) + '</div>'
     : '';
 
   var exerciseOptions = planCanonicalEditorExerciseOptions();
@@ -10711,7 +10365,7 @@ function planCanonicalEditorRender() {
 
   root.innerHTML =
     '<div class="page-title-zone"><h2>Program Editor</h2></div>' +
-    savePhaseHtml + outcomeHtml + validationHtml + reloadWarningHtml +
+    outcomeHtml + validationHtml + reloadWarningHtml +
     '<div class="form-group"><label>Program Name</label><input type="text" data-testid="program-name" ' + lockedAttr + ' value="' + escapeHtml(es.name || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'name\',this.value)"></div>' +
     '<div class="form-group"><label>Description</label><textarea data-testid="program-description" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'description\',this.value)">' + escapeHtml(es.description || '') + '</textarea></div>' +
     '<div class="form-group"><label>Structure Label</label><input type="text" data-testid="program-structureLabel" ' + lockedAttr + ' value="' + escapeHtml(es.structureLabel || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'structureLabel\',this.value)"></div>' +
@@ -10726,521 +10380,12 @@ function planCanonicalEditorRender() {
     // planCanonicalEditorHandleNew's own comment for why New is no longer
     // exempt from this.
     '<button type="button" class="btn btn-secondary" data-testid="new-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleNew()">New</button>' +
-    '<button type="button" class="btn btn-secondary" data-testid="back-to-programs-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleBackToPrograms()">Back to Programs</button>' +
     '</div>' +
-    '<div class="form-group" style="margin-top:16px" data-testid="reopen-diagnostic-area"><label>Reopen Template Id (diagnostic/dev -- ordinarily use the Program library instead)</label>' +
+    '<div class="form-group" style="margin-top:16px"><label>Reopen Template Id</label>' +
     '<input type="text" data-testid="reopen-template-id-input" ' + reopenLockedAttr + ' value="' + escapeHtml(st.reopenTemplateIdInput || '') + '" oninput="planCanonicalEditorState.reopenTemplateIdInput = this.value">' +
     '<button type="button" class="btn btn-secondary" data-testid="reopen-btn" ' + reopenLockedAttr + ' onclick="planCanonicalEditorHandleReopen()">Reopen</button>' +
     '<button type="button" class="btn btn-secondary" data-testid="reopen-last-saved-btn" ' + (reopenLockedAttr || (!st.lastSavedTemplateId ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleReopenLastSaved()">Reopen Last Saved</button>' +
     '</div>';
-}
-
-// =============================================================================
-// CANONICAL PLAN LIBRARY (Phase A requirement 2) -- a discoverable canonical
-// Program library that normal PLAN navigation opens FIRST, instead of
-// dropping directly into the single-Program editor with no Template Id
-// required. Reads ONLY through the new fsPlanPersistence.fsPlanListTemplateSummaries
-// browser method (Phase A requirement 1), which itself delegates to the
-// existing, already-tested buildCanonicalPlanReaderSuite(...).listTemplateSummariesPage(...)
-// -- never a new query, never the legacy `programs` collection. Opening a
-// card always goes through the existing, unmodified planReopenCanonicalTemplate(...)
-// full verified-read path (the exact same one Reopen and auto-reopen-after-
-// save already use) -- a list-page summary is never treated as the editable
-// Program graph. The single-screen editor this section hands off to is
-// unmodified scaffolding, per this round's scope -- this section only adds a
-// discovery/entry layer in front of it.
-// =============================================================================
-
-var PLAN_CANONICAL_LIBRARY_CONTAINER_ID = 'canonical-plan-library-root';
-
-// Module-scoped, mirroring planCanonicalEditorState's own convention above:
-// { ctx, status, items, hasMore, nextCursor, error, openingTemplateId,
-//   openError }.
-//   status: 'loading' | 'ready' | 'disabled' | 'retryable' | 'error'
-var planCanonicalLibraryState = null;
-
-function planCanonicalLibraryGetState() { return planCanonicalLibraryState; }
-
-// Production ctx: reads ownerUid from the SAME live Firebase Auth handle
-// planCanonicalEditorBuildProductionCtx() already reads it from (never a
-// UI-supplied value), and delegates listTemplateSummaries to the one new
-// approved persistence method (Phase A requirement 1) -- never a raw
-// Firestore query, never the reader suite directly.
-//
-// buildEditorCtx is carried on this SAME ctx object (defaulting to the real
-// planCanonicalEditorBuildProductionCtx) rather than HandleNew/HandleOpen
-// below calling planCanonicalEditorBuildProductionCtx() directly -- matching
-// the one injection point every other handler in this file already relies
-// on for testability (a Node-only test passes a ctxOverride to
-// planCanonicalLibraryBoot with its own buildEditorCtx, driving these
-// IDENTICAL production handler functions against a fake editor ctx instead
-// of requiring a real auth.currentUser/fsPlanPersistence for every library
-// test).
-function planCanonicalLibraryBuildProductionCtx() {
-  var uid = (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null;
-  planCanonicalAdapterRequire(typeof uid === 'string' && uid,
-    'planCanonicalLibraryBuildProductionCtx: no authenticated user -- the canonical Program library must never be booted before real authentication resolves');
-  return {
-    ownerUid: uid,
-    listTemplateSummaries: function (input) { return fsPlanPersistence.fsPlanListTemplateSummaries(input); },
-    buildEditorCtx: planCanonicalEditorBuildProductionCtx
-  };
-}
-
-function planCanonicalLibraryRequireBooted(callerName) {
-  planCanonicalAdapterRequire(planCanonicalLibraryState && typeof planCanonicalLibraryState === 'object',
-    callerName + ': the canonical Program library has not been booted -- call planCanonicalLibraryBoot() first');
-}
-
-// ---- planCanonicalLibraryBoot(ctxOverride) ----
-// Same injection pattern as planCanonicalEditorBoot: production always
-// calls this with zero arguments (real ctx, real auth); a Node-only test
-// passes a ctx whose listTemplateSummaries is bound to
-// __test.dispatchCanonicalTemplateListForTest, driving this IDENTICAL
-// production function -- there is no separate "test version" of the list
-// UI, exactly the same testability contract the editor section above
-// already documents.
-function planCanonicalLibraryBoot(ctxOverride) {
-  var ctx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalLibraryBuildProductionCtx();
-  var st = {
-    ctx: ctx,
-    status: 'loading',
-    items: [],
-    hasMore: false,
-    nextCursor: null,
-    error: null,
-    openingTemplateId: null,
-    openError: null
-  };
-  planCanonicalLibraryState = st;
-  planCanonicalLibraryRender();
-  planCanonicalLibraryRunFetch(st, null, false);
-  return st;
-}
-
-// ---- planCanonicalLibraryRunFetch(st, cursor, append) ----
-// The one and only place this section calls ctx.listTemplateSummaries.
-// `.items` returned by listTemplateSummariesPage already excludes
-// malformed/terminated/inactive entries (the reader suite's own
-// classification/active-item filtering) -- rendered directly, never
-// re-filtered here. On append (Load More), new items are merged by
-// templateId so a page boundary landing between concurrent edits can never
-// produce a duplicate card; nextCursor/hasMore are always taken from the
-// freshest response. A response arriving after a newer boot has replaced
-// planCanonicalLibraryState is discarded rather than applied to stale state.
-//
-// A retryable engine failure inside listTemplateSummariesPage does not
-// reject -- it RESOLVES with { outcome: 'retryableFailure', ... } (the same
-// contract fsPlanReadCanonicalTemplate already uses, handled identically by
-// planReopenCanonicalTemplate above). That resolved-but-failed shape is
-// checked for explicitly, before treating the response as a page of items --
-// otherwise a retryable engine failure would be silently rendered as an
-// empty Program list instead of a retryable error.
-async function planCanonicalLibraryRunFetch(st, cursor, append) {
-  if (planCanonicalLibraryState !== st) return;
-  st.status = 'loading';
-  st.error = null;
-  planCanonicalLibraryRender();
-  try {
-    var page = await st.ctx.listTemplateSummaries({ ownerUid: st.ctx.ownerUid, cursor: cursor || null });
-    if (planCanonicalLibraryState !== st) return;
-    if (page && page.outcome === 'retryableFailure') {
-      st.status = 'retryable';
-      st.error = { status: 'retryable', error: { message: page.reason || 'retryable failure' }, result: page };
-      return;
-    }
-    var incoming = (page && Array.isArray(page.items)) ? page.items : [];
-    if (append) {
-      var seen = {};
-      st.items.forEach(function (it) { seen[it.templateId] = true; });
-      incoming.forEach(function (it) { if (!seen[it.templateId]) { st.items.push(it); seen[it.templateId] = true; } });
-    } else {
-      st.items = incoming.slice();
-    }
-    st.hasMore = !!(page && page.hasMore);
-    st.nextCursor = (page && page.nextCursor) || null;
-    st.status = 'ready';
-  } catch (err) {
-    if (planCanonicalLibraryState !== st) return;
-    var classified = planClassifyCanonicalReadError(err);
-    st.status = (classified.status === 'disabled') ? 'disabled' : (classified.status === 'retryable') ? 'retryable' : 'error';
-    st.error = classified;
-  } finally {
-    if (planCanonicalLibraryState === st) planCanonicalLibraryRender();
-  }
-}
-
-function planCanonicalLibraryHandleRetry() {
-  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleRetry');
-  return planCanonicalLibraryRunFetch(planCanonicalLibraryState, null, false);
-}
-
-function planCanonicalLibraryHandleLoadMore() {
-  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleLoadMore');
-  var st = planCanonicalLibraryState;
-  if (st.status === 'loading' || !st.hasMore || !st.nextCursor) return { status: 'ignored', reason: 'noMoreOrBusy' };
-  return planCanonicalLibraryRunFetch(st, st.nextCursor, true);
-}
-
-// ---- planCanonicalLibraryMountEditorContainer() ----
-// Mirrors planOpenCanonicalEditorFromPlanNavigation's own mount step
-// exactly -- clears page-programs, mounts a fresh
-// PLAN_CANONICAL_EDITOR_CONTAINER_ID div -- so the editor's own render
-// function finds the container it expects regardless of whether the editor
-// is reached via the library's New/Open, or (still, temporarily) directly.
-function planCanonicalLibraryMountEditorContainer() {
-  if (typeof document === 'undefined') return;
-  var page = planContainer();
-  if (!page) return;
-  page.innerHTML = '';
-  var mountedRoot = document.createElement('div');
-  mountedRoot.id = PLAN_CANONICAL_EDITOR_CONTAINER_ID;
-  page.appendChild(mountedRoot);
-}
-
-// ---- planCanonicalLibraryHandleNew() ----
-// A genuinely fresh editor: builds state directly with
-// planCanonicalEditorBuildFreshState(ctx) rather than going through
-// planCanonicalEditorBoot, deliberately -- Boot's own recovery-marker check
-// exists to catch an UNKNOWN prior uncertain save from a previous session,
-// which is only meaningful when reopening/resuming; a brand-new Program has
-// no marker of its own to check, and running that check here would risk
-// surfacing a stale marker belonging to whatever Program was open before
-// New was clicked.
-function planCanonicalLibraryHandleNew() {
-  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleNew');
-  // Phase A correction (final round, Finding 4): re-check for a valid,
-  // owner-matched recovery marker immediately before proceeding -- a marker
-  // may have been written (by another tab/session) after this library
-  // already finished booting with none present, while its New Program
-  // control stayed mounted and clickable. If one now exists, this locks
-  // into the existing recovery UI/status-check flow instead: no fresh
-  // editor is created, and the marker itself is never touched here.
-  var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(planCanonicalLibraryState.ctx);
-  if (recoveryCheck.locked) return recoveryCheck.editorState;
-  var ctx = planCanonicalLibraryState.ctx.buildEditorCtx();
-  planCanonicalLibraryMountEditorContainer();
-  planCanonicalEditorState = planCanonicalEditorBuildFreshState(ctx);
-  planCanonicalEditorRender();
-  return planCanonicalEditorState;
-}
-
-// ---- planCanonicalLibraryHandleOpen(templateId) ----
-// Uses the card's own stable Template Id and the SAME full verified-read
-// path (planReopenCanonicalTemplate) Reopen and auto-reopen-after-save
-// already use -- never the summary data itself. Enters the editor only
-// after that read succeeds; on failure, the library stays mounted and
-// shows the failure on the card's own action so a person can retry from the
-// library instead of being dropped into a broken editor screen.
-async function planCanonicalLibraryHandleOpen(templateId) {
-  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleOpen');
-  var st = planCanonicalLibraryState;
-  if (st.openingTemplateId) return { status: 'ignored', reason: 'openInProgress' };
-  planCanonicalAdapterRequire(typeof templateId === 'string' && templateId, 'planCanonicalLibraryHandleOpen: templateId is required');
-  // Phase A correction (final round, Finding 4): the same re-check
-  // planCanonicalLibraryHandleNew above performs, immediately before this
-  // proceeds -- a marker may have been written (by another tab/session)
-  // after this library already finished booting with none present, while
-  // its Open/Edit controls stayed mounted and clickable. If one now
-  // exists, this locks into the existing recovery UI/status-check flow
-  // instead: the selected Template is never opened, and the marker itself
-  // is never touched here. Checked BEFORE st.openingTemplateId is set and
-  // before any read is issued, so a locked outcome never leaves a stray
-  // "opening" state behind.
-  var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(st.ctx);
-  if (recoveryCheck.locked) return { status: 'ignored', reason: 'recoveryPending', editorState: recoveryCheck.editorState };
-  st.openingTemplateId = templateId;
-  st.openError = null;
-  planCanonicalLibraryRender();
-  // Phase A correction (finding 1): a successful reopen must leave the
-  // editor mounted -- planCanonicalLibraryRender() looks up
-  // PLAN_CANONICAL_LIBRARY_CONTAINER_ID by id; once
-  // planCanonicalLibraryMountEditorContainer() below has replaced
-  // #page-programs's content with the editor container, that library root
-  // no longer exists in the DOM, so an unconditional finally-block render
-  // would find it missing, wipe #page-programs, and remount a brand-new
-  // (empty-looking) library over the editor that was just opened. This
-  // flag is the one clean way to tell the finally block "this call already
-  // reached a successful, still-current transition to the editor -- do not
-  // touch the DOM again on the way out."
-  var openedEditor = false;
-  try {
-    var editorCtx = st.ctx.buildEditorCtx();
-    var reopenResult = await planReopenCanonicalTemplate(editorCtx.ownerUid, templateId, editorCtx);
-    // Stale-result guard: if the library itself has been replaced (a fresh
-    // boot, a Retry, or the user navigated away) while this reopen was in
-    // flight, this result belongs to a session that no longer exists --
-    // never act on it, and never touch st (a different object now).
-    if (planCanonicalLibraryState !== st) return reopenResult;
-    if (reopenResult.status === 'success' && reopenResult.editorState) {
-      var freshState = planCanonicalEditorBuildFreshState(editorCtx);
-      freshState.editorState = reopenResult.editorState;
-      freshState.lastSavedTemplateId = templateId;
-      freshState.reopenTemplateIdInput = templateId;
-      planCanonicalLibraryMountEditorContainer();
-      planCanonicalEditorState = freshState;
-      // Clear the in-flight marker on the (still-retained, not discarded)
-      // library state now, inline, rather than relying on the finally
-      // block below -- so a LATER return to the library (Back to
-      // Programs) never shows this Program as still "opening".
-      st.openingTemplateId = null;
-      openedEditor = true;
-      planCanonicalEditorRender();
-      return reopenResult;
-    }
-    st.openError = reopenResult;
-    return reopenResult;
-  } catch (err) {
-    var classified = planClassifyCanonicalReadError(err);
-    if (planCanonicalLibraryState === st) st.openError = classified;
-    return classified;
-  } finally {
-    // Only the non-success paths (failure, stale, or an exception) still
-    // own #page-programs as the library -- render it there, honestly
-    // reflecting st.openError. A successful transition to the editor
-    // (openedEditor) must never be followed by a library render here.
-    if (!openedEditor && planCanonicalLibraryState === st) {
-      st.openingTemplateId = null;
-      planCanonicalLibraryRender();
-    }
-  }
-}
-
-function planCanonicalLibraryOutcomeLabel(err) {
-  if (!err || !err.status) return '';
-  var labels = { disabled: 'Disabled (canonical capability is off)', retryable: 'Retryable failure -- try again' };
-  return labels[err.status] || 'Could not open this Program';
-}
-
-// ---- planCanonicalLibraryRender() ----
-// Real DOM, guarded no-op under Node -- same convention as
-// planCanonicalEditorRender above. Covers every state requirement 2 names:
-// loading, empty, one active-Program card per valid summary (name plus
-// whichever of description/structureLabel/assignmentCount are available),
-// New Program, Open/Edit, retry for a retryable list failure, and honest
-// disabled/unknown-error states.
-function planCanonicalLibraryRender() {
-  if (typeof document === 'undefined') return;
-  if (!planCanonicalLibraryState) return;
-  var page = planContainer();
-  var root = document.getElementById(PLAN_CANONICAL_LIBRARY_CONTAINER_ID);
-  if (!root) {
-    root = document.createElement('div');
-    root.id = PLAN_CANONICAL_LIBRARY_CONTAINER_ID;
-    if (page) { page.innerHTML = ''; page.appendChild(root); }
-    else if (typeof document.body !== 'undefined') { document.body.appendChild(root); }
-  }
-  var st = planCanonicalLibraryState;
-  var newBtnHtml = '<button type="button" class="btn btn-primary" data-testid="library-new-btn" onclick="planCanonicalLibraryHandleNew()">New Program</button>';
-
-  if (st.status === 'loading' && !st.items.length) {
-    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
-      '<div data-testid="library-loading" style="padding:16px">Loading Programs...</div>';
-    return;
-  }
-  if (st.status === 'disabled') {
-    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
-      '<div data-testid="library-disabled" style="padding:8px;border-radius:6px;background:#eee">The canonical Program library is currently disabled.</div>' +
-      newBtnHtml;
-    return;
-  }
-  if (st.status === 'retryable' || st.status === 'error') {
-    var isRetryable = st.status === 'retryable';
-    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
-      '<div data-testid="' + (isRetryable ? 'library-retryable' : 'library-error') + '" style="padding:8px;border-radius:6px;' + (isRetryable ? 'background:#ffe;color:#740' : 'background:#fee;color:#900') + '">Could not load Programs' + (isRetryable ? ' -- a retryable error occurred.' : '.') +
-      (st.error && st.error.error && st.error.error.message ? ' -- ' + escapeHtml(st.error.error.message) : '') + '</div>' +
-      '<button type="button" class="btn btn-secondary" data-testid="library-retry-btn" onclick="planCanonicalLibraryHandleRetry()">Retry</button>' +
-      newBtnHtml;
-    return;
-  }
-
-  var openErrorHtml = st.openError
-    ? '<div class="plan-canonical-library-open-error" data-testid="library-open-error" style="margin:8px 0;padding:8px;border-radius:6px;background:#fee;color:#900">' +
-      escapeHtml(planCanonicalLibraryOutcomeLabel(st.openError)) +
-      (st.openError.error && st.openError.error.message ? ' -- ' + escapeHtml(st.openError.error.message) : '') +
-      '</div>'
-    : '';
-
-  var cardsHtml = !st.items.length
-    ? '<div data-testid="library-empty" style="padding:16px">No Programs yet. Use New Program to create one.</div>'
-    : st.items.map(function (item) {
-      var opening = st.openingTemplateId === item.templateId;
-      var detailBits = [];
-      if (item.description) detailBits.push(escapeHtml(item.description));
-      if (item.structureLabel) detailBits.push(escapeHtml(item.structureLabel));
-      if (typeof item.assignmentCount === 'number') detailBits.push(item.assignmentCount + ' assignment' + (item.assignmentCount === 1 ? '' : 's'));
-      var safeTemplateId = escapeHtml(item.templateId).replace(/'/g, "\\'");
-      return '<div class="plan-canonical-library-card" data-testid="library-card" data-template-id="' + escapeHtml(item.templateId) + '" style="border:1px solid #ccc;border-radius:6px;padding:8px;margin:6px 0">' +
-        '<div style="font-weight:600">' + escapeHtml(item.name || '(untitled Program)') + '</div>' +
-        (detailBits.length ? '<div style="font-size:12px;color:#555">' + detailBits.join(' -- ') + '</div>' : '') +
-        '<button type="button" class="btn btn-sm" data-testid="library-open-btn" data-template-id="' + escapeHtml(item.templateId) + '" ' + (opening ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleOpen(\'' + safeTemplateId + '\')">' + (opening ? 'Opening...' : 'Open / Edit') + '</button>' +
-        '</div>';
-    }).join('');
-
-  var loadMoreHtml = st.hasMore
-    ? '<button type="button" class="btn btn-secondary" data-testid="library-load-more-btn" ' + (st.status === 'loading' ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleLoadMore()">Load More</button>'
-    : '';
-
-  root.innerHTML =
-    '<div class="page-title-zone"><h2>Programs</h2></div>' +
-    openErrorHtml +
-    newBtnHtml +
-    '<div data-testid="library-cards">' + cardsHtml + '</div>' +
-    loadMoreHtml;
-}
-
-// ---- planCanonicalOwnsPageProgramsView() ----
-// Phase A correction, finding 3: a single explicit canonical-ownership
-// predicate, exported so app-core.js's legacy `programs` collection
-// snapshot listener can ask "does the canonical library/editor (including
-// the canonical editor's own boot-time recovery-check screen -- it's just
-// planCanonicalEditorState with recoveryChecking true) currently own the
-// #page-programs container?" instead of re-deriving that answer from
-// scattered DOM guesses. Both planCanonicalLibraryBoot and
-// planCanonicalEditorBoot assign their respective module-scoped state
-// synchronously, before any async work begins, and
-// planOpenCanonicalLibraryFromPlanNavigation (the sole normal-PLAN-
-// navigation entry point, called synchronously from showPage() the moment
-// #page-programs becomes the active page) always ends by calling one of
-// them -- so by the time any other code can observe #page-programs as the
-// active page, canonical ownership is already established. The only time
-// both are null is when planResetCanonicalUserScopedState() has just torn
-// everything down (auth boundary), which also clears the canonical
-// containers' own DOM -- correctly reporting "canonical does not own it"
-// in that narrow window, since there is nothing canonical left to protect.
-function planCanonicalOwnsPageProgramsView() {
-  return !!(planCanonicalLibraryState || planCanonicalEditorState);
-}
-
-// ---- planCanonicalLibraryCheckAndLockOnPendingRecovery(libraryCtx) ----
-// Phase A correction (final round, Finding 4 -- multi-tab recovery-marker
-// race). Closes a gap the boot-time-only check below could not: a valid,
-// owner-matched recovery marker written by ANOTHER tab/session AFTER this
-// library already finished booting with none present -- so its rendered
-// New/Open controls are still mounted and clickable, even though a prior
-// save attempt from elsewhere is now genuinely unresolved. This is the ONE
-// shared route used both by initial PLAN navigation
-// (planOpenCanonicalLibraryFromPlanNavigation below) and immediately before
-// New/Open on an ALREADY-mounted library (planCanonicalLibraryHandleNew/
-// HandleOpen further below) -- there is no second, separate recovery
-// protocol; every locked path still mounts the exact same pre-existing
-// recovery UI/status-check/Retry-Check/Abandon flow via the unmodified
-// planCanonicalEditorBoot / planCanonicalEditorRunBootRecoveryCheck /
-// planCanonicalEditorApplyBootRecoveryOutcome machinery, and never touches
-// or clears the marker itself (only that machinery's own resolution
-// branches do).
-//
-// Returns { locked: true, editorState } once a valid marker is found (or
-// one is already being checked -- see below), having already, synchronously,
-// mounted the locked recovery screen; or { locked: false } when it is safe
-// for the caller to proceed with an ordinary New/Open/library boot.
-//
-// Duplicate-check prevention (requirement: "two rapid actions cannot start
-// duplicate recovery checks"): if a recovery check is ALREADY running
-// (planCanonicalEditorState.recoveryChecking, set synchronously by an
-// earlier call to this exact function, strictly before its own async status
-// check ever settles), this returns that ALREADY-locked state immediately
-// without re-reading localStorage or starting a second status check. This
-// is sufficient, not merely best-effort: browser click handlers (and this
-// function's own synchronous body) each run to completion before the next
-// begins, so the first call's synchronous lock is always already visible to
-// a second call for the same or a different action, however "simultaneous"
-// the two triggering clicks were. A malformed or wrong-owner marker still
-// returns null from the unmodified planCanonicalEditorReadValidRecoveryMarker
-// check below, so this falls through to { locked: false } exactly as
-// before this correction for those cases.
-function planCanonicalLibraryCheckAndLockOnPendingRecovery(libraryCtx) {
-  if (planCanonicalEditorState && planCanonicalEditorState.recoveryChecking) {
-    return { locked: true, editorState: planCanonicalEditorState };
-  }
-  var pendingMarker = planCanonicalEditorReadValidRecoveryMarker(libraryCtx.ownerUid);
-  if (!pendingMarker) return { locked: false };
-  var editorCtxForRecovery = libraryCtx.buildEditorCtx();
-  // Carries the library ctx along so that, if this recovery check resolves
-  // as confirmed-absent, the library can be reopened with the SAME injected
-  // ctx (production or test) rather than silently reverting to a fresh
-  // production ctx build -- identical to planOpenCanonicalLibraryFromPlanNavigation's
-  // own pre-existing behavior.
-  editorCtxForRecovery.__planCanonicalReturnToLibraryOnConfirmedAbsent = libraryCtx;
-  if (typeof document !== 'undefined') {
-    var recoveryPage = planContainer();
-    if (recoveryPage) {
-      recoveryPage.innerHTML = '';
-      var recoveryRoot = document.createElement('div');
-      recoveryRoot.id = PLAN_CANONICAL_EDITOR_CONTAINER_ID;
-      recoveryPage.appendChild(recoveryRoot);
-    }
-  }
-  // The editor's own existing, unmodified rendering already covers every
-  // state this needs while locked: the "checking previous save..." message,
-  // and (for a retryable/unrecognized result) the established Retry Check /
-  // Abandon controls -- there is no New/Open control anywhere on this
-  // screen, so neither is reachable while locked.
-  var lockedState = planCanonicalEditorBoot(editorCtxForRecovery);
-  return { locked: true, editorState: lockedState };
-}
-
-// ---- planOpenCanonicalLibraryFromPlanNavigation() ----
-// The new normal-PLAN-navigation entry point (Phase A requirement 2):
-// app-core.js's page-programs branch now calls this instead of calling
-// planOpenCanonicalEditorFromPlanNavigation() directly (that function stays
-// defined, untouched, for the diagnostic Reopen-by-Id path and any test
-// that still exercises it directly -- see the implementation report).
-// Re-entering PLAN while the library is already booted simply re-renders it
-// (mirroring planOpenCanonicalEditorFromPlanNavigation's own "revisiting
-// preserves state" behavior) rather than discarding its current page/items
-// and re-fetching every time.
-function planOpenCanonicalLibraryFromPlanNavigation(ctxOverride) {
-  if (planCanonicalEditorState) {
-    // An editor session (new or reopened) is already open -- normal PLAN
-    // navigation while mid-edit re-enters that editor exactly as it did
-    // before this correction, not the library, so in-progress editing (and
-    // any unresolved save/recovery state) is never silently abandoned by a
-    // plain nav click. "Back to Programs" is the explicit, safety-checked
-    // way back to the library (see planCanonicalEditorHandleBackToPrograms).
-    planCanonicalLibraryMountEditorContainer();
-    planCanonicalEditorRender();
-    return planCanonicalEditorState;
-  }
-
-  // Phase A correction (finding 2): normal PLAN navigation must not offer
-  // New/Open (i.e. must not open the library at all) while an
-  // owner-matched, well-formed recovery marker from an earlier unresolved
-  // save is still pending -- otherwise New/Open could silently bypass, and
-  // a later Save could silently overwrite, the one thing standing between
-  // the app and losing track of that earlier uncertain write. This reuses
-  // the exact, already-accepted recovery-marker check
-  // (planCanonicalEditorReadValidRecoveryMarker) and boot-time
-  // recovery-check machinery (planCanonicalEditorBoot /
-  // planCanonicalEditorRunBootRecoveryCheck /
-  // planCanonicalEditorApplyBootRecoveryOutcome) the editor has always
-  // had -- nothing here reimplements or duplicates that logic, and a
-  // malformed/wrong-owner marker still returns null from that same,
-  // unmodified check (falling through to an ordinary library boot exactly
-  // as before this correction).
-  var libraryCtx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalLibraryBuildProductionCtx();
-  // Phase A correction (final round, Finding 4): this check is now the
-  // shared planCanonicalLibraryCheckAndLockOnPendingRecovery helper (see
-  // its own comment above) -- the SAME route planCanonicalLibraryHandleNew/
-  // HandleOpen below also call immediately before proceeding, closing the
-  // multi-tab race where a marker appears after a library is already
-  // mounted. Behavior here is byte-for-byte unchanged from before this
-  // correction.
-  var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(libraryCtx);
-  if (recoveryCheck.locked) return recoveryCheck.editorState;
-
-  if (typeof document !== 'undefined') {
-    var page = planContainer();
-    if (page) {
-      page.innerHTML = '';
-      var mountedRoot = document.createElement('div');
-      mountedRoot.id = PLAN_CANONICAL_LIBRARY_CONTAINER_ID;
-      page.appendChild(mountedRoot);
-    }
-  }
-  if (!planCanonicalLibraryState) return planCanonicalLibraryBoot(libraryCtx);
-  planCanonicalLibraryRender();
-  return planCanonicalLibraryState;
 }
 
 // -----------------------------------------------------------------------------
@@ -11921,39 +11066,6 @@ if (typeof module !== 'undefined' && module.exports) {
     planCanonicalEditorHandleMoveSet: planCanonicalEditorHandleMoveSet,
     planCanonicalEditorValidateBeforeSave: planCanonicalEditorValidateBeforeSave,
     planCanonicalEditorExerciseOptions: planCanonicalEditorExerciseOptions,
-    planCanonicalEditorIdxAttrs: planCanonicalEditorIdxAttrs,
-    // Phase A requirement 3: save-progress/safe-to-leave behavior
-    planCanonicalEditorIsSafeToLeave: planCanonicalEditorIsSafeToLeave,
-    planCanonicalEditorSyncBeforeUnloadGuard: planCanonicalEditorSyncBeforeUnloadGuard,
-    planCanonicalEditorBeforeUnloadHandler: planCanonicalEditorBeforeUnloadHandler,
-    planCanonicalEditorHandleBackToPrograms: planCanonicalEditorHandleBackToPrograms,
-    // Phase A requirement 4: development-only save-performance instrumentation
-    planCanonicalPerfNow: planCanonicalPerfNow,
-    planCanonicalEditorComputeGraphSize: planCanonicalEditorComputeGraphSize,
-    // Phase A correction, finding 4: pure planned-read/manifest-chunk/
-    // candidate-write count helpers.
-    planCanonicalComputePlannedReadCount: planCanonicalComputePlannedReadCount,
-    planCanonicalComputeManifestChunkCount: planCanonicalComputeManifestChunkCount,
-    planCanonicalComputeCandidateWriteCount: planCanonicalComputeCandidateWriteCount,
-    // Phase A requirement 2: canonical Program library
-    PLAN_CANONICAL_LIBRARY_CONTAINER_ID: PLAN_CANONICAL_LIBRARY_CONTAINER_ID,
-    planCanonicalLibraryGetState: planCanonicalLibraryGetState,
-    planCanonicalLibraryBuildProductionCtx: planCanonicalLibraryBuildProductionCtx,
-    planCanonicalLibraryBoot: planCanonicalLibraryBoot,
-    planCanonicalLibraryRunFetch: planCanonicalLibraryRunFetch,
-    planCanonicalLibraryHandleRetry: planCanonicalLibraryHandleRetry,
-    planCanonicalLibraryHandleLoadMore: planCanonicalLibraryHandleLoadMore,
-    planCanonicalLibraryMountEditorContainer: planCanonicalLibraryMountEditorContainer,
-    planCanonicalLibraryHandleNew: planCanonicalLibraryHandleNew,
-    planCanonicalLibraryHandleOpen: planCanonicalLibraryHandleOpen,
-    planCanonicalLibraryOutcomeLabel: planCanonicalLibraryOutcomeLabel,
-    planCanonicalLibraryRender: planCanonicalLibraryRender,
-    planOpenCanonicalLibraryFromPlanNavigation: planOpenCanonicalLibraryFromPlanNavigation,
-    // Phase A: extracted fresh-state builder (used by Boot, and now by the
-    // library's New/Open flows)
-    planCanonicalEditorBuildFreshState: planCanonicalEditorBuildFreshState,
-    // Phase A correction, finding 3: canonical-ownership predicate, used by
-    // app-core.js's legacy programs-collection snapshot listener.
-    planCanonicalOwnsPageProgramsView: planCanonicalOwnsPageProgramsView
+    planCanonicalEditorIdxAttrs: planCanonicalEditorIdxAttrs
   };
 }
