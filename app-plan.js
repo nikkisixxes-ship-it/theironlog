@@ -3017,6 +3017,793 @@ function planValidateDuplicationLineage(rawLineageList, graphSubjectIds, templat
   return { ok: true, bySubjectId: bySubjectId, recordTypeBySubjectId: recordTypeBySubjectId };
 }
 
+// =============================================================================
+// PHASE B (Round 10 implementation) -- planPrepareDuplicationLineageForCommit
+// =============================================================================
+// Shared, pure helper called by BOTH the authoritative Save build sequence
+// (planBuildCanonicalSaveAttempt) and the Preview build sequence
+// (planCanonicalEditorPreviewDuplicationSave), on the exact same
+// ordinary-mode draft/basis pair each is about to submit. Classifies the
+// editor's transient duplication-lineage sidecar
+// (editorState._pendingDuplicationLineage) into exactly one of three
+// outcomes (Round 10 spec Section 6.6.1) and builds the complete, atomic
+// draft/basis attachment for the one case that has genuine canonical
+// provenance to report. Never mutates pendingLineage, draft, or basis;
+// never allocates identity; performs no I/O; fails closed on any
+// structural or cross-check problem. This function, and the writer
+// functions above it (planEnsureDraftIdentities, planValidateDuplicationLineage,
+// planBuildTemplateCommitPackage), are not modified to accommodate it --
+// it only ever builds inputs those already-accepted functions already know
+// how to accept or correctly reject.
+//
+// pendingLineage: editorState._pendingDuplicationLineage, or absent/empty.
+//   Sidecar schema (Section 6.3, unchanged by this round):
+//     { canonicalSubjects: { [destId]: { structuralSourceSubjectId,
+//                                         persistedSourceSubjectId, // string or null
+//                                         recordType, groupId } },
+//       localScope:       { [destId]: { structuralSourceLocalId,
+//                                         recordType, groupId } } }
+// draft: the ordinary-mode, post-planEnsureDraftIdentities canonical draft
+//   about to be submitted (never the duplicate-mode shape).
+// basis: the freshly built commit basis (planBuildCommitBasis's return),
+//   read-only here -- specifically basis.priorChildHeadsBySubjectId, used
+//   to independently verify a claimed persisted source genuinely exists
+//   and to source its expectedHeadRevisionId/expectedEnvelope (never
+//   trusted from the sidecar's own self-assertion alone -- exactly the
+//   standard planValidateDuplicationLineage's own expectedBySubjectId
+//   cross-check already enforces on the writer side).
+//
+// Returns exactly one of:
+//   { ok:true,  hasLineage:false }
+//     -- Case 1 (immediate no-op, absent/structurally empty sidecar) or
+//        Case 2 (local-only no-op: validated, including one required
+//        normalization pass, but nothing persistable). Both attach
+//        nothing; a caller never needs to distinguish them.
+//   { ok:true,  hasLineage:true,
+//     draftDuplicationLineage: { duplicatedFromTemplateId: null, subjectLineage: [...] },
+//     duplicationSourceExpectedBySubjectId: { ... } }
+//     -- Case 3 (lineage-bearing): at least one canonical entry carries a
+//        genuine, independently verified, non-null persisted source.
+//   { ok:false, blockReason:'pendingDuplicationLineageInvalid', details:{reason:<check>, ...} }
+//     -- any structural/cross-check failure. No package-only identity has
+//        been allocated by the time a caller sees this (Section 6.6.2).
+function planPrepareDuplicationLineageForCommit(pendingLineage, draft, basis) {
+  var BLOCKED = 'pendingDuplicationLineageInvalid';
+  function blocked(reason, extra) {
+    var details = { reason: reason };
+    if (extra) { for (var k in extra) { if (Object.prototype.hasOwnProperty.call(extra, k)) details[k] = extra[k]; } }
+    return { ok: false, blockReason: BLOCKED, details: details };
+  }
+
+  // ---- Case 1a: absent sidecar -- the ONLY legitimate "no sidecar at
+  // all" input (Finding 2). Zero validation, zero normalization.
+  if (pendingLineage === undefined) {
+    return { ok: true, hasLineage: false };
+  }
+
+  // ---- Finding 2: exact-shape, fail-closed sidecar validation. A
+  // malformed sidecar (non-object, an array, a primitive, unrelated/
+  // missing top-level keys, a non-plain-object map) must never be
+  // silently reinterpreted as an empty/no-op sidecar -- only `undefined`
+  // above and the one exact structurally-empty shape below are legitimate
+  // no-ops. planIsPlainObject is this codebase's existing plain-object
+  // rule (accepts Object.prototype and null-prototype objects, rejects
+  // arrays/primitives/class instances) -- reused here rather than
+  // inventing a second notion of "plain" for this one helper.
+  if (!planIsPlainObject(pendingLineage)) {
+    return blocked('sidecarNotPlainObject');
+  }
+  // [Round 3 / Finding 3] The top-level key allow-list widens to permit
+  // one additional, optional key, expectedDuplicationManifest, sibling to
+  // the two existing maps. canonicalSubjects and localScope remain
+  // mandatory (checked below); expectedDuplicationManifest's own
+  // presence/emptiness requirement is enforced later (Section 5a) -- its
+  // mere absence from topKeys is never itself the reason for a block.
+  var topKeys = Object.keys(pendingLineage);
+  for (var tk = 0; tk < topKeys.length; tk++) {
+    if (topKeys[tk] !== 'canonicalSubjects' && topKeys[tk] !== 'localScope' && topKeys[tk] !== 'expectedDuplicationManifest') {
+      return blocked('sidecarUnexpectedKey', { key: topKeys[tk] });
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(pendingLineage, 'canonicalSubjects')) {
+    return blocked('sidecarMissingCanonicalSubjects');
+  }
+  if (!Object.prototype.hasOwnProperty.call(pendingLineage, 'localScope')) {
+    return blocked('sidecarMissingLocalScope');
+  }
+  if (!planIsPlainObject(pendingLineage.canonicalSubjects)) {
+    return blocked('canonicalSubjectsNotPlainObject');
+  }
+  if (!planIsPlainObject(pendingLineage.localScope)) {
+    return blocked('localScopeNotPlainObject');
+  }
+  var canonicalSubjects = pendingLineage.canonicalSubjects;
+  var localScope = pendingLineage.localScope;
+  var canonicalIds = Object.keys(canonicalSubjects);
+  var localIds = Object.keys(localScope);
+
+  // [Round 3 / Finding 3] expectedDuplicationManifest's raw value, if the
+  // key is present at all. Its own shape is not yet validated here --
+  // that is Section 5b's job, below -- this is only what Case 1b and
+  // Section 5a's gate need to classify the no-op/required determination.
+  var manifestKeyPresent = Object.prototype.hasOwnProperty.call(pendingLineage, 'expectedDuplicationManifest');
+  var rawDuplicationManifest = manifestKeyPresent ? pendingLineage.expectedDuplicationManifest : undefined;
+  var manifestIsExactEmptyObject = manifestKeyPresent && planIsPlainObject(rawDuplicationManifest) && Object.keys(rawDuplicationManifest).length === 0;
+
+  // ---- Case 1b: the three, and only three, legitimate no-op shapes
+  // (Round 3 Section 3) -- both required live maps present, both plain
+  // objects, both structurally empty, AND expectedDuplicationManifest
+  // either absent or itself the exact-empty plain object. Zero further
+  // work, nothing mutated, nothing attached. A present-but-nonempty, or
+  // present-but-malformed, manifest alongside two empty live maps is
+  // deliberately NOT a fourth no-op -- it falls through to full
+  // validation below (Section 3's own note: it will reach the manifest's
+  // own shape checks, or, once those pass, duplicationManifestEntryMissing).
+  if (canonicalIds.length === 0 && localIds.length === 0 && (!manifestKeyPresent || manifestIsExactEmptyObject)) {
+    return { ok: true, hasLineage: false };
+  }
+
+  var CANONICAL_LINEAGE_RECORD_TYPES = {
+    planAssignmentSubject: true,
+    planScheduleOpportunitySubject: true,
+    planPrescriptionSubject: true,
+    planImplementationRelationshipSubject: true,
+    planSetSubject: true,
+    planRuleSubject: true
+  };
+
+  // Responsibility 1: structural shape -- the EXACT permitted field set
+  // per entry (no extra fields, none missing), correctly typed, non-empty
+  // identifiers, and a recordType drawn from the actual known set
+  // (Finding 2's "invalid ... types"; previously any non-empty string was
+  // accepted here and only caught later, if at all, by a mismatch check
+  // that never ran for local-only builds). Also rejects a destId that
+  // collides with its own declared source (source and destination must
+  // differ -- Finding 3).
+  // [Round 3 / Finding 2] Every identifier-bearing field below is checked
+  // with planProgressionId -- this codebase's one established
+  // canonical/document-identifier predicate (Slice 5B's shared
+  // precedent, itself grounded in firebase.js's accepted isValidRecordId
+  // rejections: empty/whitespace-only, overlong, '/', '\\', NUL, '.', '..',
+  // '?', '#', and case-insensitive encoded '%2f'/'%5c' substitutes) --
+  // rather than the previous bare non-empty-string check. The blocked
+  // reasons below are UNCHANGED from before this round; only the
+  // underlying validity test is strengthened.
+  var ci, li;
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    var cDestId = canonicalIds[ci];
+    if (!planProgressionId(cDestId)) {
+      return blocked('invalidDestinationId', { destId: cDestId });
+    }
+    var cEntry = canonicalSubjects[cDestId];
+    if (!planIsPlainObject(cEntry)) {
+      return blocked('canonicalEntryMalformed', { destId: cDestId });
+    }
+    var cEntryKeys = Object.keys(cEntry);
+    var cShapeOk = cEntryKeys.length === 4 &&
+      Object.prototype.hasOwnProperty.call(cEntry, 'structuralSourceSubjectId') &&
+      Object.prototype.hasOwnProperty.call(cEntry, 'persistedSourceSubjectId') &&
+      Object.prototype.hasOwnProperty.call(cEntry, 'recordType') &&
+      Object.prototype.hasOwnProperty.call(cEntry, 'groupId');
+    if (!cShapeOk) {
+      return blocked('canonicalEntryMalformed', { destId: cDestId });
+    }
+    var cSourceOk = planProgressionId(cEntry.structuralSourceSubjectId);
+    var cPersistedOk = cEntry.persistedSourceSubjectId === null || planProgressionId(cEntry.persistedSourceSubjectId);
+    if (!cSourceOk || !cPersistedOk) {
+      return blocked('canonicalEntryMalformed', { destId: cDestId });
+    }
+    if (typeof cEntry.recordType !== 'string' || !Object.prototype.hasOwnProperty.call(CANONICAL_LINEAGE_RECORD_TYPES, cEntry.recordType)) {
+      return blocked('canonicalEntryInvalidRecordType', { destId: cDestId, recordType: cEntry.recordType });
+    }
+    if (!planProgressionId(cEntry.groupId)) {
+      return blocked('invalidGroupId', { destId: cDestId });
+    }
+    if (cEntry.structuralSourceSubjectId === cDestId) {
+      return blocked('canonicalSourceEqualsDestination', { destId: cDestId });
+    }
+  }
+  for (li = 0; li < localIds.length; li++) {
+    var lDestId = localIds[li];
+    if (!planProgressionId(lDestId)) {
+      return blocked('invalidDestinationId', { destId: lDestId });
+    }
+    var lEntry = localScope[lDestId];
+    if (!planIsPlainObject(lEntry)) {
+      return blocked('localEntryMalformed', { destId: lDestId });
+    }
+    var lEntryKeys = Object.keys(lEntry);
+    var lShapeOk = lEntryKeys.length === 3 &&
+      Object.prototype.hasOwnProperty.call(lEntry, 'structuralSourceLocalId') &&
+      Object.prototype.hasOwnProperty.call(lEntry, 'recordType') &&
+      Object.prototype.hasOwnProperty.call(lEntry, 'groupId');
+    if (!lShapeOk) {
+      return blocked('localEntryMalformed', { destId: lDestId });
+    }
+    if (!planProgressionId(lEntry.structuralSourceLocalId)) {
+      return blocked('localEntryMalformed', { destId: lDestId });
+    }
+    if (typeof lEntry.recordType !== 'string' || !Object.prototype.hasOwnProperty.call(PLAN_LINEAGE_LOCAL_SCOPE_RECORD_TYPES, lEntry.recordType)) {
+      return blocked('localEntryInvalidRecordType', { destId: lDestId, recordType: lEntry.recordType });
+    }
+    if (!planProgressionId(lEntry.groupId)) {
+      return blocked('invalidGroupId', { destId: lDestId });
+    }
+    if (lEntry.structuralSourceLocalId === lDestId) {
+      return blocked('localSourceEqualsDestination', { destId: lDestId });
+    }
+  }
+  // No destination may be claimed as both a canonical subject and a
+  // local-scope node ("no destination appears in both maps" -- Finding 3's
+  // group-coherence requirement).
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    if (Object.prototype.hasOwnProperty.call(localScope, canonicalIds[ci])) {
+      return blocked('duplicateDestinationAcrossMaps', { destId: canonicalIds[ci] });
+    }
+  }
+
+  // ---- Round 3 Section 5a: the manifest-required gate. Placed here,
+  // after Responsibility 1's own per-entry shape checks above, so a
+  // fixture testing a malformed live entry still surfaces its own, more
+  // specific reason first rather than being pre-empted merely because it
+  // also lacks a manifest. Both live maps being empty is already handled
+  // by Case 1b above; this only runs once at least one live map is
+  // nonempty.
+  if ((canonicalIds.length > 0 || localIds.length > 0) && (!manifestKeyPresent || manifestIsExactEmptyObject)) {
+    return blocked('duplicationManifestRequired');
+  }
+
+  // ---- Round 3 Section 5b: manifest presence, shape, existence, and
+  // field-agreement checks (steps 5-16). By this point manifestKeyPresent
+  // is always true -- the only way to reach here with it false would have
+  // required both live maps to be empty, which Case 1b already returned
+  // on (manifestKeyPresent false there implies manifestIsExactEmptyObject
+  // false's OTHER disjunct, i.e. this gate above would have fired
+  // instead). rawDuplicationManifest may still be any value at all --
+  // including a non-plain-object -- since only its exact-emptiness was
+  // tested so far.
+  if (!planIsPlainObject(rawDuplicationManifest)) {
+    return blocked('manifestNotPlainObject');
+  }
+  var expectedDuplicationManifest = rawDuplicationManifest;
+  var manifestDestIds = Object.keys(expectedDuplicationManifest);
+  var CANONICAL_MANIFEST_FIELD_SET = ['destinationId', 'scope', 'recordType', 'expectedStructuralSourceId', 'expectedPersistedSourceId', 'expectedDestinationParentId', 'expectedSourceParentId', 'groupId'];
+  var LOCAL_MANIFEST_FIELD_SET = ['destinationId', 'scope', 'recordType', 'expectedStructuralSourceId', 'expectedDestinationParentId', 'expectedSourceParentId', 'groupId'];
+  function manifestEntryHasExactFieldSet(entry, fieldList) {
+    var entryKeys = Object.keys(entry);
+    if (entryKeys.length !== fieldList.length) return false;
+    for (var fsi = 0; fsi < fieldList.length; fsi++) {
+      if (!Object.prototype.hasOwnProperty.call(entry, fieldList[fsi])) return false;
+    }
+    return true;
+  }
+  for (var mdi = 0; mdi < manifestDestIds.length; mdi++) {
+    var mDestId = manifestDestIds[mdi];
+    var mEntry = expectedDuplicationManifest[mDestId];
+    // 6. Every manifest value must itself be a plain object.
+    if (!planIsPlainObject(mEntry)) {
+      return blocked('manifestEntryMalformed', { destId: mDestId });
+    }
+    // 7. The entry's own key must equal its destinationId field. Checked
+    // before the key's own identifier validity so a mismatched-but-valid
+    // key/destinationId pair is reported as the more specific
+    // manifestEntryKeyMismatch rather than the generic invalidDestinationId.
+    if (mEntry.destinationId !== mDestId) {
+      return blocked('manifestEntryKeyMismatch', { destId: mDestId });
+    }
+    if (!planProgressionId(mDestId)) {
+      return blocked('invalidDestinationId', { destId: mDestId });
+    }
+    // 8. scope must be exactly "canonical" or "local".
+    if (mEntry.scope !== 'canonical' && mEntry.scope !== 'local') {
+      return blocked('manifestEntryInvalidScope', { destId: mDestId, scope: mEntry.scope });
+    }
+    // 9. The exact field set Section 3 specifies for the declared scope --
+    // 8 fields for "canonical", 7 for "local" (expectedPersistedSourceId
+    // omitted entirely, not merely null, for "local").
+    var mFieldList = mEntry.scope === 'canonical' ? CANONICAL_MANIFEST_FIELD_SET : LOCAL_MANIFEST_FIELD_SET;
+    if (!manifestEntryHasExactFieldSet(mEntry, mFieldList)) {
+      return blocked('manifestEntryMalformed', { destId: mDestId });
+    }
+    // 10. recordType must be one of the 8 known types, matching the
+    // correct family for the declared scope.
+    var mRecordTypeSet = mEntry.scope === 'canonical' ? CANONICAL_LINEAGE_RECORD_TYPES : PLAN_LINEAGE_LOCAL_SCOPE_RECORD_TYPES;
+    if (typeof mEntry.recordType !== 'string' || !Object.prototype.hasOwnProperty.call(mRecordTypeSet, mEntry.recordType)) {
+      return blocked('manifestEntryInvalidRecordType', { destId: mDestId, recordType: mEntry.recordType });
+    }
+    // 11. groupId and expectedStructuralSourceId, canonical identifiers
+    // (Finding 2).
+    if (!planProgressionId(mEntry.groupId)) {
+      return blocked('invalidGroupId', { destId: mDestId });
+    }
+    if (!planProgressionId(mEntry.expectedStructuralSourceId)) {
+      return blocked('manifestEntryMalformed', { destId: mDestId });
+    }
+    // 12. expectedPersistedSourceId (canonical only) -- null or a valid
+    // canonical identifier (Finding 2).
+    if (mEntry.scope === 'canonical' && mEntry.expectedPersistedSourceId !== null && !planProgressionId(mEntry.expectedPersistedSourceId)) {
+      return blocked('manifestEntryMalformed', { destId: mDestId });
+    }
+    // 13. expectedDestinationParentId/expectedSourceParentId -- null or a
+    // valid canonical identifier (Finding 2), both exactly null for
+    // planMicrocycleLocal (the Microcycle-root entry has no parent) and
+    // both required, valid, non-null identifiers for every other record
+    // type (Section 3: "null only for the Microcycle-root entry").
+    var mIsMicrocycleRoot = mEntry.recordType === 'planMicrocycleLocal';
+    if (mIsMicrocycleRoot) {
+      if (mEntry.expectedDestinationParentId !== null || mEntry.expectedSourceParentId !== null) {
+        return blocked('manifestEntryMalformed', { destId: mDestId });
+      }
+    } else {
+      if (mEntry.expectedDestinationParentId === null || !planProgressionId(mEntry.expectedDestinationParentId)) {
+        return blocked('manifestEntryMalformed', { destId: mDestId });
+      }
+      if (mEntry.expectedSourceParentId === null || !planProgressionId(mEntry.expectedSourceParentId)) {
+        return blocked('manifestEntryMalformed', { destId: mDestId });
+      }
+    }
+  }
+  // 14. Manifest => live existence: every manifest key must exist in the
+  // corresponding live map for its declared scope -- the completeness fix
+  // itself.
+  for (var mei = 0; mei < manifestDestIds.length; mei++) {
+    var meDestId = manifestDestIds[mei];
+    var meEntry = expectedDuplicationManifest[meDestId];
+    var meLiveMap = meEntry.scope === 'canonical' ? canonicalSubjects : localScope;
+    if (!Object.prototype.hasOwnProperty.call(meLiveMap, meDestId)) {
+      return blocked('duplicationManifestEntryMissing', { destId: meDestId });
+    }
+  }
+  // 15. Live => manifest existence: every live key must have a manifest
+  // entry declared under the matching scope.
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    var lm2CId = canonicalIds[ci];
+    if (!Object.prototype.hasOwnProperty.call(expectedDuplicationManifest, lm2CId) || expectedDuplicationManifest[lm2CId].scope !== 'canonical') {
+      return blocked('duplicationManifestMissingForLiveEntry', { destId: lm2CId });
+    }
+  }
+  for (li = 0; li < localIds.length; li++) {
+    var lm2LId = localIds[li];
+    if (!Object.prototype.hasOwnProperty.call(expectedDuplicationManifest, lm2LId) || expectedDuplicationManifest[lm2LId].scope !== 'local') {
+      return blocked('duplicationManifestMissingForLiveEntry', { destId: lm2LId });
+    }
+  }
+  // 16. Field agreement: shared fields between a live entry and its
+  // manifest record must match exactly -- a one-sided edit to either
+  // representation alone is what this catches.
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    var faCId = canonicalIds[ci];
+    var faCLive = canonicalSubjects[faCId];
+    var faCManifest = expectedDuplicationManifest[faCId];
+    if (faCLive.structuralSourceSubjectId !== faCManifest.expectedStructuralSourceId ||
+        faCLive.persistedSourceSubjectId !== faCManifest.expectedPersistedSourceId ||
+        faCLive.recordType !== faCManifest.recordType ||
+        faCLive.groupId !== faCManifest.groupId) {
+      return blocked('duplicationManifestLiveMismatch', { destId: faCId });
+    }
+  }
+  for (li = 0; li < localIds.length; li++) {
+    var faLId = localIds[li];
+    var faLLive = localScope[faLId];
+    var faLManifest = expectedDuplicationManifest[faLId];
+    if (faLLive.structuralSourceLocalId !== faLManifest.expectedStructuralSourceId ||
+        faLLive.recordType !== faLManifest.recordType ||
+        faLLive.groupId !== faLManifest.groupId) {
+      return blocked('duplicationManifestLiveMismatch', { destId: faLId });
+    }
+  }
+
+  // Responsibility 2: normalize -- exactly once, required either way to
+  // check canonical destination existence/type below (Round 10 Section
+  // 6.6.1's corrected no-op determination: the local-only case still
+  // performs this, distinguishing it from the true immediate no-op above).
+  // This runs BEFORE any structural-source/group-coherence check below --
+  // a draft that cannot even normalize must be reported as
+  // normalizationFailed, not masked by an unrelated sidecar defect.
+  var graph;
+  try {
+    graph = planNormalizeCanonicalGraph(draft);
+  } catch (normErr) {
+    return blocked('normalizationFailed', { message: normErr && normErr.message });
+  }
+  var graphNodeById = {};
+  for (var gi = 0; gi < graph.nodes.length; gi++) graphNodeById[graph.nodes[gi].subjectId] = graph.nodes[gi];
+
+  // Responsibility 7: owner/Template isolation.
+  //
+  // Template isolation (unchanged): Phase B never duplicates the Template
+  // itself (whole-Template duplication is not a Phase B feature); a
+  // destination naming the Template's own subject id is a caller contract
+  // violation, not a value ever produced by
+  // planCanonicalEditorHandleDuplicateMicrocycle.
+  if (Object.prototype.hasOwnProperty.call(canonicalSubjects, draft.planTemplateId)) {
+    return blocked('templateIsNotADuplicationDestination', { destId: draft.planTemplateId });
+  }
+  // Owner isolation (Finding 4, new): basis.ownerUid itself must be a
+  // valid, nonempty owner identity before any persisted-source claim
+  // below can be trusted against it. planBuildCommitBasis's own
+  // constructor already guarantees this for every real caller
+  // (planCanonicalAdapterRequire throws otherwise) -- this is a defensive,
+  // fail-closed check of this function's OWN contract, not a duplicate of
+  // that guarantee, since this helper must never assume a well-formed
+  // basis was supplied.
+  if (!basis || typeof basis.ownerUid !== 'string' || !basis.ownerUid) {
+    return blocked('basisOwnerUidMissing');
+  }
+
+  // Responsibility 3: canonical destination existence, type, and
+  // uniqueness.
+  var seenCanonicalDest = {};
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    var destId = canonicalIds[ci];
+    if (Object.prototype.hasOwnProperty.call(seenCanonicalDest, destId)) {
+      return blocked('duplicateDestination', { destId: destId });
+    }
+    seenCanonicalDest[destId] = true;
+    var node = graphNodeById[destId];
+    if (!node) {
+      return blocked('destinationNotInGraph', { destId: destId });
+    }
+    if (node.recordType !== canonicalSubjects[destId].recordType) {
+      return blocked('destinationRecordTypeMismatch', { destId: destId, claimed: canonicalSubjects[destId].recordType, actual: node.recordType });
+    }
+  }
+
+  // ---- Finding 3: build a complete draft ancestry map -- every
+  // Microcycle/Session local id AND every canonical subject id currently
+  // present anywhere in the draft, with the Microcycle/Session it lives
+  // under. This covers BOTH destination ids (freshly duplicated) and
+  // structural-source ids (the original subtree, still present and
+  // untouched by Duplicate -- Duplicate never removes its source)
+  // uniformly, since both are read from the same live draft structure.
+  // Never invented, never trusted from the sidecar's own self-assertion.
+  var localAncestry = {};      // localId -> { recordType, microcycleId, sessionId }
+  var canonicalAncestry = {};  // canonicalSubjectId -> { recordType, microcycleId, sessionId }
+  var microcycleRootIds = {};  // microcycleId -> true (genuinely exists in draft)
+  var microcyclesForCheck = Array.isArray(draft.microcycles) ? draft.microcycles : [];
+  for (var mci = 0; mci < microcyclesForCheck.length; mci++) {
+    var mcForCheck = microcyclesForCheck[mci];
+    var mcIdForCheck = mcForCheck && mcForCheck.planMicrocycleId;
+    if (mcIdForCheck) {
+      microcycleRootIds[mcIdForCheck] = true;
+      localAncestry[mcIdForCheck] = { recordType: 'planMicrocycleLocal', microcycleId: mcIdForCheck, sessionId: null };
+    }
+    var sessForCheck = Array.isArray(mcForCheck && mcForCheck.sessions) ? mcForCheck.sessions : [];
+    for (var sci = 0; sci < sessForCheck.length; sci++) {
+      var sessForCheck2 = sessForCheck[sci];
+      var sessIdForCheck = sessForCheck2 && sessForCheck2.planSessionId;
+      if (sessIdForCheck) localAncestry[sessIdForCheck] = { recordType: 'planSessionLocal', microcycleId: mcIdForCheck, sessionId: sessIdForCheck };
+      var exForCheck = Array.isArray(sessForCheck2 && sessForCheck2.exercises) ? sessForCheck2.exercises : [];
+      for (var eci = 0; eci < exForCheck.length; eci++) {
+        var exForCheck2 = exForCheck[eci];
+        if (!exForCheck2) continue;
+        // [Round 3 / Finding 3] parentAssignmentId is recorded on every
+        // Exercise-child entry (Schedule Opportunity/Prescription/
+        // Implementation Relationship/Set/Rule) -- the same Exercise's own
+        // Assignment id, since an Exercise has no canonical subject id of
+        // its own and Assignment is this design's designated "Exercise
+        // anchor" (Round 3 Section 3/5c). Purely additive: every field
+        // already recorded here is unchanged, and no existing reader of
+        // this map is affected. null on the Assignment entry itself,
+        // since an Assignment's own parent is its Session (sessionId),
+        // not another canonical node.
+        var exAssignmentIdForCheck = exForCheck2.planAssignmentId;
+        if (exAssignmentIdForCheck) canonicalAncestry[exAssignmentIdForCheck] = { recordType: 'planAssignmentSubject', microcycleId: mcIdForCheck, sessionId: sessIdForCheck, parentAssignmentId: null };
+        if (exForCheck2.planOpportunityId) canonicalAncestry[exForCheck2.planOpportunityId] = { recordType: 'planScheduleOpportunitySubject', microcycleId: mcIdForCheck, sessionId: sessIdForCheck, parentAssignmentId: exAssignmentIdForCheck };
+        if (exForCheck2.planPrescriptionId) canonicalAncestry[exForCheck2.planPrescriptionId] = { recordType: 'planPrescriptionSubject', microcycleId: mcIdForCheck, sessionId: sessIdForCheck, parentAssignmentId: exAssignmentIdForCheck };
+        if (exForCheck2.planRelationshipId) canonicalAncestry[exForCheck2.planRelationshipId] = { recordType: 'planImplementationRelationshipSubject', microcycleId: mcIdForCheck, sessionId: sessIdForCheck, parentAssignmentId: exAssignmentIdForCheck };
+        var setsForCheck = Array.isArray(exForCheck2.sets) ? exForCheck2.sets : [];
+        for (var seti2 = 0; seti2 < setsForCheck.length; seti2++) {
+          if (setsForCheck[seti2] && setsForCheck[seti2].planSetId) canonicalAncestry[setsForCheck[seti2].planSetId] = { recordType: 'planSetSubject', microcycleId: mcIdForCheck, sessionId: sessIdForCheck, parentAssignmentId: exAssignmentIdForCheck };
+        }
+        // A Rule's identity is tracked here regardless of whether it is
+        // currently an ACTIVE graph node (planNormalizeCanonicalGraph's
+        // ruleActive gate) -- a disabled Rule still has a real, stable
+        // subjectId reserved by planEnsureDraftIdentities, and a
+        // structural-source reference naming it is still checkable
+        // against the draft, independent of whether it is a graph node
+        // right now (that is Responsibility 3's job, for DESTINATIONS
+        // only -- a structural SOURCE is never itself required to be an
+        // active graph node).
+        if (exForCheck2.progression && exForCheck2.progression.planRuleId) {
+          canonicalAncestry[exForCheck2.progression.planRuleId] = { recordType: 'planRuleSubject', microcycleId: mcIdForCheck, sessionId: sessIdForCheck, parentAssignmentId: exAssignmentIdForCheck };
+        }
+      }
+    }
+  }
+
+  // Responsibility 6a: local-scope destination existence, type.
+  var seenLocalDest = {};
+  for (li = 0; li < localIds.length; li++) {
+    var lDestId2 = localIds[li];
+    if (Object.prototype.hasOwnProperty.call(seenLocalDest, lDestId2)) {
+      return blocked('duplicateDestination', { destId: lDestId2 });
+    }
+    seenLocalDest[lDestId2] = true;
+    var lAnc = localAncestry[lDestId2];
+    if (!lAnc) {
+      return blocked('localDestinationNotInDraft', { destId: lDestId2 });
+    }
+    if (lAnc.recordType !== localScope[lDestId2].recordType) {
+      return blocked('localDestinationRecordTypeMismatch', { destId: lDestId2, claimed: localScope[lDestId2].recordType, actual: lAnc.recordType });
+    }
+  }
+
+  // Responsibility 6b: group coherence (Finding 3). Every entry names a
+  // groupId; a genuine Duplicate Microcycle operation stamps exactly one
+  // local Microcycle-root entry plus every Session/canonical descendant it
+  // touched with that SAME groupId (see
+  // planCanonicalEditorHandleDuplicateMicrocycle above). This section
+  // proves that shape holds for every group present, purely from the
+  // sidecar's own declared groupIds plus the draft ancestry built above --
+  // nothing here is guessed or invented.
+  var groups = {};
+  function groupFor(gid) {
+    return groups[gid] || (groups[gid] = { microcycleRootDestId: null, microcycleRootSourceId: null, localDestIds: [], canonicalDestIds: [] });
+  }
+  for (li = 0; li < localIds.length; li++) {
+    var glDestId = localIds[li];
+    var glEntry = localScope[glDestId];
+    var g = groupFor(glEntry.groupId);
+    g.localDestIds.push(glDestId);
+    if (glEntry.recordType === 'planMicrocycleLocal') {
+      if (g.microcycleRootDestId !== null) {
+        return blocked('groupMultipleMicrocycleRoots', { groupId: glEntry.groupId });
+      }
+      g.microcycleRootDestId = glDestId;
+      g.microcycleRootSourceId = glEntry.structuralSourceLocalId;
+    }
+  }
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    var gcDestId = canonicalIds[ci];
+    groupFor(canonicalSubjects[gcDestId].groupId).canonicalDestIds.push(gcDestId);
+  }
+  var groupIds = Object.keys(groups);
+  for (var gx = 0; gx < groupIds.length; gx++) {
+    var groupId = groupIds[gx];
+    var group = groups[groupId];
+    if (!group.microcycleRootDestId) {
+      // A canonical or Session entry riding under a groupId with no
+      // Microcycle-root local entry at all -- an orphan group member,
+      // never produced by the real handler (which always stamps the
+      // Microcycle root first, in the same operation, with the same
+      // groupId).
+      return blocked('orphanGroupMember', { groupId: groupId });
+    }
+    var destMcId = group.microcycleRootDestId;
+    var srcMcId = group.microcycleRootSourceId;
+    if (!Object.prototype.hasOwnProperty.call(microcycleRootIds, srcMcId)) {
+      return blocked('localStructuralSourceNotFound', { destId: destMcId, structuralSourceLocalId: srcMcId });
+    }
+    // Every Session-level local entry in this group must map a
+    // destination session under destMcId to a source session under
+    // srcMcId.
+    for (var lgi = 0; lgi < group.localDestIds.length; lgi++) {
+      var lgDestId = group.localDestIds[lgi];
+      if (lgDestId === destMcId) continue; // the Microcycle root itself, already handled above
+      var lgEntry = localScope[lgDestId];
+      var lgDestAnc = localAncestry[lgDestId];
+      if (!lgDestAnc || lgDestAnc.microcycleId !== destMcId) {
+        return blocked('groupMemberOutsideDestinationSubtree', { destId: lgDestId, groupId: groupId });
+      }
+      var lgSrcAnc = localAncestry[lgEntry.structuralSourceLocalId];
+      if (!lgSrcAnc || lgSrcAnc.recordType !== lgEntry.recordType) {
+        return blocked('localStructuralSourceNotFound', { destId: lgDestId, structuralSourceLocalId: lgEntry.structuralSourceLocalId });
+      }
+      // [Round 3 correction] The live-source-position comparison
+      // ("lgSrcAnc.microcycleId !== srcMcId" -> structuralSourceOutsideSourceSubtree)
+      // that used to appear here is retired by this round -- it
+      // re-consulted the source's CURRENT live position on every call,
+      // which made a legitimate later reorganization of the source
+      // subtree retroactively invalidate an already-correct duplicate.
+      // Source correspondence is now verified entirely from the
+      // manifest's own frozen internal parent chain, in the dedicated
+      // pass below (Section 5c) -- never from this live ancestry map.
+    }
+    // Every canonical destination in this group must belong under
+    // destMcId, its owning Session must itself be tracked as a
+    // local-scope member of this SAME group (a canonical child cannot be
+    // part of a duplication whose own Session is not also part of it --
+    // the completeness relationship this group's own local-scope tracking
+    // must satisfy), and its structural source must resolve to a real
+    // node of the matching type under srcMcId.
+    for (var cgi = 0; cgi < group.canonicalDestIds.length; cgi++) {
+      var cgDestId = group.canonicalDestIds[cgi];
+      var cgEntry = canonicalSubjects[cgDestId];
+      var cgDestAnc = canonicalAncestry[cgDestId];
+      if (!cgDestAnc) {
+        return blocked('canonicalDestinationAncestryMissing', { destId: cgDestId });
+      }
+      if (cgDestAnc.microcycleId !== destMcId) {
+        return blocked('groupMemberOutsideDestinationSubtree', { destId: cgDestId, groupId: groupId });
+      }
+      var ownerSessionEntry = cgDestAnc.sessionId ? localScope[cgDestAnc.sessionId] : null;
+      if (!ownerSessionEntry || ownerSessionEntry.groupId !== groupId) {
+        return blocked('canonicalMemberSessionNotTracked', { destId: cgDestId, groupId: groupId });
+      }
+      var cgSrcAnc = canonicalAncestry[cgEntry.structuralSourceSubjectId];
+      if (!cgSrcAnc) {
+        return blocked('canonicalStructuralSourceNotFound', { destId: cgDestId, structuralSourceSubjectId: cgEntry.structuralSourceSubjectId });
+      }
+      if (cgSrcAnc.recordType !== cgEntry.recordType) {
+        return blocked('canonicalStructuralSourceTypeMismatch', { destId: cgDestId, claimed: cgEntry.recordType, actual: cgSrcAnc.recordType });
+      }
+      // [Round 3 correction] Same retirement as above, canonical side:
+      // "cgSrcAnc.microcycleId !== srcMcId" -> structuralSourceOutsideSourceSubtree
+      // removed for the same reason. See Section 5c below.
+    }
+  }
+
+  // ---- Round 3 Section 5c: frozen manifest-internal parent-chain check,
+  // per non-root manifest entry. Destination containment is
+  // live-consulted (this save/preview is about the CURRENT destination
+  // draft); source correspondence is manifest-internal only -- it never
+  // re-consults the live source draft's own current position, so a
+  // legitimate later reorganization of the source subtree cannot
+  // retroactively invalidate an already-correct duplicate (Round 10
+  // Section 6.4: source and duplicate remain independently editable).
+  // This is what replaces the two structuralSourceOutsideSourceSubtree
+  // checks removed above. By this point every manifest entry already
+  // passed Section 5b's shape/existence/field-agreement checks, so
+  // expectedDuplicationManifest is a plain object of well-formed,
+  // 1:1-corresponding entries.
+  function planResolveActualDestinationParentIdForManifestEntry(entry) {
+    if (entry.scope === 'local') {
+      var la = localAncestry[entry.destinationId];
+      return la ? la.microcycleId : null;
+    }
+    if (entry.recordType === 'planAssignmentSubject') {
+      var ca = canonicalAncestry[entry.destinationId];
+      return ca ? ca.sessionId : null;
+    }
+    var ca2 = canonicalAncestry[entry.destinationId];
+    return ca2 ? ca2.parentAssignmentId : null;
+  }
+  for (var hci = 0; hci < manifestDestIds.length; hci++) {
+    var hcEntry = expectedDuplicationManifest[manifestDestIds[hci]];
+    if (hcEntry.expectedDestinationParentId === null) continue; // Microcycle root: no parent to check.
+    var hcActualParentId = planResolveActualDestinationParentIdForManifestEntry(hcEntry);
+    if (hcActualParentId !== hcEntry.expectedDestinationParentId) {
+      return blocked('duplicationManifestDestinationParentMismatch', { destId: hcEntry.destinationId });
+    }
+    var hcParentEntry = Object.prototype.hasOwnProperty.call(expectedDuplicationManifest, hcEntry.expectedDestinationParentId) ? expectedDuplicationManifest[hcEntry.expectedDestinationParentId] : null;
+    if (!hcParentEntry) {
+      return blocked('duplicationManifestParentEntryNotFound', { destId: hcEntry.destinationId });
+    }
+    // [Final correction, Finding 2] A dedicated "hcParentEntry.groupId !==
+    // hcEntry.groupId" check used to sit here, guarded by its own
+    // duplicationManifestCrossGroupParentReference reason. Rigorous
+    // source-tracing (documented in the final correction report) proved
+    // this branch unreachable: Section 6b's own group-coherence checks
+    // (canonicalMemberSessionNotTracked / groupMemberOutsideDestinationSubtree,
+    // both unchanged, both live-consulted, both running strictly before
+    // this pass) already force every entry within one real, live
+    // component -- a Microcycle root, its Sessions, and their canonical
+    // children -- to share exactly one declared groupId, transitively,
+    // by the time this pass is ever reached; combined with Section 5b's
+    // own field-agreement check (manifest.groupId must equal
+    // live.groupId), hcParentEntry.groupId and hcEntry.groupId are always
+    // already equal here. The dead branch and its reason vocabulary were
+    // removed rather than preserved to match an outdated reason table --
+    // the actual cross-group protection this design provides is entirely
+    // unaffected, since it was always coming from Section 6b's checks
+    // (still present, still unchanged) and never from this one.
+    if (hcEntry.expectedSourceParentId !== hcParentEntry.expectedStructuralSourceId) {
+      return blocked('duplicationManifestSourceParentMismatch', { destId: hcEntry.destinationId });
+    }
+  }
+
+  // Responsibility 4/5: persisted-source verification and one-claim-per-
+  // source, canonical entries only -- a canonical entry with
+  // persistedSourceSubjectId:null makes no claim and is simply passed
+  // through (Case B/C/D: nothing persistable for this entry). Every
+  // verified claim requires a real, matching entry in
+  // basis.priorChildHeadsBySubjectId, with a matching record type,
+  // complete head/envelope information (Finding 4: the expected envelope
+  // must be structurally complete under this codebase's own
+  // planRequireExpectedEnvelope, not merely present), and -- new this
+  // round -- the SAME owner as this commit's own basis.ownerUid. Never
+  // trusted from the sidecar's own self-assertion alone.
+  var priorChildHeads = (basis && basis.priorChildHeadsBySubjectId && typeof basis.priorChildHeadsBySubjectId === 'object') ? basis.priorChildHeadsBySubjectId : {};
+  var sourced = [];
+  var claimedSources = {};
+  for (ci = 0; ci < canonicalIds.length; ci++) {
+    var cid = canonicalIds[ci];
+    var persistedSourceId = canonicalSubjects[cid].persistedSourceSubjectId;
+    if (persistedSourceId === null) continue;
+    // Finding 3: a claimed persisted source must be consistent with the
+    // independently established structural source -- the real handler
+    // (planCanonicalEditorResolvePersistedSource) only ever derives
+    // persistedSourceSubjectId AS the structural source's own id (ids are
+    // stable across save/reopen in this design), so any sidecar in which
+    // the two differ is a fabricated or corrupted claim, never a value the
+    // real handler could have produced.
+    if (persistedSourceId !== canonicalSubjects[cid].structuralSourceSubjectId) {
+      return blocked('persistedSourceInconsistentWithStructuralSource', { destId: cid });
+    }
+    var priorHead = priorChildHeads[persistedSourceId];
+    if (!priorHead || typeof priorHead !== 'object') {
+      return blocked('persistedSourceNotFound', { destId: cid, persistedSourceSubjectId: persistedSourceId });
+    }
+    if (priorHead.recordType !== canonicalSubjects[cid].recordType) {
+      return blocked('persistedSourceRecordTypeMismatch', { destId: cid, persistedSourceSubjectId: persistedSourceId });
+    }
+    if (!priorHead.headRevisionId) {
+      return blocked('persistedSourceIncomplete', { destId: cid, persistedSourceSubjectId: persistedSourceId });
+    }
+    // Finding 4: structural completeness of the expected envelope, under
+    // the SAME accepted validator every other basis source is already
+    // held to (planRequireExpectedEnvelope throws on any incomplete
+    // shape; this helper must fail closed, not throw, so the call is
+    // wrapped).
+    try {
+      planRequireExpectedEnvelope('basis.priorChildHeadsBySubjectId[' + persistedSourceId + ']', priorHead.expectedEnvelope);
+    } catch (envErr) {
+      return blocked('persistedSourceEnvelopeMalformed', { destId: cid, persistedSourceSubjectId: persistedSourceId });
+    }
+    // Finding 4: owner isolation -- the persisted source's own known
+    // owner must exactly match this commit's basis.ownerUid. No
+    // cross-owner lookup is performed and no owner identity is echoed
+    // back in the block details, in either direction -- a mismatch and a
+    // missing owner produce the identical, non-revealing detail shape.
+    if (priorHead.expectedEnvelope.ownerUid !== basis.ownerUid) {
+      return blocked('persistedSourceOwnerMismatch', { destId: cid });
+    }
+    if (Object.prototype.hasOwnProperty.call(claimedSources, persistedSourceId)) {
+      return blocked('duplicationSourceClaimedByMultipleDestinations', { sourceSubjectId: persistedSourceId });
+    }
+    claimedSources[persistedSourceId] = cid;
+    sourced.push(cid);
+  }
+
+  // Three-case classification (Round 10 Section 6.6.1): lineage attaches
+  // only when at least one canonical entry has a genuine, verified,
+  // non-null persisted source -- which (Section 2.2's decisive,
+  // source-confirmed consequence) can only be true once templateIsNew is
+  // false, since basis.priorChildHeadsBySubjectId is necessarily empty
+  // whenever it is true. This is exactly what lets the mixed-case
+  // subjectLineage below safely include local-scope entries without ever
+  // being able to trigger templateLineageMissing.
+  if (sourced.length === 0) {
+    // Case 2: local-only no-op. Validated above (including the one
+    // required normalization pass), but zero canonical entries have
+    // anything persistable to report. Attach nothing -- this is the exact
+    // case Round 9 got wrong (Round 10 correction report Section 1-3).
+    return { ok: true, hasLineage: false };
+  }
+
+  // Case 3: lineage-bearing. subjectLineage = every local-scope entry
+  // unconditionally, plus every genuinely-sourced canonical entry (a
+  // null-sourced canonical entry, e.g. Case C's own individually-unsaved
+  // node, is validated above but never included here).
+  var subjectLineage = [];
+  var duplicationSourceExpectedBySubjectId = {};
+  for (var si2 = 0; si2 < sourced.length; si2++) {
+    var sDestId = sourced[si2];
+    var sEntry = canonicalSubjects[sDestId];
+    var sPriorHead = priorChildHeads[sEntry.persistedSourceSubjectId];
+    subjectLineage.push({ oldSubjectId: sEntry.persistedSourceSubjectId, newSubjectId: sDestId, recordType: sEntry.recordType });
+    duplicationSourceExpectedBySubjectId[sDestId] = {
+      sourceSubjectId: sEntry.persistedSourceSubjectId,
+      sourceRecordType: sEntry.recordType,
+      expectedHeadRevisionId: sPriorHead.headRevisionId,
+      expectedEnvelope: sPriorHead.expectedEnvelope
+    };
+  }
+  for (li = 0; li < localIds.length; li++) {
+    var lDest = localIds[li];
+    var lEntry2 = localScope[lDest];
+    subjectLineage.push({ oldSubjectId: lEntry2.structuralSourceLocalId, newSubjectId: lDest, recordType: lEntry2.recordType });
+  }
+
+  return {
+    ok: true,
+    hasLineage: true,
+    draftDuplicationLineage: { duplicatedFromTemplateId: null, subjectLineage: subjectLineage },
+    duplicationSourceExpectedBySubjectId: duplicationSourceExpectedBySubjectId
+  };
+}
+
 function planBuildTemplateCommitPackage(draft, basis, ids) {
   planRequire(draft && typeof draft === 'object', 'draft must be an object');
   planRequire(draft.planTemplateId, 'draft is missing stable identities; call planEnsureDraftIdentities first');
@@ -8384,6 +9171,25 @@ function planBuildCanonicalSaveAttempt(editorState, ctx) {
   var draft = planEnsureDraftIdentities(rawDraft, allocator);
 
   var basis = planBuildCommitBasis(ctx.ownerUid, ctx.actorUid, editorState && editorState._priorCanonicalBase, ctx.deviceId, ctx.sessionId);
+
+  // [Phase B, Round 10 Section 6.6.2] The shared duplication-lineage
+  // helper runs BEFORE package-only id allocation, on the exact
+  // ordinary-mode draft/basis pair just built above -- never a second,
+  // differently-built draft/basis. On failure this returns blocked before
+  // `ids` is ever built (no package-only identity is allocated for a
+  // rejected attempt). On success, attach atomically (both keys together)
+  // or attach nothing -- planPrepareDuplicationLineageForCommit itself
+  // never mutates draft/basis; this is the one place either key is ever
+  // assigned.
+  var preparedLineage = planPrepareDuplicationLineageForCommit(editorState && editorState._pendingDuplicationLineage, draft, basis);
+  if (!preparedLineage.ok) {
+    return { ok: false, status: 'blocked', blockReason: preparedLineage.blockReason, details: preparedLineage.details || {}, draft: draft };
+  }
+  if (preparedLineage.hasLineage) {
+    draft._planDuplicationLineage = preparedLineage.draftDuplicationLineage;
+    basis.duplicationSourceExpectedBySubjectId = preparedLineage.duplicationSourceExpectedBySubjectId;
+  }
+
   var ids = {
     operationId: allocator(),
     manifestId: allocator(),
@@ -8581,11 +9387,19 @@ function planCanonicalEditorGetState() { return planCanonicalEditorState; }
 function planResetCanonicalUserScopedState() {
   planCanonicalEditorState = null;
   planProgressionManualState = null;
+  // Canonical Program library correction (Phase A requirement 2): the
+  // library's fetched list of another owner's Programs is exactly the kind
+  // of state this hard authentication boundary exists to clear -- same
+  // treatment as the editor and manual-progression state above.
+  planCanonicalLibraryState = null;
+  planCanonicalEditorSyncBeforeUnloadGuard(false);
   if (typeof document !== 'undefined') {
     var editorRoot = document.getElementById(PLAN_CANONICAL_EDITOR_CONTAINER_ID);
     if (editorRoot) editorRoot.innerHTML = '';
     var progressionRoot = document.getElementById(PLAN_PROGRESSION_MANUAL_CONTAINER_ID);
     if (progressionRoot) progressionRoot.innerHTML = '';
+    var libraryRoot = document.getElementById(PLAN_CANONICAL_LIBRARY_CONTAINER_ID);
+    if (libraryRoot) libraryRoot.innerHTML = '';
   }
 }
 
@@ -8785,15 +9599,19 @@ function planCanonicalEditorBuildProductionCtx() {
   };
 }
 
-// ---- planCanonicalEditorBoot(ctxOverride) ----
-// The sole entry point (see the banner comment above for the full
-// reachability contract). Production callers (app-core.js) always call this
-// with zero arguments. A Node-only test passes an explicit ctx (built with
-// the __test dispatch-for-test seam) to exercise the identical handler
-// chain below without ever touching the real hardcoded capability flags.
-function planCanonicalEditorBoot(ctxOverride) {
-  var ctx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalEditorBuildProductionCtx();
-  var st = {
+// ---- planCanonicalEditorBuildFreshState(ctx) ----
+// Phase A canonical Program library correction: extracted, byte-identical,
+// from planCanonicalEditorBoot's own state-object literal below (a pure
+// refactor -- no field, default value, or comment describing any field's
+// purpose changed) so the library's own Open-a-card flow
+// (planCanonicalLibraryHandleOpen below) can build a genuinely fresh
+// booted-editor-shaped state around an already-verified reopen result,
+// without duplicating this shape by hand and without triggering
+// planCanonicalEditorBoot's own recovery-marker check or render call (which
+// only make sense for a BRAND NEW Program boot, never for a Program the
+// library just finished verifying).
+function planCanonicalEditorBuildFreshState(ctx) {
+  return {
     editorState: planCanonicalEditorFreshState(),
     ctx: ctx,
     outcome: null,
@@ -8801,6 +9619,15 @@ function planCanonicalEditorBoot(ctxOverride) {
     lastSavedTemplateId: null,
     reopenTemplateIdInput: '',
     busy: false,
+    // Save-progress/save-performance correction requirement: the current
+    // sub-phase of an in-flight save, distinct from the plain boolean
+    // `busy` above -- 'preparingSave' (adapter/identity + package/manifest
+    // construction, before any I/O), 'saving' (the writer transaction is
+    // in flight), or 'verifyingReopen' (the commit succeeded and the
+    // mandatory automatic reopen is establishing the new _priorCanonicalBase).
+    // null whenever busy is false. Purely a rendering/observability aid --
+    // no handler branches on it, and clearing it never affects any outcome.
+    savePhase: null,
     // Save-lifecycle correction requirement 1: set true whenever a save
     // committed successfully but the immediate follow-up reopen (below)
     // could not confirm the new canonical head -- blocks an ordinary next
@@ -8838,8 +9665,54 @@ function planCanonicalEditorBoot(ctxOverride) {
     // -- see planCanonicalEditorHandleAbandonUnresolvedSave and the
     // renderer's abandon control below). Never influences anything by
     // itself; only what is explicitly passed to that handler does.
-    _abandonAcknowledged: false
+    _abandonAcknowledged: false,
+    // Phase B multi-screen editor: transient multi-screen navigation state,
+    // a SIBLING of editorState (never inside it) -- see
+    // planCanonicalEditorFreshNavState/planCanonicalEditorResolveNavLocation
+    // below for the full contract. Never enters normalization, the commit
+    // package, or Firestore; reset to a fresh Program-screen selection by
+    // this same fresh-state builder on every New/Open/Reopen/verified-save
+    // refresh (every one of those replaces planCanonicalEditorState.editorState
+    // wholesale, and each such call site also explicitly resets this field --
+    // see the comments at each of those four call sites).
+    nav: planCanonicalEditorFreshNavState(),
+    // Program-library stale-refresh correction, AS BROADENED by the
+    // reopen-failure-refresh correction (this round): true from the moment
+    // a save this editor session has CONCLUSIVELY COMMITTED -- a terminal
+    // 'success'/'alreadyCommitted' commit result with a real saved
+    // planTemplateId, set in planCanonicalEditorApplySaveResult the instant
+    // that is established, REGARDLESS of whether the separate automatic
+    // post-save reopen that follows succeeds -- or
+    // planCanonicalEditorHandleCheckSavedStatus's recovery check confirmed
+    // an earlier attempt already completed -- until
+    // planCanonicalEditorHandleBackToPrograms below consumes it. Never set
+    // for a plain New/Open with no save, and never merely because a save
+    // was ATTEMPTED (disabled/conflict/blocked/retryable/permanent never
+    // set this). It IS now set when a save's automatic reopen fails
+    // (needsReopenBeforeNextSave/savedButReopenFailed) -- that pair tracks
+    // a DIFFERENT fact ("committed but unconfirmed to THIS session's own
+    // editor identity"), which is deliberately untouched by this flag; the
+    // write having occurred is enough, on its own, to make the library's
+    // cached list known-stale, whether or not this session's own editor
+    // could confirm it. Consulted exactly once, by Back to Programs, to
+    // decide whether the library must discard its existing (possibly
+    // pre-save) planCanonicalLibraryState and perform a genuine fresh
+    // boot/read rather than re-rendering cached items -- see that
+    // function's own comment for the full rationale.
+    libraryNeedsRefreshOnReturn: false
   };
+}
+
+// ---- planCanonicalEditorBoot(ctxOverride) ----
+// The sole entry point (see the banner comment above for the full
+// reachability contract). Production callers (app-core.js, indirectly via
+// planCanonicalLibraryHandleNew/HandleOpen below) always call this with a
+// real production ctx. A Node-only test passes an explicit ctx (built with
+// the __test dispatch-for-test seam) to exercise the identical handler
+// chain below without ever touching the real hardcoded capability flags.
+function planCanonicalEditorBoot(ctxOverride) {
+  var ctx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalEditorBuildProductionCtx();
+  var st = planCanonicalEditorBuildFreshState(ctx);
   planCanonicalEditorState = st;
 
   // Uncertain-save recovery correction requirement 4: check for a valid,
@@ -8890,6 +9763,20 @@ function planCanonicalEditorApplyBootRecoveryOutcome(st, marker, result) {
       status: 'recoveryResolved', resolution: 'notFound',
       message: 'The previous save attempt (Template Id "' + marker.planTemplateId + '") did not produce a readable Template -- it is safe to save again.'
     };
+    // Phase A correction (finding 2): when this boot-time recovery check
+    // was entered by planOpenCanonicalLibraryFromPlanNavigation (guarding
+    // the canonical Program library, not a direct editor open),
+    // confirmed-absent unlocks the library -- the primary destination --
+    // instead of leaving a bare fresh editor mounted. Every pre-existing
+    // direct caller of planCanonicalEditorBoot never sets this ctx field,
+    // so this branch is inert for them; their behavior (render the fresh
+    // editor with the "safe to save again" message above) is unchanged.
+    if (st.ctx && st.ctx.__planCanonicalReturnToLibraryOnConfirmedAbsent) {
+      var libraryCtxForReturn = st.ctx.__planCanonicalReturnToLibraryOnConfirmedAbsent;
+      if (planCanonicalEditorState === st) planCanonicalEditorState = null;
+      planOpenCanonicalLibraryFromPlanNavigation(libraryCtxForReturn);
+      return;
+    }
     planCanonicalEditorRender();
     return;
   }
@@ -8903,6 +9790,14 @@ function planCanonicalEditorApplyBootRecoveryOutcome(st, marker, result) {
     st.recoveryChecking = false;
     st.recoveryMarker = null;
     st.needsReopenBeforeNextSave = false;
+    // Phase B multi-screen editor: this verified boot-time recovery
+    // resolution wholesale-replaces editorState with a freshly-reopened
+    // graph -- any previously-selected Microcycle/Session/Exercise/Set
+    // object reference belonged to the discarded graph, so navigation is
+    // reset safely to the Program screen (never left pointing at stale
+    // objects that resolveNavLocation would otherwise have to fall back
+    // from on the very next render).
+    st.nav = planCanonicalEditorFreshNavState();
     st.outcome = {
       status: 'recoveryResolved', resolution: 'verified',
       message: 'The previous save attempt (Template Id "' + marker.planTemplateId + '") had already completed -- it has been reopened and is ready for normal editing.'
@@ -9038,6 +9933,176 @@ function planCanonicalEditorGuardMutable(callerName) {
   return true;
 }
 
+// ---- planCanonicalEditorIsSafeToLeave() ----
+// Save-progress/save-performance correction ("safe to leave" policy). The
+// exact same fail-closed condition planCanonicalEditorHandleNew and the
+// rendered reopenLockedAttr already use (busy, a pending save attempt --
+// live or cancelled-but-unresolved -- or an unresolved boot-time recovery
+// check): none of these guarantee the in-memory editorState is durably
+// reflected in Firestore yet, so leaving now could discard the only record
+// of an attempt that may already have written. No editor booted at all
+// (planCanonicalEditorState === null) is trivially safe -- there is nothing
+// to leave. This is the single source of truth both the rendered "Back to
+// Programs" action (planCanonicalEditorHandleBackToPrograms below) and the
+// beforeunload guard (planCanonicalEditorSyncBeforeUnloadGuard below)
+// consult -- neither duplicates this condition independently.
+function planCanonicalEditorIsSafeToLeave() {
+  var st = planCanonicalEditorState;
+  if (!st) return true;
+  return !(st.busy || st._pendingSaveAttempt || st.recoveryChecking);
+}
+
+// ---- planCanonicalEditorBeforeUnloadHandler(e) / ...SyncBeforeUnloadGuard(unsafe) ----
+// Save-progress/save-performance correction requirement: "register a
+// beforeunload warning for save/verified-reopen/pending-attempt/cancelled-
+// unresolved-attempt/recovery-check; remove the warning promptly once
+// safe." Deliberately NOT a permanently-installed unconditional prompt --
+// planCanonicalEditorSyncBeforeUnloadGuard is called on every render with
+// the CURRENT !planCanonicalEditorIsSafeToLeave() value, so the listener is
+// added the instant the editor becomes unsafe to leave and removed the
+// instant it becomes safe again, never left behind afterward. Guarded so a
+// Node test environment (no `window`, or a fake one with no
+// addEventListener) never throws; a test that wants to observe installation
+// supplies a fake `window` with addEventListener/removeEventListener spies.
+// A committed save whose automatic reopen failed (needsReopenBeforeNextSave)
+// is deliberately NOT included here -- the write already durably succeeded,
+// so leaving the page loses nothing; only the NEXT save is blocked (by
+// planCanonicalEditorHandleSave's own existing check) until a Reopen
+// succeeds.
+var planCanonicalEditorBeforeUnloadInstalled = false;
+function planCanonicalEditorBeforeUnloadHandler(e) {
+  if (e && typeof e.preventDefault === 'function') e.preventDefault();
+  if (e) e.returnValue = '';
+  return '';
+}
+function planCanonicalEditorSyncBeforeUnloadGuard(unsafe) {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function' || typeof window.removeEventListener !== 'function') return;
+  if (unsafe && !planCanonicalEditorBeforeUnloadInstalled) {
+    window.addEventListener('beforeunload', planCanonicalEditorBeforeUnloadHandler);
+    planCanonicalEditorBeforeUnloadInstalled = true;
+  } else if (!unsafe && planCanonicalEditorBeforeUnloadInstalled) {
+    window.removeEventListener('beforeunload', planCanonicalEditorBeforeUnloadHandler);
+    planCanonicalEditorBeforeUnloadInstalled = false;
+  }
+}
+
+// ---- planCanonicalPerfNow() ----
+// Development-only performance instrumentation (requirement 4). A
+// monotonic clock when one is available (the real browser's
+// window.performance.now(), or Node's own global performance.now()),
+// falling back to Date.now() only when neither exists. Used exclusively by
+// the timing capture below, which itself only runs at all when a caller
+// has explicitly supplied ctx.perfObserver -- see
+// planCanonicalEditorHandleSave.
+function planCanonicalPerfNow() {
+  if (typeof performance !== 'undefined' && typeof performance.now === 'function') return performance.now();
+  return Date.now();
+}
+
+// ---- planCanonicalEditorComputeGraphSize(editorState) ----
+// Development-only performance instrumentation (requirement 4, item 6:
+// "graph size"). A pure, read-only count of the editor's own in-memory
+// structure -- never touches Firestore, never alters editorState. Used
+// exclusively for the injected perf observer's benefit; no handler branches
+// on its result.
+function planCanonicalEditorComputeGraphSize(editorState) {
+  var microcycles = (editorState && editorState.microcycles) || [];
+  var sessionCount = 0, exerciseCount = 0, setCount = 0;
+  microcycles.forEach(function (mc) {
+    var sessions = (mc && mc.sessions) || [];
+    sessionCount += sessions.length;
+    sessions.forEach(function (s) {
+      var exercises = (s && s.exercises) || [];
+      exerciseCount += exercises.length;
+      exercises.forEach(function (ex) {
+        setCount += ((ex && ex.sets) || []).length;
+      });
+    });
+  });
+  return { microcycleCount: microcycles.length, sessionCount: sessionCount, exerciseCount: exerciseCount, setCount: setCount };
+}
+
+// ---- planCanonicalComputePlannedReadCount(readPlan) ----
+// Phase A correction, finding 4: the prior instrumentation counted only
+// readPlan.reusedRevisionRefs.length, silently ignoring every other
+// category of document the real executor
+// (planValidateTemplateCommitReads/planBuildTemplateCommitPackage) actually
+// reads. A commitment package's readPlan (built above, around
+// `var readPlan = Object.freeze({...})`) carries exactly seventeen ref
+// categories, matching the `docs` shape planValidateTemplateCommitReads
+// documents and reads slots for:
+//   - six ALWAYS-present singular refs, one read each, unconditionally:
+//     schemaAuthorityRef, operationRef, gatewayRef, templateSubjectRef,
+//     manifestRootRef, projectionRef;
+//   - three OPTIONAL singular refs, counted only when present (non-null) --
+//     priorManifestRootRef/priorOperationRef/priorGatewayRef, frozen only
+//     for a genuine no-change-to-commit attempt (see noChangeToCommit
+//     above);
+//   - eight array-backed categories, each contributing exactly its own
+//     .length (zero when genuinely empty, never assumed non-empty):
+//     childSubjectRefs, reusedRevisionRefs, newRevisionTargetRefs,
+//     predecessorRevisionRefs, removedAssignmentRefs, chunkRefs,
+//     priorChunkRefs, duplicationSourceRefs.
+// Metadata carried on individual ref objects (chunkId, chunkOrdinal,
+// newSubjectId, sourceSubjectId, expectedHeadRevisionId, path, etc.) is
+// never itself counted as a read -- only the number of ref OBJECTS in each
+// category is. Pure and read-only: never mutates readPlan, never rebuilds
+// or re-derives it. Returns null (never an estimate) if any always-present
+// category is unexpectedly missing or any always-array category is
+// unexpectedly not an array -- an honest signal that the real readPlan
+// shape no longer matches what this helper was written against, rather
+// than silently reporting a wrong number.
+var PLAN_READ_PLAN_ALWAYS_SINGULAR_REF_KEYS = ['schemaAuthorityRef', 'operationRef', 'gatewayRef', 'templateSubjectRef', 'manifestRootRef', 'projectionRef'];
+var PLAN_READ_PLAN_OPTIONAL_SINGULAR_REF_KEYS = ['priorManifestRootRef', 'priorOperationRef', 'priorGatewayRef'];
+var PLAN_READ_PLAN_ARRAY_REF_KEYS = ['childSubjectRefs', 'reusedRevisionRefs', 'newRevisionTargetRefs', 'predecessorRevisionRefs', 'removedAssignmentRefs', 'chunkRefs', 'priorChunkRefs', 'duplicationSourceRefs'];
+function planCanonicalComputePlannedReadCount(readPlan) {
+  if (!readPlan || typeof readPlan !== 'object') return null;
+  var count = 0;
+  for (var i = 0; i < PLAN_READ_PLAN_ALWAYS_SINGULAR_REF_KEYS.length; i++) {
+    if (!readPlan[PLAN_READ_PLAN_ALWAYS_SINGULAR_REF_KEYS[i]]) return null;
+    count += 1;
+  }
+  for (var j = 0; j < PLAN_READ_PLAN_OPTIONAL_SINGULAR_REF_KEYS.length; j++) {
+    if (readPlan[PLAN_READ_PLAN_OPTIONAL_SINGULAR_REF_KEYS[j]]) count += 1;
+  }
+  for (var k = 0; k < PLAN_READ_PLAN_ARRAY_REF_KEYS.length; k++) {
+    var arr = readPlan[PLAN_READ_PLAN_ARRAY_REF_KEYS[k]];
+    if (!Array.isArray(arr)) return null;
+    count += arr.length;
+  }
+  return count;
+}
+
+// ---- planCanonicalComputeManifestChunkCount(pkg) ----
+// Phase A correction, finding 4: the prior instrumentation read
+// built.package.manifest.chunkCount, but a commitment package has no
+// top-level `manifest` field at all -- the real shape (see the package
+// object literal built above) is package.graph.manifest (itself carrying
+// its own chunkCount, stamped as chunks.length at manifest-build time) and
+// package.graph.chunks (the actual chunk array). Cross-checks the two
+// independent sources of chunk count against each other -- both are
+// derived from the same underlying chunks array and so must always agree
+// for a validly-built package -- and returns the count only when they do;
+// an honest null (never a silent choice of one over the other) if they
+// disagree or either source is missing/malformed. Pure and read-only:
+// never mutates or rebuilds the package.
+function planCanonicalComputeManifestChunkCount(pkg) {
+  var graph = pkg && pkg.graph;
+  var manifest = graph && graph.manifest;
+  var chunks = graph && graph.chunks;
+  if (!manifest || typeof manifest.chunkCount !== 'number' || !Array.isArray(chunks)) return null;
+  if (manifest.chunkCount !== chunks.length) return null;
+  return manifest.chunkCount;
+}
+
+// ---- planCanonicalComputeCandidateWriteCount(pkg) ----
+// Phase A correction, finding 4: this count was previously omitted
+// entirely despite package.candidateWrites.length being directly
+// available. Pure and read-only: never mutates or rebuilds the package.
+function planCanonicalComputeCandidateWriteCount(pkg) {
+  return (pkg && Array.isArray(pkg.candidateWrites)) ? pkg.candidateWrites.length : null;
+}
+
 // ---- planCanonicalEditorHandleNew() ----
 // The canonical "new Program" action. Discards whatever editor state
 // existed (if any) and replaces it with a completely fresh
@@ -9074,7 +10139,71 @@ function planCanonicalEditorHandleNew() {
   st.validationMessage = null;
   st.lastSavedTemplateId = null;
   st.needsReopenBeforeNextSave = false;
+  // Phase B multi-screen editor: a brand-new Program has nothing for any
+  // prior Microcycle/Session/Exercise/Set selection to still point at --
+  // reset navigation to the Program screen, the same wholesale-replacement
+  // reset every other New/Open/Reopen/verified-save-refresh call site below
+  // performs.
+  st.nav = planCanonicalEditorFreshNavState();
   planCanonicalEditorRender();
+}
+
+// ---- planCanonicalEditorHandleBackToPrograms() ----
+// Canonical Program library correction (Phase A requirement 2): a simple,
+// explicit way back to the library, added only where it is safe. Reuses
+// the exact same planCanonicalEditorIsSafeToLeave() predicate as the
+// beforeunload guard above -- if a save attempt is unresolved, a recovery
+// check is in progress, or an operation is literally in flight, this
+// refuses to leave (the existing fail-closed policy), sets a message, and
+// re-renders instead of discarding that state. Only when it is genuinely
+// safe does this clear the editor's own module state and beforeunload
+// guard and hand off to the library boot entry point.
+function planCanonicalEditorHandleBackToPrograms() {
+  planCanonicalEditorRequireBooted('planCanonicalEditorHandleBackToPrograms');
+  var st = planCanonicalEditorState;
+  if (!planCanonicalEditorIsSafeToLeave()) {
+    st.validationMessage = 'This Program has an unresolved save attempt or check in progress -- resolve it (Retry, Cancel, Check Saved Status, or Abandon) before returning to Programs.';
+    planCanonicalEditorRender();
+    return { status: 'blocked', reason: 'unsafeToLeave', message: st.validationMessage };
+  }
+  // Phase A correction (finding 2): the library's own ctx (never discarded
+  // while an editor session is open -- see planCanonicalLibraryHandleNew/
+  // HandleOpen) is threaded through here so planOpenCanonicalLibraryFromPlanNavigation's
+  // recovery-marker check reuses the SAME injected ctx (production or
+  // test) this session has used throughout, rather than building a fresh
+  // production ctx (which would fail outside a real authenticated
+  // browser). Falls back to the production default when no library
+  // session exists yet, matching this function's own prior behavior.
+  // Captured BEFORE any possible invalidation below, since that
+  // invalidation (when it happens) clears planCanonicalLibraryState itself.
+  var libraryCtx = planCanonicalLibraryState ? planCanonicalLibraryState.ctx : undefined;
+  // Program-library stale-refresh correction (root cause: planOpenCanonicalLibraryFromPlanNavigation
+  // only ever performs a genuine planCanonicalLibraryBoot -- a real
+  // canonical summary-list read -- when planCanonicalLibraryState is
+  // null; otherwise it takes its `else` branch and just re-renders
+  // whatever items that state object already holds from whenever it was
+  // last booted, which for this session is always BEFORE the Program
+  // that was just created/edited here was saved). When this editor
+  // session has conclusively verified a save (st.libraryNeedsRefreshOnReturn --
+  // set only by planCanonicalEditorApplySaveResult's successful automatic
+  // reopen, or planCanonicalEditorHandleCheckSavedStatus's verified
+  // recovery resolution), that now-provably-stale library state is
+  // discarded here, forcing planOpenCanonicalLibraryFromPlanNavigation
+  // into its existing fresh-boot branch below -- the exact same real
+  // listTemplateSummaries read, loading state, and pagination reset a
+  // first-ever library entry already performs. This is deliberately NOT
+  // a full unconditional refresh on every Back to Programs: a plain
+  // Back with no verified save this session leaves
+  // planCanonicalLibraryState untouched, so the existing cached-render
+  // (no duplicate read) behavior for that ordinary case is completely
+  // unchanged. Nothing is constructed or injected from editor state here --
+  // only a real re-read is triggered.
+  if (st.libraryNeedsRefreshOnReturn) {
+    planCanonicalLibraryState = null;
+  }
+  planCanonicalEditorState = null;
+  planCanonicalEditorSyncBeforeUnloadGuard(false);
+  return planOpenCanonicalLibraryFromPlanNavigation(libraryCtx);
 }
 
 // ---- planCanonicalEditorHandleEnableProgression(mi, si, ei) ----
@@ -9092,6 +10221,16 @@ function planCanonicalEditorHandleEnableProgression(mi, si, ei) {
   planCanonicalAdapterRequire(ex, 'planCanonicalEditorHandleEnableProgression: no such exercise at [' + mi + '][' + si + '][' + ei + ']');
   ex.progression = planNewCanonicalProgressionState();
   ex.progression.enabled = true;
+  // [Final correction, Finding 1] planNewCanonicalProgressionState() never
+  // carries over the discarded progression object's OLD planRuleId (it
+  // returns no planRuleId field at all -- a fresh one is allocated later,
+  // at identity-ensuring time), so this exercise's Rule is never itself a
+  // live destination immediately after Enable. Pruning here removes any
+  // now-obsolete duplication-lineage records (live + manifest) that named
+  // the discarded Rule's old id, exactly the "an old destination's
+  // lineage may remain" case -- never fabricating or resurrecting
+  // anything for the brand-new Rule this action just created.
+  planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorRender();
 }
 function planCanonicalEditorHandleDisableProgression(mi, si, ei) {
@@ -9099,6 +10238,18 @@ function planCanonicalEditorHandleDisableProgression(mi, si, ei) {
   var ex = planCanonicalEditorState.editorState.microcycles[mi].sessions[si].exercises[ei];
   planCanonicalAdapterRequire(ex, 'planCanonicalEditorHandleDisableProgression: no such exercise at [' + mi + '][' + si + '][' + ei + ']');
   if (ex.progression) ex.progression.enabled = false;
+  // [Final correction, Finding 1] A disabled Rule is no longer an active
+  // canonical graph node (planNormalizeCanonicalGraph's own ruleActive
+  // gate), so planCanonicalEditorCollectLiveIds (corrected alongside this
+  // change) no longer reports its planRuleId as live -- this prune call
+  // is what actually removes that now-stale Rule's live+manifest
+  // duplication-lineage records, the moment it stops being a graph node,
+  // rather than leaving them to strand a later Preview/Save with
+  // destinationNotInGraph. Only the Rule's own destination entries are
+  // ever affected -- planCanonicalEditorPruneDuplicationLineage deletes
+  // strictly by absence from the live-id set; it never touches a
+  // surviving entry's own fields.
+  planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorRender();
 }
 
@@ -9126,6 +10277,565 @@ function planCanonicalEditorHandleAddSet(mi, si, ei) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleAddSet')) return;
   planCanonicalEditorState.editorState.microcycles[mi].sessions[si].exercises[ei].sets.push(planCanonicalEditorFreshSet());
   planCanonicalEditorRender();
+}
+
+// =============================================================================
+// PHASE B (Round 10 implementation) -- Duplicate Microcycle
+// =============================================================================
+// Everything below builds on the already-accepted
+// planPrepareDuplicationLineageForCommit helper above (defined alongside
+// planValidateDuplicationLineage) and the sidecar schema settled in the
+// Round 10 spec (Section 6.3). It adds real Duplicate/pruning/preview
+// behavior to THIS existing single-screen canonical editor. The Round 10
+// spec's separate multi-screen navigation rebuild (Section 4) is a large,
+// independent body of visual/structural work not attempted in this
+// increment -- see the implementation report's explicit scope note. This
+// section changes no writer function above it.
+
+// ---- planCanonicalEditorEnsureLocalId(obj, field, allocator) ----
+function planCanonicalEditorEnsureLocalId(obj, field, allocator) {
+  if (!obj[field]) obj[field] = allocator();
+  return obj[field];
+}
+
+// ---- planCanonicalEditorEnsureSourceIdentities(mc, allocator) ----
+// [Bounded implementation judgment call -- documented in the implementation
+// report, not a change to any writer function] Duplicate Microcycle needs a
+// stable identity to duplicate FROM, but this editor (like the legacy
+// editor before it) does not allocate any identity until
+// planEnsureDraftIdentities runs at Save time -- a freshly added, never-
+// saved Microcycle/Session/Exercise/Set carries no id field at all (see
+// planCanonicalEditorFreshState/HandleAddMicrocycle/HandleAddSession/
+// HandleAddExercise/HandleAddSet above). This assigns any missing identity
+// on the SOURCE subtree in place, using the exact same allocator Save will
+// eventually use. This is safe and inert on the eventual committed shape:
+// ordinary-mode planEnsureDraftIdentities always reuses an existing id
+// untouched ("if (existing) return existing", 03-identity.js), so
+// allocating here only changes WHEN an id is minted (at Duplicate-click
+// time instead of at Save time), never the final committed identity or
+// any semantic field.
+function planCanonicalEditorEnsureSourceIdentities(mc, allocator) {
+  planCanonicalEditorEnsureLocalId(mc, 'planMicrocycleId', allocator);
+  var sessions = Array.isArray(mc.sessions) ? mc.sessions : [];
+  for (var si = 0; si < sessions.length; si++) {
+    var sess = sessions[si];
+    planCanonicalEditorEnsureLocalId(sess, 'planSessionId', allocator);
+    var exercises = Array.isArray(sess.exercises) ? sess.exercises : [];
+    for (var ei = 0; ei < exercises.length; ei++) {
+      var ex = exercises[ei];
+      planCanonicalEditorEnsureLocalId(ex, 'planAssignmentId', allocator);
+      planCanonicalEditorEnsureLocalId(ex, 'planOpportunityId', allocator);
+      planCanonicalEditorEnsureLocalId(ex, 'planPrescriptionId', allocator);
+      planCanonicalEditorEnsureLocalId(ex, 'planRelationshipId', allocator);
+      var sets = Array.isArray(ex.sets) ? ex.sets : [];
+      for (var seti = 0; seti < sets.length; seti++) {
+        planCanonicalEditorEnsureLocalId(sets[seti], 'planSetId', allocator);
+      }
+      if (ex.progression && typeof ex.progression === 'object') {
+        planCanonicalEditorEnsureLocalId(ex.progression, 'planRuleId', allocator);
+      }
+    }
+  }
+}
+
+// ---- planCanonicalEditorResolvePersistedSource(existingId, editorState) ----
+// [Round 10 Section 6.4] Determines, for a source node's CURRENT identity,
+// the genuine persisted canonical subject it traces back to, if any. The
+// only source of truth for "genuinely persisted" is
+// editorState._priorCanonicalBase.priorChildHeadsBySubjectId -- populated
+// only by a real, verified reopen (planReopenCanonicalTemplate). This is
+// what makes Case A/E (a real prior save exists) and Case B/C/D (nothing
+// persisted yet, or this specific node was never part of a persisted save)
+// distinguishable purely from source: a brand-new Program has no
+// _priorCanonicalBase at all, so this always returns null for it (Case B);
+// a Microcycle added to an already-saved Template since its last save has
+// ids that are absent from priorChildHeadsBySubjectId too (Case C); only a
+// node that genuinely existed at the last verified reopen resolves to a
+// real answer (Case A), including one created by an earlier Duplicate that
+// has SINCE been saved and reopened (Case E, since reopen replaces
+// editorState.microcycles[...] and priorChildHeadsBySubjectId together).
+function planCanonicalEditorResolvePersistedSource(existingId, editorState) {
+  var priorHeads = editorState && editorState._priorCanonicalBase && editorState._priorCanonicalBase.priorChildHeadsBySubjectId;
+  if (priorHeads && typeof priorHeads === 'object' && Object.prototype.hasOwnProperty.call(priorHeads, existingId)) {
+    return existingId;
+  }
+  return null;
+}
+
+// ---- planCanonicalEditorHandleDuplicateMicrocycle(mi) ----
+// [Round 10] Duplicates the Microcycle at index mi: deep-clones its full
+// subtree (Sessions/Exercises/Sets/progression), allocates a fresh,
+// distinct destination identity for every duplicated node (Section 6.2:
+// identities are allocated now, not deferred to Save), inserts the new
+// Microcycle immediately after the source, and records one pending-lineage
+// entry per duplicated node in editorState._pendingDuplicationLineage
+// (Section 6.3's sidecar schema) -- never touching
+// _planDuplicationLineage or duplicationSourceExpectedBySubjectId directly;
+// those are built later, at Save/Preview time, by
+// planPrepareDuplicationLineageForCommit alone.
+//
+// First-claim-wins (Section 6.4, "at most one outstanding destination may
+// claim a given persisted source"): if the structural source of a
+// canonical entry already has its persisted source claimed by an earlier
+// still-pending sidecar entry, THIS new entry is recorded with
+// persistedSourceSubjectId:null instead of a second claim on the same
+// source -- the earlier claim wins. Fields are still fully copied either
+// way (deep clone, before any id reallocation); only the lineage claim is
+// affected. Per Section 6.4, this rule has no writer-facing effect at all
+// before the Program's first save (there is no persisted source yet for
+// anything to claim) -- it matters only once persisted sources exist to
+// contend for.
+//
+// Fresh progression identity (settled decision, preserved): the duplicate's
+// Rule gets its own fresh subjectId (via the same reallocation as every
+// other canonical child), while its configuration/field values are
+// preserved unchanged by the deep clone -- this is a fresh identity, not a
+// reset to an inert/disabled state, and creates no progression continuity
+// between the source and the duplicate (Section 8: continuity is fully
+// deferred, unaffected by Duplicate).
+// ---- planCanonicalEditorHandleRequestDuplicateMicrocycle(mi) /
+// planCanonicalEditorHandleConfirmDuplicateMicrocycle(mi) /
+// planCanonicalEditorHandleCancelDuplicateMicrocycle(mi) ----
+// Phase B partial-implementation correction, Finding 1, corrected in
+// Round 3: the rendered Duplicate control's own state-driven confirm/
+// cancel wrapper around the real, unmodified
+// planCanonicalEditorHandleDuplicateMicrocycle below. State-driven and
+// rendered inside the canonical editor itself (see the microcyclesHtml
+// render block above) -- never a native confirm()/alert().
+//
+// [Round 3 correction] The original partial implementation stored only
+// an array index ({index: mi}), which let a stale confirmation duplicate
+// the WRONG Microcycle after the list was reordered, or silently do
+// nothing useful after the confirmed Microcycle was removed, while still
+// LOOKING valid (a real Microcycle now sits at that index). This
+// correction binds the confirmation to the selected Microcycle's own
+// stable in-memory object identity instead: no new permanent identity is
+// allocated merely to support this -- the object reference itself, held
+// only for the lifetime of one pending confirmation, is the "stable
+// identity" Finding 1 requires. planCanonicalEditorState.
+// _pendingDuplicateMicrocycleConfirm is now a transient, editor-session-
+// scoped UI flag shaped { microcycle: <object> } (or absent/null); it is
+// never read by planBuildCanonicalSaveAttempt, Preview, or any writer/
+// reader function, and never serialized -- it exists solely to drive
+// this one rendered confirmation exchange. Both the render block above
+// (which matches by mc === pending.microcycle, so the rendered Confirm/
+// Cancel controls always carry whatever mi that object currently
+// occupies) and Confirm below re-resolve this identity independently;
+// neither trusts a caller-supplied index.
+function planCanonicalEditorHandleRequestDuplicateMicrocycle(mi) {
+  if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleRequestDuplicateMicrocycle')) return;
+  // Resolve first (throws the shared typed "no such microcycle" error if
+  // mi is out of range) so a stale/bad index can never open a
+  // confirmation for a Microcycle that does not exist. The RESOLVED
+  // OBJECT, not mi, is what gets remembered.
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  planCanonicalEditorState._pendingDuplicateMicrocycleConfirm = { microcycle: mc };
+  planCanonicalEditorRender();
+}
+// [Round 3, new] Resolves a pending Duplicate confirmation's CURRENT
+// actual index by strict object-identity search (Array#indexOf, which
+// compares with ===) against the CURRENT st.editorState.microcycles
+// array -- never against any caller-supplied index. Returns -1 when
+// there is no pending confirmation, or when the confirmed object is no
+// longer present at all in the current array -- because it was removed,
+// because the editorState it belonged to was wholesale-replaced (New,
+// Open/Reopen, or any other full-state replacement always produces an
+// entirely new object graph, so the old reference can never
+// coincidentally match something in it), or for any other reason. This
+// one function is the sole authority both Confirm and (indirectly,
+// through the same-shaped comparison in the render block) the rendered
+// controls rely on.
+function planCanonicalEditorResolvePendingDuplicateMicrocycleIndex(st) {
+  var pending = st && st._pendingDuplicateMicrocycleConfirm;
+  if (!pending || !pending.microcycle) return -1;
+  var mcs = st.editorState && st.editorState.microcycles;
+  if (!Array.isArray(mcs)) return -1;
+  return mcs.indexOf(pending.microcycle);
+}
+function planCanonicalEditorHandleCancelDuplicateMicrocycle(mi) {
+  if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleCancelDuplicateMicrocycle')) return;
+  var st = planCanonicalEditorState;
+  // Cancel clears only the one outstanding pending-confirmation flag --
+  // never editorState (graph, identities, ordering, or
+  // _pendingDuplicationLineage), which stays byte-for-byte untouched.
+  // There is at most one pending confirmation at a time (requesting a new
+  // one always overwrites this same single field), so Cancel needs no
+  // index or identity match at all to know which one to clear -- it is
+  // unconditional, and correct even when called with a stale mi.
+  if (st._pendingDuplicateMicrocycleConfirm) {
+    st._pendingDuplicateMicrocycleConfirm = null;
+  }
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorHandleConfirmDuplicateMicrocycle(mi) {
+  if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleConfirmDuplicateMicrocycle')) return;
+  var st = planCanonicalEditorState;
+  // [Round 3 correction] The idempotency guard, now identity-resolved
+  // rather than index-compared. The caller-supplied mi is NEVER trusted
+  // for this decision -- only the pending confirmation's own remembered
+  // object, re-resolved to its CURRENT actual index right now.
+  //
+  // [Final correction, Finding 3] Stable object identity alone already
+  // prevents a stale confirmation from duplicating the WRONG Microcycle
+  // -- but the original correction let every stale/absent case fall
+  // through to the SAME silent "clear and return undefined," with no
+  // visible or inspectable outcome. That collapsed two genuinely
+  // different situations into one:
+  //   (a) NO pending confirmation at all -- most commonly, an already-
+  //       consumed Confirm dispatched a second time. Nothing is wrong;
+  //       there is simply nothing to do. Ignored, silently, exactly like
+  //       every other already-established "ignored" result in this file
+  //       (busy/pendingSaveAttempt/etc. above) -- no validationMessage,
+  //       no re-render, since nothing about the visible editor changed.
+  //   (b) a pending confirmation EXISTS, but its remembered object is no
+  //       longer present in the CURRENT editorState.microcycles array --
+  //       removed, replaced at the same index, or the whole editor graph
+  //       was superseded (New/Open/Reopen). This is the sole "index
+  //       resolves to -1 while pending is truthy" case, and it is a
+  //       genuinely stale confirmation that the person asked for and can
+  //       no longer be honored -- it gets a concrete, human-readable
+  //       message, an actual re-render so the cleared confirmation UI is
+  //       visible, and a defined blocked result a caller/test can
+  //       inspect, never a silent no-op indistinguishable from (a).
+  // Either way the pending confirmation is cleared before this function
+  // does anything else -- which is also what keeps double activation
+  // (two click/dispatch events against the same rendered Confirm control
+  // before/without an intervening re-render) unable to ever produce two
+  // duplicates: the FIRST invocation to actually run clears the flag
+  // before doing anything else, so a second invocation -- however it was
+  // triggered -- always finds case (a), never case (b) or a live
+  // resolution, and performs no allocation, duplication, Preview,
+  // persistence, or other I/O either way.
+  var hadPending = !!(st._pendingDuplicateMicrocycleConfirm && st._pendingDuplicateMicrocycleConfirm.microcycle);
+  var resolvedIndex = planCanonicalEditorResolvePendingDuplicateMicrocycleIndex(st);
+  st._pendingDuplicateMicrocycleConfirm = null;
+  if (resolvedIndex === -1) {
+    if (!hadPending) {
+      return { status: 'ignored', reason: 'noPendingDuplicateConfirmation' };
+    }
+    var staleMessage = 'The selected Microcycle changed or no longer exists -- request Duplicate again.';
+    st.validationMessage = staleMessage;
+    planCanonicalEditorRender();
+    return { status: 'blocked', reason: 'staleDuplicateConfirmation', message: staleMessage };
+  }
+  // The real, unmodified Phase B duplicate handler -- never the legacy
+  // planDuplicateMicrocycle. It performs exactly one duplication, inserts
+  // the copy immediately after the RESOLVED index (Section 6.1's
+  // unchanged insertion-point rule, now anchored to the confirmed
+  // object's current position rather than to mi), and renders the result
+  // itself. This is precisely what makes a reorder that happens BEFORE
+  // Confirm still duplicate the originally selected Microcycle, at
+  // wherever it now sits, rather than whatever a stale mi would now
+  // point at.
+  planCanonicalEditorHandleDuplicateMicrocycle(resolvedIndex);
+  return { status: 'confirmed', index: resolvedIndex };
+}
+function planCanonicalEditorHandleDuplicateMicrocycle(mi) {
+  if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleDuplicateMicrocycle')) return;
+  var st = planCanonicalEditorState;
+  var es = st.editorState;
+  var mcs = es.microcycles;
+  var sourceMc = mcs[mi];
+  planCanonicalAdapterRequire(sourceMc, 'planCanonicalEditorHandleDuplicateMicrocycle: no such microcycle at [' + mi + ']');
+
+  var allocator = (st.ctx && typeof st.ctx.allocateId === 'function') ? st.ctx.allocateId : planDefaultIdAllocator;
+  planCanonicalEditorEnsureSourceIdentities(sourceMc, allocator);
+
+  if (!es._pendingDuplicationLineage || typeof es._pendingDuplicationLineage !== 'object') {
+    es._pendingDuplicationLineage = { canonicalSubjects: {}, localScope: {} };
+  }
+  if (!es._pendingDuplicationLineage.canonicalSubjects || typeof es._pendingDuplicationLineage.canonicalSubjects !== 'object') es._pendingDuplicationLineage.canonicalSubjects = {};
+  if (!es._pendingDuplicationLineage.localScope || typeof es._pendingDuplicationLineage.localScope !== 'object') es._pendingDuplicationLineage.localScope = {};
+  // [Round 3 / Finding 3] expectedDuplicationManifest is ensured as a
+  // third, co-equal sidecar map, exactly like the two existing ones. It
+  // starts empty even for a sidecar that already has live entries from an
+  // earlier Duplicate performed before this correction existed -- the
+  // very next entry this handler writes below always populates both the
+  // live map and the manifest together from here on, so no migration
+  // step is needed for the entries THIS handler adds. (A sidecar carried
+  // over from before this correction, with live entries but no manifest
+  // records for them, is a pre-existing-state edge case outside this
+  // handler's own contract; planPrepareDuplicationLineageForCommit's own
+  // duplicationManifestRequired gate is what surfaces that, not this
+  // handler.)
+  if (!es._pendingDuplicationLineage.expectedDuplicationManifest || typeof es._pendingDuplicationLineage.expectedDuplicationManifest !== 'object') es._pendingDuplicationLineage.expectedDuplicationManifest = {};
+  var canonicalSidecar = es._pendingDuplicationLineage.canonicalSubjects;
+  var localSidecar = es._pendingDuplicationLineage.localScope;
+  var manifestSidecar = es._pendingDuplicationLineage.expectedDuplicationManifest;
+
+  var alreadyClaimed = {};
+  Object.keys(canonicalSidecar).forEach(function (destId) {
+    var e = canonicalSidecar[destId];
+    if (e && e.persistedSourceSubjectId) alreadyClaimed[e.persistedSourceSubjectId] = true;
+  });
+  function claimIfFree(existingId) {
+    var real = planCanonicalEditorResolvePersistedSource(existingId, es);
+    if (real && !alreadyClaimed[real]) {
+      alreadyClaimed[real] = true;
+      return real;
+    }
+    return null;
+  }
+
+  var groupId = allocator();
+  var clonedMc = planDeepClonePlain(sourceMc);
+
+  var oldMcId = clonedMc.planMicrocycleId;
+  var newMcId = allocator();
+  clonedMc.planMicrocycleId = newMcId;
+  localSidecar[newMcId] = { structuralSourceLocalId: oldMcId, recordType: 'planMicrocycleLocal', groupId: groupId };
+  // [Round 3 / Finding 3] The Microcycle root's manifest record is
+  // written in the SAME statement group as its live entry above, from
+  // the SAME oldMcId/newMcId/groupId already in scope -- never
+  // recomputed. It is the one record with null parent ids (Section 3:
+  // "null only for the Microcycle-root entry").
+  manifestSidecar[newMcId] = { destinationId: newMcId, scope: 'local', recordType: 'planMicrocycleLocal', expectedStructuralSourceId: oldMcId, expectedDestinationParentId: null, expectedSourceParentId: null, groupId: groupId };
+
+  var sessions = Array.isArray(clonedMc.sessions) ? clonedMc.sessions : [];
+  for (var si = 0; si < sessions.length; si++) {
+    var sess = sessions[si];
+    var oldSessId = sess.planSessionId;
+    var newSessId = allocator();
+    sess.planSessionId = newSessId;
+    localSidecar[newSessId] = { structuralSourceLocalId: oldSessId, recordType: 'planSessionLocal', groupId: groupId };
+    // A Session's parent is its Microcycle (Section 3's convention):
+    // destination parent is the destination Microcycle root's OWN NEW id
+    // (newMcId), source parent is the source Microcycle's OWN OLD id
+    // (oldMcId) -- both already in scope from the root write above.
+    manifestSidecar[newSessId] = { destinationId: newSessId, scope: 'local', recordType: 'planSessionLocal', expectedStructuralSourceId: oldSessId, expectedDestinationParentId: newMcId, expectedSourceParentId: oldMcId, groupId: groupId };
+
+    var exercises = Array.isArray(sess.exercises) ? sess.exercises : [];
+    for (var ei = 0; ei < exercises.length; ei++) {
+      var ex = exercises[ei];
+
+      var oldAssignmentId = ex.planAssignmentId;
+      var newAssignmentId = allocator();
+      ex.planAssignmentId = newAssignmentId;
+      // [Round 3 / Finding 3] The SAME computed persisted-source claim
+      // (read once from claimIfFree) is written to both the live entry
+      // and its manifest record below -- never recomputed a second time,
+      // which is what makes the two representations correct-by-
+      // construction and therefore never disagree merely because of how
+      // a value was independently rederived (Round 3 Section 4).
+      var assignmentPersistedSource = claimIfFree(oldAssignmentId);
+      canonicalSidecar[newAssignmentId] = { structuralSourceSubjectId: oldAssignmentId, persistedSourceSubjectId: assignmentPersistedSource, recordType: 'planAssignmentSubject', groupId: groupId };
+      // An Assignment's parent is its Session (Section 3's convention).
+      manifestSidecar[newAssignmentId] = { destinationId: newAssignmentId, scope: 'canonical', recordType: 'planAssignmentSubject', expectedStructuralSourceId: oldAssignmentId, expectedPersistedSourceId: assignmentPersistedSource, expectedDestinationParentId: newSessId, expectedSourceParentId: oldSessId, groupId: groupId };
+
+      var oldOpportunityId = ex.planOpportunityId;
+      var newOpportunityId = allocator();
+      ex.planOpportunityId = newOpportunityId;
+      var opportunityPersistedSource = claimIfFree(oldOpportunityId);
+      canonicalSidecar[newOpportunityId] = { structuralSourceSubjectId: oldOpportunityId, persistedSourceSubjectId: opportunityPersistedSource, recordType: 'planScheduleOpportunitySubject', groupId: groupId };
+      // A Schedule Opportunity/Prescription/Implementation Relationship/
+      // Set/Rule's parent is THE SAME EXERCISE'S OWN Assignment id --
+      // Assignment is this design's designated "Exercise anchor" (Section
+      // 3), since an Exercise has no canonical subject id of its own.
+      manifestSidecar[newOpportunityId] = { destinationId: newOpportunityId, scope: 'canonical', recordType: 'planScheduleOpportunitySubject', expectedStructuralSourceId: oldOpportunityId, expectedPersistedSourceId: opportunityPersistedSource, expectedDestinationParentId: newAssignmentId, expectedSourceParentId: oldAssignmentId, groupId: groupId };
+
+      var oldPrescriptionId = ex.planPrescriptionId;
+      var newPrescriptionId = allocator();
+      ex.planPrescriptionId = newPrescriptionId;
+      var prescriptionPersistedSource = claimIfFree(oldPrescriptionId);
+      canonicalSidecar[newPrescriptionId] = { structuralSourceSubjectId: oldPrescriptionId, persistedSourceSubjectId: prescriptionPersistedSource, recordType: 'planPrescriptionSubject', groupId: groupId };
+      manifestSidecar[newPrescriptionId] = { destinationId: newPrescriptionId, scope: 'canonical', recordType: 'planPrescriptionSubject', expectedStructuralSourceId: oldPrescriptionId, expectedPersistedSourceId: prescriptionPersistedSource, expectedDestinationParentId: newAssignmentId, expectedSourceParentId: oldAssignmentId, groupId: groupId };
+
+      var oldRelationshipId = ex.planRelationshipId;
+      var newRelationshipId = allocator();
+      ex.planRelationshipId = newRelationshipId;
+      var relationshipPersistedSource = claimIfFree(oldRelationshipId);
+      canonicalSidecar[newRelationshipId] = { structuralSourceSubjectId: oldRelationshipId, persistedSourceSubjectId: relationshipPersistedSource, recordType: 'planImplementationRelationshipSubject', groupId: groupId };
+      manifestSidecar[newRelationshipId] = { destinationId: newRelationshipId, scope: 'canonical', recordType: 'planImplementationRelationshipSubject', expectedStructuralSourceId: oldRelationshipId, expectedPersistedSourceId: relationshipPersistedSource, expectedDestinationParentId: newAssignmentId, expectedSourceParentId: oldAssignmentId, groupId: groupId };
+
+      var sets = Array.isArray(ex.sets) ? ex.sets : [];
+      for (var seti = 0; seti < sets.length; seti++) {
+        var s = sets[seti];
+        var oldSetId = s.planSetId;
+        var newSetId = allocator();
+        s.planSetId = newSetId;
+        // Each Set is claimed/computed independently, in this same loop
+        // iteration, from its OWN oldSetId -- this is what preserves
+        // distinct, correct source mappings for multiple sibling Sets
+        // under the same Exercise (Round 3 test matrix case 5).
+        var setPersistedSource = claimIfFree(oldSetId);
+        canonicalSidecar[newSetId] = { structuralSourceSubjectId: oldSetId, persistedSourceSubjectId: setPersistedSource, recordType: 'planSetSubject', groupId: groupId };
+        manifestSidecar[newSetId] = { destinationId: newSetId, scope: 'canonical', recordType: 'planSetSubject', expectedStructuralSourceId: oldSetId, expectedPersistedSourceId: setPersistedSource, expectedDestinationParentId: newAssignmentId, expectedSourceParentId: oldAssignmentId, groupId: groupId };
+      }
+
+      if (ex.progression && typeof ex.progression === 'object') {
+        // A Rule is a real canonical graph node -- and therefore a valid
+        // duplication-lineage destination -- only when
+        // planNormalizeCanonicalGraph's own ruleActive condition holds
+        // (04-normalize.js: "!!(ex.progression && ex.progression.enabled &&
+        // ex.progression.planRuleId)"). A disabled/default progression
+        // still carries a dormant planRuleId on the draft (planEnsureDraftIdentities
+        // allocates one unconditionally), but that id is never promoted to
+        // a graph node, so it must never be recorded as a canonical
+        // sidecar destination -- doing so would make the destination fail
+        // "destinationNotInGraph" the moment a build tried to validate it.
+        // A fresh id is still minted either way (fresh progression identity,
+        // preserved decision; also avoids two independent dormant rules
+        // ever sharing one literal id), just without a lineage claim when
+        // inert -- and, symmetrically, without a manifest record either
+        // (Round 3 test matrix case 5: "inactive Rules produce neither
+        // entry").
+        var oldRuleId = ex.progression.planRuleId;
+        var wasRuleActive = !!(oldRuleId && ex.progression.enabled);
+        var newRuleId = allocator();
+        ex.progression.planRuleId = newRuleId;
+        if (wasRuleActive) {
+          var rulePersistedSource = claimIfFree(oldRuleId);
+          canonicalSidecar[newRuleId] = { structuralSourceSubjectId: oldRuleId, persistedSourceSubjectId: rulePersistedSource, recordType: 'planRuleSubject', groupId: groupId };
+          manifestSidecar[newRuleId] = { destinationId: newRuleId, scope: 'canonical', recordType: 'planRuleSubject', expectedStructuralSourceId: oldRuleId, expectedPersistedSourceId: rulePersistedSource, expectedDestinationParentId: newAssignmentId, expectedSourceParentId: oldAssignmentId, groupId: groupId };
+        }
+      }
+    }
+  }
+
+  mcs.splice(mi + 1, 0, clonedMc);
+  planCanonicalEditorState.validationMessage = null;
+  planCanonicalEditorRender();
+}
+
+// ---- planCanonicalEditorCollectLiveIds(editorState) ----
+// [Round 10 Section 6.5] Every identity currently present anywhere in the
+// draft tree -- used to prune the pending-duplication sidecar after a
+// Remove action.
+function planCanonicalEditorCollectLiveIds(editorState) {
+  var live = {};
+  var microcycles = Array.isArray(editorState && editorState.microcycles) ? editorState.microcycles : [];
+  for (var mi = 0; mi < microcycles.length; mi++) {
+    var mc = microcycles[mi];
+    if (mc && mc.planMicrocycleId) live[mc.planMicrocycleId] = true;
+    var sessions = Array.isArray(mc && mc.sessions) ? mc.sessions : [];
+    for (var si = 0; si < sessions.length; si++) {
+      var sess = sessions[si];
+      if (sess && sess.planSessionId) live[sess.planSessionId] = true;
+      var exercises = Array.isArray(sess && sess.exercises) ? sess.exercises : [];
+      for (var ei = 0; ei < exercises.length; ei++) {
+        var ex = exercises[ei];
+        if (!ex) continue;
+        if (ex.planAssignmentId) live[ex.planAssignmentId] = true;
+        if (ex.planOpportunityId) live[ex.planOpportunityId] = true;
+        if (ex.planPrescriptionId) live[ex.planPrescriptionId] = true;
+        if (ex.planRelationshipId) live[ex.planRelationshipId] = true;
+        var sets = Array.isArray(ex.sets) ? ex.sets : [];
+        for (var seti = 0; seti < sets.length; seti++) {
+          if (sets[seti] && sets[seti].planSetId) live[sets[seti].planSetId] = true;
+        }
+        // [Final correction, Finding 1] A Rule is only a live LINEAGE
+        // destination while it is genuinely an active canonical graph node
+        // -- the exact same ruleActive gate planNormalizeCanonicalGraph
+        // itself uses ("!!(ex.progression && ex.progression.enabled &&
+        // ex.progression.planRuleId)", 04-normalize.js). A disabled Rule's
+        // reserved planRuleId may still sit on the draft (existing,
+        // unrelated identity behavior), but it must never be treated as a
+        // live DESTINATION here -- doing so is exactly what stranded a
+        // disabled Rule's lineage records (canonicalSubjects/
+        // expectedDuplicationManifest) forever, since they'd never be
+        // pruned once the Rule stopped being a graph node. This is
+        // deliberately scoped to THIS destination-liveness collector only
+        // -- it has no effect on planPrepareDuplicationLineageForCommit's
+        // own, separate canonicalAncestry map, which correctly continues
+        // to track a disabled Rule's identity for SOURCE existence/type
+        // lookups regardless of its active state (a disabled Rule remains
+        // a real, checkable structural-history node; it just cannot be a
+        // pending-lineage DESTINATION while inactive).
+        if (ex.progression && ex.progression.enabled && ex.progression.planRuleId) live[ex.progression.planRuleId] = true;
+      }
+    }
+  }
+  return live;
+}
+
+// ---- planCanonicalEditorPruneDuplicationLineage(editorState) ----
+// [Round 10 Section 6.5, "Delete-time pruning of pending lineage"] Called
+// after every structural Remove action below. Drops any pending-lineage
+// sidecar entry whose OWN destination id no longer exists anywhere in the
+// current draft -- the removed node (and, for a removed Microcycle/
+// Session, every removed descendant) can never be duplicated again from
+// lineage that still names it. Never touches an entry whose destination id
+// is still live. A build's own hasLineage classification is never what
+// clears this sidecar (Section 6.5) -- this Remove-triggered prune is the
+// one, separate, already-settled trigger for removing SPECIFIC entries;
+// the sidecar as a whole is still cleared only at verified reopen success
+// or explicit New (both replace editorState wholesale elsewhere in this
+// file, which already discards _pendingDuplicationLineage as a side
+// effect of building a fresh/reopened editorState with no such field).
+function planCanonicalEditorPruneDuplicationLineage(editorState) {
+  var sidecar = editorState && editorState._pendingDuplicationLineage;
+  if (!sidecar || typeof sidecar !== 'object') return;
+  var live = planCanonicalEditorCollectLiveIds(editorState);
+  // [Round 3 / Finding 3] expectedDuplicationManifest is pruned in
+  // lockstep with the two live maps -- a genuine Remove still removes
+  // all three pieces of evidence for a node together (Round 3 Section 7).
+  // This only ever DELETES matching entries; it never rewrites a
+  // surviving entry's identity fields (Round 3 Section 5d, point 4).
+  ['canonicalSubjects', 'localScope', 'expectedDuplicationManifest'].forEach(function (key) {
+    var map = sidecar[key];
+    if (!map || typeof map !== 'object') return;
+    Object.keys(map).forEach(function (destId) {
+      if (!Object.prototype.hasOwnProperty.call(live, destId)) delete map[destId];
+    });
+  });
+  var canonicalEmpty = !sidecar.canonicalSubjects || Object.keys(sidecar.canonicalSubjects).length === 0;
+  var localEmpty = !sidecar.localScope || Object.keys(sidecar.localScope).length === 0;
+  if (canonicalEmpty && localEmpty) {
+    // The whole sidecar -- all three maps -- returns to its
+    // empty/absent state together once both live maps are empty,
+    // exactly as before this round; expectedDuplicationManifest has no
+    // separate lifecycle of its own (Round 3 Section 9).
+    delete editorState._pendingDuplicationLineage;
+  }
+}
+
+// ---- planCanonicalEditorPreviewDuplicationSave(editorState, previewCtx) ----
+// [Round 10 Section 6.6.4 / 10.3] Advisory-only preview of what an
+// authoritative Save would do right now: builds a disposable package using
+// the SAME shared lineage-preparation helper and the SAME classification
+// Save uses, purely to report the candidate write count and whether the
+// existing maxTransactionWrites cap (PLAN_V1_SAFETY_CAPS, unchanged) would
+// be exceeded. Never commits, never creates a pending-save attempt or
+// recovery marker, never mutates editorState. previewCtx mirrors
+// planBuildCanonicalSaveAttempt's ctx (ownerUid/actorUid/deviceId/
+// sessionId/allocateId); pass a preview-only allocator so no id minted
+// here is ever reused by the real Save's own, separate allocation pass.
+// Discarded regardless of outcome -- a caller must never persist or reuse
+// anything this function returns.
+function planCanonicalEditorPreviewDuplicationSave(editorState, previewCtx) {
+  planCanonicalAdapterRequire(previewCtx && typeof previewCtx === 'object', 'planCanonicalEditorPreviewDuplicationSave: previewCtx is required');
+  var previewAllocator = (typeof previewCtx.allocateId === 'function') ? previewCtx.allocateId : planDefaultIdAllocator;
+
+  var rawDraft = planAdaptEditorStateToCanonicalDraft(editorState);
+  var draft = planEnsureDraftIdentities(rawDraft, previewAllocator);
+  var basis = planBuildCommitBasis(previewCtx.ownerUid, previewCtx.actorUid, editorState && editorState._priorCanonicalBase, previewCtx.deviceId, previewCtx.sessionId);
+
+  var prepared = planPrepareDuplicationLineageForCommit(editorState && editorState._pendingDuplicationLineage, draft, basis);
+  if (!prepared.ok) {
+    return { ok: false, blockReason: prepared.blockReason, details: prepared.details || {} };
+  }
+  if (prepared.hasLineage) {
+    draft._planDuplicationLineage = prepared.draftDuplicationLineage;
+    basis.duplicationSourceExpectedBySubjectId = prepared.duplicationSourceExpectedBySubjectId;
+  }
+
+  var ids = {
+    operationId: previewAllocator(),
+    manifestId: previewAllocator(),
+    gatewayId: previewAllocator(),
+    allocateRevisionId: previewAllocator
+  };
+  var pkgResult = planBuildTemplateCommitPackage(draft, basis, ids);
+  if (!pkgResult.ok) {
+    return { ok: false, blockReason: pkgResult.blockReason, details: pkgResult.details || {} };
+  }
+  var candidateWriteCount = planCanonicalComputeCandidateWriteCount(pkgResult.package);
+  return {
+    ok: true,
+    hasLineage: prepared.hasLineage,
+    candidateWriteCount: candidateWriteCount,
+    wouldExceedSizeLimit: (typeof candidateWriteCount === 'number') ? (candidateWriteCount > PLAN_V1_SAFETY_CAPS.maxTransactionWrites) : null
+  };
 }
 
 // =============================================================================
@@ -9281,6 +10991,7 @@ function planCanonicalEditorHandleRemoveMicrocycle(mi) {
     return;
   }
   mcs.splice(mi, 1);
+  planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorState.validationMessage = null;
   planCanonicalEditorRender();
 }
@@ -9294,6 +11005,7 @@ function planCanonicalEditorHandleRemoveSession(mi, si) {
     return;
   }
   mc.sessions.splice(si, 1);
+  planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorState.validationMessage = null;
   planCanonicalEditorRender();
 }
@@ -9307,6 +11019,7 @@ function planCanonicalEditorHandleRemoveExercise(mi, si, ei) {
     return;
   }
   s.exercises.splice(ei, 1);
+  planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorState.validationMessage = null;
   planCanonicalEditorRender();
 }
@@ -9329,6 +11042,7 @@ function planCanonicalEditorHandleRemoveSet(mi, si, ei, seti) {
   if (ex.progression && (ex.progression.gatewaySetIndex === null || ex.progression.gatewaySetIndex === undefined || ex.progression.gatewaySetIndex >= ex.sets.length || ex.progression.gatewaySetIndex < 0)) {
     ex.progression.gatewaySetIndex = 0;
   }
+  planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorState.validationMessage = null;
   planCanonicalEditorRender();
 }
@@ -9509,8 +11223,17 @@ function planCanonicalEditorOutcomeIsConclusivelyNoWrite(status) {
 // refuses to let a plain next Save silently pass through -- exactly the
 // condition that used to let an ordinary second Save mint a brand-new
 // Program instead of updating the one just saved.
-async function planCanonicalEditorApplySaveResult(st, result) {
-  st.outcome = result;
+async function planCanonicalEditorApplySaveResult(st, result, perf) {
+  // Save-progress/safe-to-leave correction (Phase A requirement 3): st.outcome
+  // must never claim a save fully succeeded before the automatic verified
+  // reopen (below) actually resolves -- so, unlike every other status, the
+  // 'success'/'alreadyCommitted'-with-reopen branch further down deliberately
+  // does NOT publish st.outcome here at the top. It stays whatever HandleSave
+  // already set it to (null, cleared before this call) for the entire
+  // verifyingReopen window, and is only published once the reopen (success or
+  // failure) has resolved -- see the two st.outcome assignments below instead
+  // of one unconditional assignment here.
+  //
   // Recovery-marker CERTAINTY correction (this round): 'permanent' is
   // planClassifyCanonicalWriteError's catch-all for every writer error that
   // is not specifically recognized as disabled/conflict/retryable -- an
@@ -9533,6 +11256,7 @@ async function planCanonicalEditorApplySaveResult(st, result) {
     // "never reached the server"; for 'permanent', the catch-all itself
     // carries no source-proven guarantee either way. Either way the recovery
     // marker must also survive untouched.
+    st.outcome = result;
     return result;
   }
   // Every other status is terminal for this attempt -- nothing left to retry.
@@ -9563,16 +11287,47 @@ async function planCanonicalEditorApplySaveResult(st, result) {
   if ((result.status === 'success' || result.status === 'alreadyCommitted') && result.draft && typeof result.draft.planTemplateId === 'string' && result.draft.planTemplateId) {
     st.lastSavedTemplateId = result.draft.planTemplateId;
     st.reopenTemplateIdInput = result.draft.planTemplateId;
+    st.savePhase = 'verifyingReopen';
+    // Program-library reopen-failure-refresh correction (this round): the
+    // WRITE is conclusively established right here -- a terminal
+    // 'success'/'alreadyCommitted' result with a real draft.planTemplateId
+    // -- independent of whether the SEPARATE automatic post-save reopen
+    // below succeeds. The canonical Program library's cached list (if any
+    // is still mounted from before this session's New/Open) can no longer
+    // be trusted to include/reflect this Program, so mark it dirty NOW,
+    // before the reopen outcome is even known, rather than only inside the
+    // reopen-succeeded branch further down. This is deliberately the ONLY
+    // change this round makes to this function: it does not touch
+    // needsReopenBeforeNextSave, savedButReopenFailed, the recovery marker,
+    // or editor-identity/refresh-claim semantics below -- those still
+    // depend entirely on the reopen's own real outcome. Consumed exactly
+    // once by planCanonicalEditorHandleBackToPrograms.
+    st.libraryNeedsRefreshOnReturn = true;
+    var reopenStartedAt = (perf ? planCanonicalPerfNow() : null);
     var reopenResult = await planReopenCanonicalTemplate(st.ctx.ownerUid, result.draft.planTemplateId, st.ctx);
+    if (perf) perf.reopenMs = planCanonicalPerfNow() - reopenStartedAt;
     if (reopenResult.status === 'success' && reopenResult.editorState) {
       st.editorState = reopenResult.editorState;
       st.needsReopenBeforeNextSave = false;
+      // Phase B multi-screen editor: the automatic post-save verified
+      // reopen wholesale-replaces editorState -- reset navigation to the
+      // Program screen. Per the spec's own stated preference ("prefer the
+      // simpler Program-screen reset for this round"), this never attempts
+      // to remap the prior selection onto the freshly-reopened graph's new
+      // object references.
+      st.nav = planCanonicalEditorFreshNavState();
       result.reopenStatus = 'success';
       // Uncertain-save recovery correction requirement 3: "On successful
       // automatic reopen ... remove the marker" -- this attempt is now
       // fully confirmed, so there is nothing left to recover after a
       // reload.
       planCanonicalEditorClearRecoveryMarker();
+      // Program-library stale-refresh correction: st.libraryNeedsRefreshOnReturn
+      // was already set unconditionally above, the instant the commit
+      // itself was established -- nothing further to do here. (Previously
+      // this branch was the ONLY place that set it, which left it unset
+      // when the reopen failed; see the reopen-failure-refresh correction
+      // comment above.)
     } else {
       st.needsReopenBeforeNextSave = true;
       result.savedButReopenFailed = true;
@@ -9580,9 +11335,25 @@ async function planCanonicalEditorApplySaveResult(st, result) {
       // The marker is deliberately NOT cleared here -- requirement 3's
       // whole point is surviving exactly this scenario (the write
       // committed, but confirming it failed) across a reload.
+      //
+      // st.libraryNeedsRefreshOnReturn, however, is deliberately left TRUE
+      // (set above, before this reopen outcome was known) -- the write
+      // itself still conclusively occurred, so the library's cached list
+      // is still known-stale even though THIS session's own editor could
+      // not confirm/reopen it. This is the reopen-failure-refresh
+      // correction's entire point: the library-dirty flag and
+      // needsReopenBeforeNextSave/savedButReopenFailed now track two
+      // genuinely different facts (the write occurred vs. this session's
+      // own editor identity is confirmed) instead of being conflated.
     }
     st.outcome = result;
+    return result;
   }
+  // Every status that reaches here (disabled/conflict/blocked/alreadyCommitted
+  // without a usable draft id, etc.) never enters the reopen branch above, so
+  // there is no verifying-reopen window to withhold this from -- publish it
+  // immediately, exactly like before this round's correction.
+  st.outcome = result;
   return result;
 }
 
@@ -9659,11 +11430,39 @@ async function planCanonicalEditorHandleSave() {
   st.busy = true;
   st.outcome = null;
   st.validationMessage = null;
+  st.savePhase = 'preparingSave';
+  // Dev-only performance instrumentation (Phase A requirement 4): entirely
+  // gated behind an optional ctx.perfObserver function. Production's own
+  // planCanonicalEditorBuildProductionCtx() never sets this field, so
+  // ordinary browser use allocates no perf object, times nothing, and calls
+  // no observer -- this branch is provably inactive outside an explicit
+  // test/dev ctx override. Never alters the built package, the manifest, or
+  // any commit behavior; it only reads timestamps and pre-existing counts.
+  var perfActive = typeof st.ctx.perfObserver === 'function';
+  var perf = perfActive ? { totalStartedAt: planCanonicalPerfNow(), prepareMs: null, commitMs: null, reopenMs: null, totalMs: null, graphSize: null, plannedReadCount: null, manifestChunkCount: null, candidateWriteCount: null } : null;
   planCanonicalEditorRender();
   try {
     planCanonicalAdapterRequire(st.ctx && typeof st.ctx === 'object', 'planCanonicalEditorHandleSave: ctx is required');
     planCanonicalAdapterRequire(typeof st.ctx.commitCanonicalPackage === 'function', 'planCanonicalEditorHandleSave: ctx.commitCanonicalPackage must be a function');
+    var prepareStartedAt = perf ? planCanonicalPerfNow() : null;
     var built = planBuildCanonicalSaveAttempt(st.editorState, st.ctx);
+    if (perf) {
+      perf.prepareMs = planCanonicalPerfNow() - prepareStartedAt;
+      perf.graphSize = planCanonicalEditorComputeGraphSize(st.editorState);
+      // Phase A correction, finding 4: complete planned-read count (all
+      // seventeen readPlan ref categories, not just reusedRevisionRefs),
+      // the real package.graph.manifest/graph.chunks-derived chunk count
+      // (not the nonexistent package.manifest.chunkCount), and the
+      // previously-omitted candidate write count -- see the three pure
+      // helpers defined above planCanonicalEditorHandleNew(). built.package
+      // is undefined for a blocked build (built.ok === false); each helper
+      // already returns null for a missing/malformed package, so no extra
+      // guard is needed here.
+      var pkgForPerf = built && built.package;
+      perf.plannedReadCount = planCanonicalComputePlannedReadCount(pkgForPerf && pkgForPerf.readPlan);
+      perf.manifestChunkCount = planCanonicalComputeManifestChunkCount(pkgForPerf);
+      perf.candidateWriteCount = planCanonicalComputeCandidateWriteCount(pkgForPerf);
+    }
     if (!built.ok) {
       var blockedResult = { status: built.status, blockReason: built.blockReason, details: built.details || {}, draft: built.draft };
       st.outcome = blockedResult;
@@ -9688,8 +11487,11 @@ async function planCanonicalEditorHandleSave() {
       operationId: operationIdForMarker,
       createdAt: new Date().toISOString()
     });
+    st.savePhase = 'saving';
+    var commitStartedAt = perf ? planCanonicalPerfNow() : null;
     var result = await planCommitCanonicalPackageAndClassify(st.ctx, built.package, built.draft);
-    return await planCanonicalEditorApplySaveResult(st, result);
+    if (perf) perf.commitMs = planCanonicalPerfNow() - commitStartedAt;
+    return await planCanonicalEditorApplySaveResult(st, result, perf);
   } catch (err) {
     // A synchronous throw here (malformed ctx, or anything
     // planBuildCanonicalSaveAttempt's own adapter/identity/basis/package
@@ -9701,6 +11503,12 @@ async function planCanonicalEditorHandleSave() {
     return classified;
   } finally {
     st.busy = false;
+    st.savePhase = null;
+    if (perf) {
+      perf.totalMs = planCanonicalPerfNow() - perf.totalStartedAt;
+      delete perf.totalStartedAt;
+      st.ctx.perfObserver({ operation: 'save', perf: perf });
+    }
     planCanonicalEditorRender();
   }
 }
@@ -9749,10 +11557,27 @@ async function planCanonicalEditorHandleRetrySave() {
   st.busy = true;
   st.outcome = null;
   st.validationMessage = null;
+  st.savePhase = 'saving';
+  var retryPerfActive = typeof st.ctx.perfObserver === 'function';
+  // Phase A correction, finding 4: Retry never rebuilds -- pending.package
+  // is the exact same object planBuildCanonicalSaveAttempt built for the
+  // first attempt (see planCanonicalEditorHandleSave), so
+  // plannedReadCount/manifestChunkCount/candidateWriteCount are computed
+  // directly from IT here, synchronously, before the retry commit is even
+  // attempted -- never left null, and never re-derived from a fresh build.
+  var retryPerf = retryPerfActive ? {
+    totalStartedAt: planCanonicalPerfNow(), prepareMs: null, commitMs: null, reopenMs: null, totalMs: null,
+    graphSize: planCanonicalEditorComputeGraphSize(st.editorState),
+    plannedReadCount: planCanonicalComputePlannedReadCount(pending.package && pending.package.readPlan),
+    manifestChunkCount: planCanonicalComputeManifestChunkCount(pending.package),
+    candidateWriteCount: planCanonicalComputeCandidateWriteCount(pending.package)
+  } : null;
   planCanonicalEditorRender();
   try {
+    var retryCommitStartedAt = retryPerf ? planCanonicalPerfNow() : null;
     var result = await planCommitCanonicalPackageAndClassify(st.ctx, pending.package, pending.draft);
-    return await planCanonicalEditorApplySaveResult(st, result);
+    if (retryPerf) retryPerf.commitMs = planCanonicalPerfNow() - retryCommitStartedAt;
+    return await planCanonicalEditorApplySaveResult(st, result, retryPerf);
   } catch (err) {
     var classified = planClassifyCanonicalWriteError(err, pending.draft);
     st._pendingSaveAttempt = null;
@@ -9760,6 +11585,12 @@ async function planCanonicalEditorHandleRetrySave() {
     return classified;
   } finally {
     st.busy = false;
+    st.savePhase = null;
+    if (retryPerf) {
+      retryPerf.totalMs = planCanonicalPerfNow() - retryPerf.totalStartedAt;
+      delete retryPerf.totalStartedAt;
+      st.ctx.perfObserver({ operation: 'retrySave', perf: retryPerf });
+    }
     planCanonicalEditorRender();
   }
 }
@@ -9865,6 +11696,13 @@ async function planCanonicalEditorHandleCheckSavedStatus() {
       st.reopenTemplateIdInput = templateId;
       st.needsReopenBeforeNextSave = false;
       st.outcome = { status: 'recoveryResolved', resolution: 'verified', message: 'The previous save attempt had already completed -- it has been reopened and is ready for normal editing.' };
+      // Program-library stale-refresh correction: exactly as with an
+      // ordinary save's own successful automatic reopen above, this branch
+      // has just confirmed (via a real canonical read) that a save from
+      // this session committed -- the library's cached list can no longer
+      // be trusted. See planCanonicalEditorApplySaveResult's own comment on
+      // the same field for the full rationale.
+      st.libraryNeedsRefreshOnReturn = true;
       return st.outcome;
     }
     if (result && result.outcome === 'retryableFailure') {
@@ -10002,6 +11840,10 @@ async function planCanonicalEditorHandleReopen(templateId) {
       // plain next Save is safe again regardless of which stale
       // lastSavedTemplateId originally set the flag.
       st.needsReopenBeforeNextSave = false;
+      // Phase B multi-screen editor: a manual Reopen (or Reopen Last
+      // Saved) wholesale-replaces editorState exactly like the automatic
+      // post-save reopen above -- reset navigation to the Program screen.
+      st.nav = planCanonicalEditorFreshNavState();
     }
     return result;
   } catch (err) {
@@ -10108,6 +11950,235 @@ function planCanonicalEditorExerciseOptions() {
 // existing page-programs page instead of the old fixed development overlay.
 // Re-entering PLAN preserves the current in-memory draft; only the first visit
 // boots a fresh state (and performs the existing recovery-marker check).
+// =============================================================================
+// PHASE B MULTI-SCREEN EDITOR -- navigation controller and screen rendering
+// =============================================================================
+// Replaces the temporary one-screen canonical editor's single flat render
+// with the intended hierarchical workflow (Program Library -> Program ->
+// Microcycle -> Session -> Exercise -> Sets/Progression), per the Phase B
+// multi-screen specification. Everything ABOVE this banner in this file
+// (canonical model, normalization, writer, reader, Program library
+// persistence, save/reopen lifecycle, recovery locks, duplication-lineage
+// engine, and every field-setter/structural-editing handler) is preserved
+// completely unmodified by this section -- this section only changes HOW
+// that already-accepted state is presented and navigated.
+//
+// ---- Controller architecture ----
+// planCanonicalEditorState.nav is a transient, editor-session-scoped
+// navigation selection, added as a SIBLING of editorState (never inside
+// it -- see planCanonicalEditorBuildFreshState above). It is never read by
+// planAdaptEditorStateToCanonicalDraft, planNormalizeCanonicalGraph, any
+// commit-package builder, or any Firestore read/write -- the only functions
+// that ever touch it are the ones in this section, plus the four explicit
+// wholesale-replacement reset points commented above (HandleNew,
+// ApplyBootRecoveryOutcome's verified branch, ApplySaveResult's post-save
+// reopen branch, HandleReopen's success branch).
+//
+// nav holds STABLE OBJECT REFERENCES for the current Microcycle/Session/
+// Exercise/Set selection (never a bare array index as long-lived identity):
+// { screen, microcycle, session, exercise, set, staleNotice }. `screen` is
+// one of 'program' | 'microcycle' | 'session' | 'exercise' | 'set' |
+// 'progression' -- private identifiers to this controller. On every render,
+// planCanonicalEditorResolveNavLocation() re-resolves each held reference
+// against the CURRENT editorState tree by strict identity (Array#indexOf):
+// reordering never loses the selection (indexOf finds the same object at
+// its new position); removal (or a wholesale editorState replacement, whose
+// new objects can never coincidentally match old references) makes it
+// unresolvable, and the controller falls back to the nearest still-valid
+// parent screen with a concise, honest explanation in nav.staleNotice --
+// never silently opening a different object that happens to occupy the same
+// index.
+//
+// ---- Screen/field inventory (see the implementation report for the full
+// table) ----
+//   Program screen:     name, description, structureLabel, notes; Microcycle
+//                        rows (open/add/duplicate+confirm/cancel/move/remove).
+//   Microcycle screen:  name only (no notes field); Session rows
+//                        (open/add/move/remove); Duplicate this Microcycle.
+//   Session screen:     name, notes; Exercise rows (open/add/move/remove).
+//   Exercise screen:    exercise selection (or text fallback), notes; Set
+//                        rows (open/add/move/remove); Progression
+//                        summary + navigation.
+//   Set screen:         every existing canonical Set field (dedicated child
+//                        screen -- see the report's justification).
+//   Progression screen: every existing canonical Rule field, including
+//                        enabled/disable (dedicated child screen, matching
+//                        the Set screen's own precedent).
+// A persistent global header (Save/outcome/validation/save-phase/reload-
+// warning/New/Back to Programs/Reopen-diagnostic) renders identically on
+// every screen, using the exact same canonical save handler and state this
+// editor has always used -- never a second save implementation.
+// =============================================================================
+
+function planCanonicalEditorFreshNavState() {
+  return { screen: 'program', microcycle: null, session: null, exercise: null, set: null, staleNotice: null };
+}
+
+// ---- planCanonicalEditorResolveNavLocation() ----
+// See the banner comment above for the full contract. Called at the top of
+// every render, before any screen-specific HTML is built. Mutates
+// planCanonicalEditorState.nav IN PLACE only when a held selection can no
+// longer be resolved (falling back to its nearest valid parent); otherwise
+// leaves nav untouched. Returns a plain resolved-location object (never
+// nav itself) carrying the CURRENT indices/objects for whichever levels are
+// valid for the (possibly just-corrected) screen.
+function planCanonicalEditorResolveNavLocation() {
+  var st = planCanonicalEditorState;
+  if (!st.nav || typeof st.nav !== 'object') st.nav = planCanonicalEditorFreshNavState();
+  var nav = st.nav;
+  var es = st.editorState;
+  var loc = { screen: nav.screen, mi: -1, si: -1, ei: -1, seti: -1, mc: null, session: null, exercise: null, set: null };
+  if (!es || nav.screen === 'program') { loc.screen = 'program'; return loc; }
+
+  var mi = (nav.microcycle && Array.isArray(es.microcycles)) ? es.microcycles.indexOf(nav.microcycle) : -1;
+  if (mi === -1) {
+    nav.screen = 'program'; nav.microcycle = null; nav.session = null; nav.exercise = null; nav.set = null;
+    nav.staleNotice = 'That microcycle is no longer available here -- returned to the Program screen.';
+    loc.screen = 'program';
+    return loc;
+  }
+  loc.mi = mi; loc.mc = es.microcycles[mi];
+  if (nav.screen === 'microcycle') return loc;
+
+  var si = (nav.session && Array.isArray(loc.mc.sessions)) ? loc.mc.sessions.indexOf(nav.session) : -1;
+  if (si === -1) {
+    nav.screen = 'microcycle'; nav.session = null; nav.exercise = null; nav.set = null;
+    nav.staleNotice = 'That session is no longer available here -- returned to the Microcycle screen.';
+    loc.screen = 'microcycle';
+    return loc;
+  }
+  loc.si = si; loc.session = loc.mc.sessions[si];
+  if (nav.screen === 'session') return loc;
+
+  var ei = (nav.exercise && Array.isArray(loc.session.exercises)) ? loc.session.exercises.indexOf(nav.exercise) : -1;
+  if (ei === -1) {
+    nav.screen = 'session'; nav.exercise = null; nav.set = null;
+    nav.staleNotice = 'That exercise is no longer available here -- returned to the Session screen.';
+    loc.screen = 'session';
+    return loc;
+  }
+  loc.ei = ei; loc.exercise = loc.session.exercises[ei];
+  if (nav.screen === 'exercise' || nav.screen === 'progression') return loc;
+
+  var seti = (nav.set && Array.isArray(loc.exercise.sets)) ? loc.exercise.sets.indexOf(nav.set) : -1;
+  if (seti === -1) {
+    nav.screen = 'exercise'; nav.set = null;
+    nav.staleNotice = 'That set is no longer available here -- returned to the Exercise screen.';
+    loc.screen = 'exercise';
+    return loc;
+  }
+  loc.seti = seti; loc.set = loc.exercise.sets[seti];
+  return loc;
+}
+
+// ---- Navigation handlers ----
+// Pure navigation: never mutate editorState, never gated by
+// planCanonicalEditorGuardMutable (busy/pending-save/recovery-checking) --
+// documented policy: "ordinary movement between already-open editor levels
+// may remain available... since it cannot discard/replace state." Each
+// resolves its target through the SAME planCanonicalEditorResolve*
+// functions every field-setter/structural handler already uses, so an
+// out-of-range index throws the identical typed error rather than silently
+// opening nothing.
+function planCanonicalEditorNavOpenMicrocycle(mi) {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenMicrocycle');
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var st = planCanonicalEditorState;
+  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
+  st.nav.screen = 'microcycle'; st.nav.microcycle = mc; st.nav.session = null; st.nav.exercise = null; st.nav.set = null; st.nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavBackToProgram() {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToProgram');
+  planCanonicalEditorState.nav = planCanonicalEditorFreshNavState();
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavOpenSession(mi, si) {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenSession');
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var sess = planCanonicalEditorResolveSession(mi, si);
+  var st = planCanonicalEditorState;
+  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
+  st.nav.screen = 'session'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = null; st.nav.set = null; st.nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavBackToMicrocycle() {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToMicrocycle');
+  var nav = planCanonicalEditorState.nav;
+  planCanonicalAdapterRequire(nav, 'planCanonicalEditorNavBackToMicrocycle: no navigation state');
+  nav.screen = 'microcycle'; nav.session = null; nav.exercise = null; nav.set = null; nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavOpenExercise(mi, si, ei) {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenExercise');
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var sess = planCanonicalEditorResolveSession(mi, si);
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var st = planCanonicalEditorState;
+  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
+  st.nav.screen = 'exercise'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = ex; st.nav.set = null; st.nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavBackToSession() {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToSession');
+  var nav = planCanonicalEditorState.nav;
+  planCanonicalAdapterRequire(nav, 'planCanonicalEditorNavBackToSession: no navigation state');
+  nav.screen = 'session'; nav.exercise = null; nav.set = null; nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavOpenSet(mi, si, ei, seti) {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenSet');
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var sess = planCanonicalEditorResolveSession(mi, si);
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var set = planCanonicalEditorResolveSet(mi, si, ei, seti);
+  var st = planCanonicalEditorState;
+  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
+  st.nav.screen = 'set'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = ex; st.nav.set = set; st.nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+function planCanonicalEditorNavOpenProgression(mi, si, ei) {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenProgression');
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var sess = planCanonicalEditorResolveSession(mi, si);
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var st = planCanonicalEditorState;
+  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
+  st.nav.screen = 'progression'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = ex; st.nav.set = null; st.nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+// Shared by both the Set screen and the Progression screen -- both are
+// children of the Exercise screen, so "Back" from either has the same
+// exact logical parent.
+function planCanonicalEditorNavBackToExercise() {
+  planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToExercise');
+  var nav = planCanonicalEditorState.nav;
+  planCanonicalAdapterRequire(nav, 'planCanonicalEditorNavBackToExercise: no navigation state');
+  nav.screen = 'exercise'; nav.set = null; nav.staleNotice = null;
+  planCanonicalEditorRender();
+}
+
+// ---- planCanonicalGetExerciseName(exerciseId) ----
+// Display-name resolution for exercise rows/titles, mirroring the legacy
+// editor's own getExercise() lookups (app-data.js's shared, already-
+// accepted exercise catalog accessor -- never a canonical writer/reader
+// concern). Guarded exactly like planCanonicalEditorExerciseOptions above
+// so a bare Node load without app-data.js never breaks rendering.
+function planCanonicalGetExerciseName(exerciseId) {
+  if (!exerciseId) return '(no exercise selected)';
+  try {
+    if (typeof getExercise === 'function') {
+      var e = getExercise(exerciseId);
+      if (e && e.name) return e.name;
+    }
+  } catch (e) { /* never let a broken/absent catalog block rendering */ }
+  return exerciseId;
+}
+
+// Regular PLAN navigation entry. Mount the canonical editor inside the
+// existing page-programs page instead of the old fixed development overlay.
+// Re-entering PLAN preserves the current in-memory draft; only the first visit
+// boots a fresh state (and performs the existing recovery-marker check).
 function planOpenCanonicalEditorFromPlanNavigation() {
   if (typeof document !== 'undefined') {
     var page = planContainer();
@@ -10135,6 +12206,21 @@ function planCanonicalEditorRender() {
   }
   var st = planCanonicalEditorState;
   var es = st.editorState;
+  var loc = planCanonicalEditorResolveNavLocation();
+  var nav = st.nav;
+
+  // Save-progress/safe-to-leave correction (Phase A requirement 3): the
+  // beforeunload guard is synced on every render from the SAME
+  // planCanonicalEditorIsSafeToLeave() predicate that already drives
+  // lockedAttr/reopenLockedAttr below (busy || pending save attempt ||
+  // recovery check in progress) -- never a separately-tracked flag that
+  // could drift from what is actually rendered as locked. This means the
+  // warning is installed/removed based on current editor state on every
+  // render, not permanently installed once and left in place. Unaffected
+  // by which screen is currently showing (Phase B requirement: "The
+  // before-unload warning and save-phase state must remain active
+  // regardless of visible editor level").
+  planCanonicalEditorSyncBeforeUnloadGuard(!planCanonicalEditorIsSafeToLeave());
   var busyAttr = st.busy ? 'disabled' : '';
   // Save-lifecycle correction requirement 3 ("Rendered controls must be
   // disabled appropriately"): every control that MUTATES editorState is
@@ -10166,6 +12252,24 @@ function planCanonicalEditorRender() {
   var reloadWarningHtml = st.reloadRecoveryWarning
     ? '<div class="plan-canonical-editor-reload-warning" data-testid="reload-recovery-warning" style="margin:8px 0;padding:8px;border-radius:6px;background:#ffe;color:#740">' + escapeHtml(st.reloadRecoveryWarning) + '</div>'
     : '';
+  // Save-progress/safe-to-leave correction (Phase A requirement 3): a small,
+  // always-present-when-relevant banner distinguishing the in-flight save
+  // sub-phases (preparing/saving/verifying reopen) from the terminal
+  // outcome banner above. st.savePhase is set/cleared only by
+  // planCanonicalEditorHandleSave/HandleRetrySave/ApplySaveResult -- this
+  // is a pure read of that state, not a second source of truth.
+  var savePhaseLabels = { preparingSave: 'Preparing save...', saving: 'Saving...', verifyingReopen: 'Saved -- verifying...' };
+  var savePhaseHtml = (st.savePhase && savePhaseLabels[st.savePhase])
+    ? '<div class="plan-canonical-editor-save-phase" data-testid="save-phase" style="margin:8px 0;padding:8px;border-radius:6px;background:#eef">' + escapeHtml(savePhaseLabels[st.savePhase]) + '</div>'
+    : '';
+  // Phase B multi-screen editor: a concise, one-time explanation when the
+  // navigation controller just fell back from a stale selection (a
+  // removed/replaced Microcycle/Session/Exercise/Set) to its nearest valid
+  // parent screen. Persists until the next explicit navigation action
+  // (every planCanonicalEditorNav* handler above clears it).
+  var staleNoticeHtml = nav.staleNotice
+    ? '<div class="plan-canonical-editor-nav-stale" data-testid="nav-stale-notice" style="margin:8px 0;padding:8px;border-radius:6px;background:#eef;color:#335">' + escapeHtml(nav.staleNotice) + '</div>'
+    : '';
 
   var exerciseOptions = planCanonicalEditorExerciseOptions();
 
@@ -10186,7 +12290,7 @@ function planCanonicalEditorRender() {
     return '<label style="font-size:11px;display:block">Exercise<select data-testid="exercise-select"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetExerciseField(' + mi + ',' + si + ',' + ei + ',\'exerciseId\',this.value)">' + optionsHtml + '</select></label>';
   }
 
-  function setHtml(mi, si, ei, set, seti, setCount) {
+  function setFieldsHtml(mi, si, ei, set, seti) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei, seti);
     function num(field, label) {
       var v = set[field];
@@ -10212,7 +12316,7 @@ function planCanonicalEditorRender() {
         opts.map(function (o) { return '<option value="' + o.v + '" ' + (set[field] === o.v ? 'selected' : '') + '>' + o.label + '</option>'; }).join('') +
         '</select></label>';
     }
-    return '<div class="plan-canonical-editor-set" data-testid="set-row"' + idx + ' style="display:flex;flex-wrap:wrap;gap:6px;align-items:flex-end;margin:4px 0;padding:4px;border:1px solid #eee;border-radius:4px">' +
+    return '<div class="plan-field-group" data-testid="set-fields"' + idx + '>' +
       typeSelect('loadType', 'Load', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed Weight' }, { v: 'percentTM', label: '% TM' }, { v: 'percent1RM', label: '% 1RM' }, { v: 'bodyweight', label: 'Bodyweight' }]) +
       loadHtml +
       typeSelect('repsType', 'Reps', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed' }, { v: 'range', label: 'Range' }]) +
@@ -10222,23 +12326,20 @@ function planCanonicalEditorRender() {
       typeSelect('timeType', 'Time', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed' }, { v: 'range', label: 'Range' }]) +
       timeHtml +
       '<label style="font-size:11px">Notes<input type="text" data-testid="set-notes"' + idx + ' ' + lockedAttr + ' value="' + escapeHtml(set.notes || '') + '" oninput="planCanonicalEditorHandleSetSetField(' + mi + ',' + si + ',' + ei + ',' + seti + ',\'notes\',this.value)"></label>' +
-      '<button type="button" class="btn btn-sm" data-testid="move-set-up"' + idx + ' ' + (lockedAttr || (seti === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSet(' + mi + ',' + si + ',' + ei + ',' + seti + ',-1)">Move Up</button>' +
-      '<button type="button" class="btn btn-sm" data-testid="move-set-down"' + idx + ' ' + (lockedAttr || (seti === setCount - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSet(' + mi + ',' + si + ',' + ei + ',' + seti + ',1)">Move Down</button>' +
-      '<button type="button" class="btn btn-sm" data-testid="remove-set"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveSet(' + mi + ',' + si + ',' + ei + ',' + seti + ')">Remove Set</button>' +
       '</div>';
   }
 
-  function progressionHtml(mi, si, ei, ex) {
+  function progressionFieldsHtml(mi, si, ei, ex) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
     var prog = ex.progression;
     if (!prog || !prog.enabled) {
       return '<div class="plan-canonical-editor-progression" data-testid="progression-panel"' + idx + ' style="margin:6px 0">' +
-        '<button type="button" class="btn btn-sm" data-testid="progression-enable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleEnableProgression(' + mi + ',' + si + ',' + ei + ')">Enable Progression</button>' +
+        '<button type="button" class="btn btn-secondary btn-sm" data-testid="progression-enable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleEnableProgression(' + mi + ',' + si + ',' + ei + ')">Enable Progression</button>' +
         '</div>';
     }
     var setCount = ex.sets.length;
     var gatewayOptions = ex.sets.map(function (s, i) { return '<option value="' + i + '" ' + (prog.gatewaySetIndex === i ? 'selected' : '') + '>Set ' + (i + 1) + '</option>'; }).join('');
-    return '<div class="plan-canonical-editor-progression" data-testid="progression-panel"' + idx + ' style="margin:6px 0;padding:6px;border:1px solid #ddd;border-radius:4px">' +
+    return '<div class="plan-canonical-editor-progression plan-field-group" data-testid="progression-panel"' + idx + '>' +
       '<div style="font-size:12px;font-weight:600">Progression: ON</div>' +
       '<label style="font-size:11px">Evaluation<select data-testid="progression-evaluationType"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'evaluationType\',this.value)">' +
         ['strict', 'volume', 'gateway'].map(function (v) { return '<option value="' + v + '" ' + (prog.evaluationType === v ? 'selected' : '') + '>' + v + '</option>'; }).join('') +
@@ -10253,84 +12354,22 @@ function planCanonicalEditorRender() {
       '<label style="font-size:11px">On Failure<select data-testid="progression-failBehavior"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'failBehavior\',this.value)">' +
         '<option value="repeat" ' + (prog.failBehavior === 'repeat' ? 'selected' : '') + '>Repeat Prescription</option>' +
         '</select></label>' +
-      '<button type="button" class="btn btn-sm" data-testid="progression-disable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ')">Disable Progression</button>' +
+      '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-disable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ')">Disable Progression</button>' +
       '</div>';
   }
 
-  var microcyclesHtml = es.microcycles.map(function (mc, mi) {
-    var mcIdx = planCanonicalEditorIdxAttrs(mi);
-    var mcCount = es.microcycles.length;
-    var sessionsHtml = mc.sessions.map(function (s, si) {
-      var sIdx = planCanonicalEditorIdxAttrs(mi, si);
-      var sessCount = mc.sessions.length;
-      var exercisesHtml = s.exercises.map(function (ex, ei) {
-        var eIdx = planCanonicalEditorIdxAttrs(mi, si, ei);
-        var exCount = s.exercises.length;
-        var setsHtml = ex.sets.map(function (set, seti) { return setHtml(mi, si, ei, set, seti, ex.sets.length); }).join('');
-        return '<div class="plan-canonical-editor-exercise" data-testid="exercise-row"' + eIdx + ' style="border:1px solid #ccc;border-radius:6px;padding:8px;margin:6px 0">' +
-          exerciseSelectHtml(mi, si, ei, ex) +
-          '<label style="font-size:11px;display:block">Notes<input type="text" data-testid="exercise-notes"' + eIdx + ' ' + lockedAttr + ' value="' + escapeHtml(ex.notes || '') + '" oninput="planCanonicalEditorHandleSetExerciseField(' + mi + ',' + si + ',' + ei + ',\'notes\',this.value)"></label>' +
-          setsHtml +
-          '<button type="button" class="btn btn-sm" data-testid="add-set"' + eIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddSet(' + mi + ',' + si + ',' + ei + ')">+ Set</button>' +
-          progressionHtml(mi, si, ei, ex) +
-          '<div style="margin-top:4px">' +
-          '<button type="button" class="btn btn-sm" data-testid="move-exercise-up"' + eIdx + ' ' + (lockedAttr || (ei === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveExercise(' + mi + ',' + si + ',' + ei + ',-1)">Move Up</button>' +
-          '<button type="button" class="btn btn-sm" data-testid="move-exercise-down"' + eIdx + ' ' + (lockedAttr || (ei === exCount - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveExercise(' + mi + ',' + si + ',' + ei + ',1)">Move Down</button>' +
-          '<button type="button" class="btn btn-sm" data-testid="remove-exercise"' + eIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveExercise(' + mi + ',' + si + ',' + ei + ')">Remove Exercise</button>' +
-          '</div></div>';
-      }).join('');
-      return '<div class="plan-canonical-editor-session" data-testid="session-row"' + sIdx + ' style="border:1px solid #ddd;border-radius:6px;padding:8px;margin:6px 0">' +
-        '<label style="font-size:11px;display:block">Session Name<input type="text" data-testid="session-name"' + sIdx + ' ' + lockedAttr + ' value="' + escapeHtml(s.name || '') + '" oninput="planCanonicalEditorHandleSetSessionField(' + mi + ',' + si + ',\'name\',this.value)"></label>' +
-        '<label style="font-size:11px;display:block">Session Notes<textarea data-testid="session-notes"' + sIdx + ' ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetSessionField(' + mi + ',' + si + ',\'notes\',this.value)">' + escapeHtml(s.notes || '') + '</textarea></label>' +
-        exercisesHtml +
-        '<button type="button" class="btn btn-sm" data-testid="add-exercise"' + sIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddExercise(' + mi + ',' + si + ')">+ Exercise</button>' +
-        '<div style="margin-top:4px">' +
-        '<button type="button" class="btn btn-sm" data-testid="move-session-up"' + sIdx + ' ' + (lockedAttr || (si === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi + ',' + si + ',-1)">Move Up</button>' +
-        '<button type="button" class="btn btn-sm" data-testid="move-session-down"' + sIdx + ' ' + (lockedAttr || (si === sessCount - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi + ',' + si + ',1)">Move Down</button>' +
-        '<button type="button" class="btn btn-sm" data-testid="remove-session"' + sIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveSession(' + mi + ',' + si + ')">Remove Session</button>' +
-        '</div></div>';
-    }).join('');
-    return '<div class="plan-canonical-editor-microcycle" data-testid="microcycle-row"' + mcIdx + ' style="border:1px solid #bbb;border-radius:6px;padding:8px;margin:6px 0">' +
-      '<label style="font-size:11px;display:block">Microcycle Name<input type="text" data-testid="microcycle-name"' + mcIdx + ' ' + lockedAttr + ' value="' + escapeHtml(mc.name || '') + '" oninput="planCanonicalEditorHandleSetMicrocycleField(' + mi + ',\'name\',this.value)"></label>' +
-      sessionsHtml +
-      '<button type="button" class="btn btn-sm" data-testid="add-session"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddSession(' + mi + ')">+ Session</button>' +
-      '<div style="margin-top:4px">' +
-      '<button type="button" class="btn btn-sm" data-testid="move-microcycle-up"' + mcIdx + ' ' + (lockedAttr || (mi === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi + ',-1)">Move Up</button>' +
-      '<button type="button" class="btn btn-sm" data-testid="move-microcycle-down"' + mcIdx + ' ' + (lockedAttr || (mi === mcCount - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi + ',1)">Move Down</button>' +
-      '<button type="button" class="btn btn-sm" data-testid="remove-microcycle"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveMicrocycle(' + mi + ')">Remove Microcycle</button>' +
-      '</div></div>';
-  }).join('');
-
-  // Uncertain-save recovery correction requirement 1/2/4: the "Abandon"
-  // control shared by the two unresolved states below (a cancelled-but-
-  // unresolved pending save, and a boot-time recovery lock). Deliberately
-  // two real actions, not one: a checkbox (whose onchange writes to
-  // st._abandonAcknowledged and re-renders, purely so the checked state is
-  // visible) and a SEPARATE Abandon button whose onclick reads that same
-  // field back as the `acknowledged` argument -- a bare click on the
-  // button alone (no prior checkbox click) always passes
-  // {acknowledged:false}, which planCanonicalEditorHandleAbandonUnresolvedSave
-  // refuses outright. This is what makes a single accidental click unable
-  // to bypass duplicate-prevention.
+  // ---- Shared global header: identical Save/outcome/validation/save-phase/
+  // reload-warning/New/Back-to-Programs/Reopen-diagnostic block on every
+  // screen -- the exact same canonical save handler and states throughout
+  // (never a second, per-level save implementation). Save-lifecycle /
+  // uncertain-save recovery correction: the same four saveAreaHtml states
+  // as before this round (recovery-locked / cancelled-unresolved-pending /
+  // live-pending / ordinary Save), byte-identical logic, unmoved.
   var abandonControlHtml =
     '<div class="plan-canonical-editor-abandon" data-testid="abandon-control" style="margin-top:8px;padding:8px;border:1px dashed #900;border-radius:6px">' +
     '<label style="font-size:11px;display:block"><input type="checkbox" data-testid="abandon-ack-checkbox" ' + (st._abandonAcknowledged ? 'checked' : '') + ' onchange="planCanonicalEditorState._abandonAcknowledged = this.checked; planCanonicalEditorRender();"> Yes, I understand a Program may already exist and I am abandoning tracking it.</label>' +
     '<button type="button" class="btn btn-secondary" data-testid="abandon-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleAbandonUnresolvedSave({acknowledged: planCanonicalEditorState._abandonAcknowledged === true})">Abandon</button>' +
     '</div>';
-
-  // Save-lifecycle / uncertain-save recovery correction: three distinct
-  // rendered states now, not two.
-  //   1. recoveryChecking (requirement 4) -- boot-time recovery is either
-  //      still in flight or locked awaiting Retry Check/Abandon. Nothing
-  //      about the pending save-attempt controls applies here at all;
-  //      there is no editorState worth saving yet.
-  //   2. st._pendingSaveAttempt.cancelledUnresolved (requirement 1) -- a
-  //      Cancel has already happened; there is no live in-flight attempt
-  //      left to Cancel again, only Retry Save / Check Saved Status /
-  //      Abandon.
-  //   3. st._pendingSaveAttempt (live, not yet cancelled) -- the original
-  //      save-lifecycle correction's Retry/Cancel pair, unchanged.
-  //   4. Neither -- the ordinary Save button.
   var saveAreaHtml;
   if (st.recoveryChecking) {
     saveAreaHtml =
@@ -10345,47 +12384,718 @@ function planCanonicalEditorRender() {
       '<button type="button" class="btn btn-secondary" data-testid="check-saved-status-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleCheckSavedStatus()">Check Saved Status</button>' +
       abandonControlHtml;
   } else if (st._pendingSaveAttempt) {
-    // Save-lifecycle correction requirement 2: while a LIVE save attempt is
-    // pending confirmation, the Save button is replaced with Retry/Cancel
-    // -- there is nothing an ordinary Save click could mean in that state
-    // (see planCanonicalEditorHandleSave's own top-of-function refusal).
     saveAreaHtml =
       '<button type="button" class="btn btn-primary" data-testid="retry-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetrySave()">Retry Save</button>' +
       '<button type="button" class="btn btn-secondary" data-testid="cancel-pending-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleCancelPendingSave()">Cancel</button>';
   } else {
     saveAreaHtml = '<button type="button" class="btn btn-primary" data-testid="save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleSave()">Save</button>';
   }
-  // Reopen (and Reopen Last Saved) are disabled while a save attempt is
-  // pending, or while a boot-time recovery check is unresolved, too --
-  // reopening would discard the in-memory editorState the pending attempt
-  // was built from, or race the recovery check, while either is still
-  // unresolved (see planCanonicalEditorHandleReopen's own pending-attempt
-  // guard).
   var reopenLockedAttr = (st.busy || st._pendingSaveAttempt || st.recoveryChecking) ? 'disabled' : '';
-
-  root.innerHTML =
-    '<div class="page-title-zone"><h2>Program Editor</h2></div>' +
-    outcomeHtml + validationHtml + reloadWarningHtml +
-    '<div class="form-group"><label>Program Name</label><input type="text" data-testid="program-name" ' + lockedAttr + ' value="' + escapeHtml(es.name || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'name\',this.value)"></div>' +
-    '<div class="form-group"><label>Description</label><textarea data-testid="program-description" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'description\',this.value)">' + escapeHtml(es.description || '') + '</textarea></div>' +
-    '<div class="form-group"><label>Structure Label</label><input type="text" data-testid="program-structureLabel" ' + lockedAttr + ' value="' + escapeHtml(es.structureLabel || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'structureLabel\',this.value)"></div>' +
-    '<div class="form-group"><label>Notes</label><textarea data-testid="program-notes" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'notes\',this.value)">' + escapeHtml(es.notes || '') + '</textarea></div>' +
-    microcyclesHtml +
-    '<button type="button" class="btn btn-secondary" data-testid="add-microcycle-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddMicrocycle()">+ Add Microcycle</button>' +
-    '<div style="margin-top:16px;display:flex;gap:8px">' +
+  var programName = (es && es.name && es.name.trim()) ? es.name.trim() : 'Untitled Program';
+  var globalHeaderHtml =
+    '<div class="page-title-zone"><h2>' + escapeHtml(programName) + '</h2></div>' +
+    savePhaseHtml + outcomeHtml + validationHtml + reloadWarningHtml + staleNoticeHtml +
+    '<div style="margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
     saveAreaHtml +
-    // Uncertain-save recovery correction requirement 2: New is now locked
-    // (fail-closed, the explicitly preferred option) under exactly the
-    // same conditions lockedAttr already reflects -- see
-    // planCanonicalEditorHandleNew's own comment for why New is no longer
-    // exempt from this.
     '<button type="button" class="btn btn-secondary" data-testid="new-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleNew()">New</button>' +
+    '<button type="button" class="btn btn-secondary" data-testid="back-to-programs-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleBackToPrograms()">Back to Programs</button>' +
     '</div>' +
-    '<div class="form-group" style="margin-top:16px"><label>Reopen Template Id</label>' +
+    '<div class="form-group" data-testid="reopen-diagnostic-area"><label>Reopen Template Id (diagnostic/dev -- ordinarily use the Program library instead)</label>' +
     '<input type="text" data-testid="reopen-template-id-input" ' + reopenLockedAttr + ' value="' + escapeHtml(st.reopenTemplateIdInput || '') + '" oninput="planCanonicalEditorState.reopenTemplateIdInput = this.value">' +
     '<button type="button" class="btn btn-secondary" data-testid="reopen-btn" ' + reopenLockedAttr + ' onclick="planCanonicalEditorHandleReopen()">Reopen</button>' +
     '<button type="button" class="btn btn-secondary" data-testid="reopen-last-saved-btn" ' + (reopenLockedAttr || (!st.lastSavedTemplateId ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleReopenLastSaved()">Reopen Last Saved</button>' +
     '</div>';
+
+  function breadcrumbHtml(segments) {
+    var trail = segments.filter(Boolean).map(escapeHtml).join(' <span class="plan-breadcrumb-sep">&rsaquo;</span> ');
+    return trail ? '<div class="plan-breadcrumb">' + trail + '</div>' : '';
+  }
+
+  // ---- Duplicate Microcycle control (unchanged handler chain/testids --
+  // see the Phase B duplication-lineage correction above) -- shared by the
+  // Program-screen microcycle row AND the Microcycle screen's own page
+  // action, per the multi-screen spec's "expose Duplicate Microcycle
+  // naturally at the Program/Microcycle level."
+  function duplicateMicrocycleControlHtml(mi, mc) {
+    var mcIdx = planCanonicalEditorIdxAttrs(mi);
+    var pendingDupConfirm = st._pendingDuplicateMicrocycleConfirm;
+    var dupConfirmPendingForThis = !!(pendingDupConfirm && pendingDupConfirm.microcycle === mc);
+    return dupConfirmPendingForThis
+      ? ('<span data-testid="duplicate-microcycle-confirm-area"' + mcIdx + ' style="margin-right:4px">' +
+        '<span data-testid="duplicate-microcycle-confirm-message"' + mcIdx + ' style="font-size:11px;margin-right:4px">Duplicate this microcycle?</span>' +
+        '<button type="button" class="btn btn-sm btn-primary" data-testid="duplicate-microcycle-confirm-btn"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleConfirmDuplicateMicrocycle(' + mi + ')">Confirm Duplicate</button>' +
+        '<button type="button" class="btn btn-sm btn-secondary" data-testid="duplicate-microcycle-cancel-btn"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleCancelDuplicateMicrocycle(' + mi + ')">Cancel</button>' +
+        '</span>')
+      : ('<button type="button" class="btn-icon btn-sm" data-testid="duplicate-microcycle"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRequestDuplicateMicrocycle(' + mi + ')">Duplicate Microcycle</button>');
+  }
+
+  var bodyHtml;
+
+  // ===========================================================================
+  // PROGRAM SCREEN
+  // ===========================================================================
+  if (loc.screen === 'program') {
+    var mcCount0 = es.microcycles.length;
+    var mcRowsHtml = mcCount0 ? es.microcycles.map(function (mc, mi) {
+      var mcIdx = planCanonicalEditorIdxAttrs(mi);
+      return '<div class="plan-row" data-testid="microcycle-row"' + mcIdx + '>' +
+        '<button type="button" class="plan-row-main" data-testid="open-microcycle"' + mcIdx + ' onclick="planCanonicalEditorNavOpenMicrocycle(' + mi + ')" style="background:none;border:none;text-align:left;padding:0">' +
+        '<div class="plan-row-name">' + escapeHtml(mc.name || ('Microcycle ' + (mi + 1))) + '</div>' +
+        '<div class="plan-row-sub">' + planMicrocycleSummary(mc) + '</div>' +
+        '</button>' +
+        '<div class="plan-row-controls">' +
+        duplicateMicrocycleControlHtml(mi, mc) +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-microcycle-up"' + mcIdx + ' ' + (lockedAttr || (mi === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi + ',-1)">&uarr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-microcycle-down"' + mcIdx + ' ' + (lockedAttr || (mi === mcCount0 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi + ',1)">&darr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="remove-microcycle"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveMicrocycle(' + mi + ')">&#10005;</button>' +
+        '</div></div>';
+    }).join('') : planEmptyState('No Microcycles yet.', 'Create your first microcycle to begin building this Program.');
+
+    bodyHtml =
+      planLevelEyebrow('Program') +
+      '<div class="form-group"><label>Program Name</label><input type="text" data-testid="program-name" ' + lockedAttr + ' value="' + escapeHtml(es.name || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'name\',this.value)"></div>' +
+      '<div class="form-group"><label>Description</label><textarea data-testid="program-description" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'description\',this.value)">' + escapeHtml(es.description || '') + '</textarea></div>' +
+      '<div class="form-group"><label>Structure Label</label><input type="text" data-testid="program-structureLabel" ' + lockedAttr + ' value="' + escapeHtml(es.structureLabel || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'structureLabel\',this.value)"></div>' +
+      '<div class="form-group"><label>Notes</label><textarea data-testid="program-notes" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'notes\',this.value)">' + escapeHtml(es.notes || '') + '</textarea></div>' +
+      '<div class="prof-section-label" style="margin:16px 0 8px">Microcycles</div>' +
+      mcRowsHtml +
+      '<button type="button" class="btn btn-secondary" style="margin-top:8px" data-testid="add-microcycle-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddMicrocycle()">+ Add Microcycle</button>';
+
+  // ===========================================================================
+  // MICROCYCLE SCREEN
+  // ===========================================================================
+  } else if (loc.screen === 'microcycle') {
+    var mc1 = loc.mc, mi1 = loc.mi;
+    var sessCount1 = mc1.sessions.length;
+    var sessRowsHtml = sessCount1 ? mc1.sessions.map(function (s, si) {
+      var sIdx = planCanonicalEditorIdxAttrs(mi1, si);
+      return '<div class="plan-row" data-testid="session-row"' + sIdx + '>' +
+        '<button type="button" class="plan-row-main" data-testid="open-session"' + sIdx + ' onclick="planCanonicalEditorNavOpenSession(' + mi1 + ',' + si + ')" style="background:none;border:none;text-align:left;padding:0">' +
+        '<div class="plan-row-name">' + escapeHtml(s.name || ('Session ' + (si + 1))) + '</div>' +
+        '<div class="plan-row-sub">' + planSessionSummary(s) + '</div>' +
+        '</button>' +
+        '<div class="plan-row-controls">' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-session-up"' + sIdx + ' ' + (lockedAttr || (si === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi1 + ',' + si + ',-1)">&uarr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-session-down"' + sIdx + ' ' + (lockedAttr || (si === sessCount1 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi1 + ',' + si + ',1)">&darr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="remove-session"' + sIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveSession(' + mi1 + ',' + si + ')">&#10005;</button>' +
+        '</div></div>';
+    }).join('') : planEmptyState('No Sessions yet.', 'Add a session to this microcycle.');
+
+    bodyHtml =
+      '<button type="button" class="btn-icon" data-testid="nav-back-to-program" onclick="planCanonicalEditorNavBackToProgram()" aria-label="Back">&#8592; Program</button>' +
+      breadcrumbHtml([programName]) +
+      planLevelEyebrow('Microcycle') +
+      '<div class="form-group"><label>Microcycle Name</label><input type="text" data-testid="microcycle-name"' + planCanonicalEditorIdxAttrs(mi1) + ' ' + lockedAttr + ' value="' + escapeHtml(mc1.name || '') + '" oninput="planCanonicalEditorHandleSetMicrocycleField(' + mi1 + ',\'name\',this.value)"></div>' +
+      '<div class="prof-section-label" style="margin:16px 0 8px">Sessions</div>' +
+      sessRowsHtml +
+      '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
+      '<button type="button" class="btn btn-secondary" data-testid="add-session"' + planCanonicalEditorIdxAttrs(mi1) + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddSession(' + mi1 + ')">+ Add Session</button>' +
+      duplicateMicrocycleControlHtml(mi1, mc1) +
+      '</div>';
+
+  // ===========================================================================
+  // SESSION SCREEN
+  // ===========================================================================
+  } else if (loc.screen === 'session') {
+    var mi2 = loc.mi, si2 = loc.si, sess2 = loc.session, mc2 = loc.mc;
+    var exCount2 = sess2.exercises.length;
+    var exRowsHtml = exCount2 ? sess2.exercises.map(function (ex, ei) {
+      var eIdx = planCanonicalEditorIdxAttrs(mi2, si2, ei);
+      return '<div class="plan-row" data-testid="exercise-row"' + eIdx + '>' +
+        '<button type="button" class="plan-row-main" data-testid="open-exercise"' + eIdx + ' onclick="planCanonicalEditorNavOpenExercise(' + mi2 + ',' + si2 + ',' + ei + ')" style="background:none;border:none;text-align:left;padding:0">' +
+        '<div class="plan-row-name">' + escapeHtml(planCanonicalGetExerciseName(ex.exerciseId)) + '</div>' +
+        '<div class="plan-row-sub">' + planExerciseSummary(ex) + '</div>' +
+        '</button>' +
+        '<div class="plan-row-controls">' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-exercise-up"' + eIdx + ' ' + (lockedAttr || (ei === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveExercise(' + mi2 + ',' + si2 + ',' + ei + ',-1)">&uarr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-exercise-down"' + eIdx + ' ' + (lockedAttr || (ei === exCount2 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveExercise(' + mi2 + ',' + si2 + ',' + ei + ',1)">&darr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="remove-exercise"' + eIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveExercise(' + mi2 + ',' + si2 + ',' + ei + ')">&#10005;</button>' +
+        '</div></div>';
+    }).join('') : planEmptyState('No Exercises yet.', 'Add your first exercise to begin building this session.');
+
+    bodyHtml =
+      '<button type="button" class="btn-icon" data-testid="nav-back-to-microcycle" onclick="planCanonicalEditorNavBackToMicrocycle()" aria-label="Back">&#8592; Microcycle</button>' +
+      breadcrumbHtml([programName, mc2.name || ('Microcycle ' + (mi2 + 1))]) +
+      planLevelEyebrow('Session') +
+      '<div class="form-group"><label>Session Name</label><input type="text" data-testid="session-name"' + planCanonicalEditorIdxAttrs(mi2, si2) + ' ' + lockedAttr + ' value="' + escapeHtml(sess2.name || '') + '" oninput="planCanonicalEditorHandleSetSessionField(' + mi2 + ',' + si2 + ',\'name\',this.value)"></div>' +
+      '<div class="form-group"><label>Session Notes</label><textarea data-testid="session-notes"' + planCanonicalEditorIdxAttrs(mi2, si2) + ' ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetSessionField(' + mi2 + ',' + si2 + ',\'notes\',this.value)">' + escapeHtml(sess2.notes || '') + '</textarea></div>' +
+      '<div class="prof-section-label" style="margin:16px 0 8px">Exercises</div>' +
+      exRowsHtml +
+      '<button type="button" class="btn btn-secondary" style="margin-top:8px" data-testid="add-exercise"' + planCanonicalEditorIdxAttrs(mi2, si2) + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddExercise(' + mi2 + ',' + si2 + ')">+ Add Exercise</button>';
+
+  // ===========================================================================
+  // EXERCISE SCREEN
+  // ===========================================================================
+  } else if (loc.screen === 'exercise') {
+    var mi3 = loc.mi, si3 = loc.si, ei3 = loc.ei, ex3 = loc.exercise, sess3 = loc.session, mc3 = loc.mc;
+    var setCount3 = ex3.sets.length;
+    var setRowsHtml = setCount3 ? ex3.sets.map(function (set, seti) {
+      var setIdx = planCanonicalEditorIdxAttrs(mi3, si3, ei3, seti);
+      var workingLoadEligible = !!(ex3.progression && ex3.progression.enabled && ex3.progression.adjustmentType === 'addLoad');
+      return '<div class="plan-set-row" data-testid="set-row"' + setIdx + '>' +
+        '<button type="button" class="plan-set-row-main" data-testid="open-set"' + setIdx + ' onclick="planCanonicalEditorNavOpenSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ')" style="background:none;border:none;text-align:left;padding:0">' +
+        '<span class="plan-set-row-num">' + (seti + 1) + '</span>' +
+        '<span class="plan-set-row-summary">' + planFormatSetSummary(set, true, workingLoadEligible) + '</span>' +
+        '</button>' +
+        '<div class="plan-row-controls">' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-set-up"' + setIdx + ' ' + (lockedAttr || (seti === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ',-1)">&uarr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="move-set-down"' + setIdx + ' ' + (lockedAttr || (seti === setCount3 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ',1)">&darr;</button>' +
+        '<button type="button" class="btn-icon btn-sm" data-testid="remove-set"' + setIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ')">&#10005;</button>' +
+        '</div></div>';
+    }).join('') : planEmptyState('No Sets yet.', 'Add your first prescribed set.');
+
+    var progSummary = planProgressionSummaryText(ex3);
+    var eIdx3 = planCanonicalEditorIdxAttrs(mi3, si3, ei3);
+    bodyHtml =
+      '<button type="button" class="btn-icon" data-testid="nav-back-to-session" onclick="planCanonicalEditorNavBackToSession()" aria-label="Back">&#8592; Session</button>' +
+      breadcrumbHtml([programName, mc3.name || ('Microcycle ' + (mi3 + 1)), sess3.name || ('Session ' + (si3 + 1))]) +
+      planLevelEyebrow('Exercise') +
+      exerciseSelectHtml(mi3, si3, ei3, ex3) +
+      '<div class="form-group"><label>Exercise Notes</label><textarea data-testid="exercise-notes"' + eIdx3 + ' ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetExerciseField(' + mi3 + ',' + si3 + ',' + ei3 + ',\'notes\',this.value)">' + escapeHtml(ex3.notes || '') + '</textarea></div>' +
+      '<div class="prof-section-label" style="margin:16px 0 8px">Sets</div>' +
+      setRowsHtml +
+      '<button type="button" class="btn btn-secondary" style="margin-top:8px" data-testid="add-set"' + eIdx3 + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddSet(' + mi3 + ',' + si3 + ',' + ei3 + ')">+ Add Set</button>' +
+      '<div class="prof-section-label" style="margin:16px 0 8px">Progression</div>' +
+      '<div class="plan-row" data-testid="progression-row"' + eIdx3 + '>' +
+      '<button type="button" class="plan-row-main" data-testid="open-progression"' + eIdx3 + ' onclick="planCanonicalEditorNavOpenProgression(' + mi3 + ',' + si3 + ',' + ei3 + ')" style="background:none;border:none;text-align:left;padding:0">' +
+      '<div class="plan-row-name">' + (ex3.progression && ex3.progression.enabled ? 'Progression: On' : 'Progression: Off') + '</div>' +
+      (progSummary ? '<div class="plan-row-sub">' + escapeHtml(progSummary) + '</div>' : '') +
+      '</button></div>';
+
+  // ===========================================================================
+  // SET SCREEN
+  // ===========================================================================
+  } else if (loc.screen === 'set') {
+    var mi4 = loc.mi, si4 = loc.si, ei4 = loc.ei, seti4 = loc.seti, ex4 = loc.exercise, sess4 = loc.session, mc4 = loc.mc, set4 = loc.set;
+    var workingLoadEligible4 = !!(ex4.progression && ex4.progression.enabled && ex4.progression.adjustmentType === 'addLoad');
+    bodyHtml =
+      '<button type="button" class="btn-icon" data-testid="nav-back-to-exercise" onclick="planCanonicalEditorNavBackToExercise()" aria-label="Back">&#8592; Exercise</button>' +
+      breadcrumbHtml([programName, mc4.name || ('Microcycle ' + (mi4 + 1)), sess4.name || ('Session ' + (si4 + 1)), planCanonicalGetExerciseName(ex4.exerciseId)]) +
+      planLevelEyebrow('Set ' + (seti4 + 1)) +
+      '<div class="plan-set-preview-box" data-testid="set-preview">' + planFormatSetSummary(set4, true, workingLoadEligible4) + '</div>' +
+      setFieldsHtml(mi4, si4, ei4, set4, seti4);
+
+  // ===========================================================================
+  // PROGRESSION SCREEN
+  // ===========================================================================
+  } else if (loc.screen === 'progression') {
+    var mi5 = loc.mi, si5 = loc.si, ei5 = loc.ei, ex5 = loc.exercise, sess5 = loc.session, mc5 = loc.mc;
+    bodyHtml =
+      '<button type="button" class="btn-icon" data-testid="nav-back-to-exercise" onclick="planCanonicalEditorNavBackToExercise()" aria-label="Back">&#8592; Exercise</button>' +
+      breadcrumbHtml([programName, mc5.name || ('Microcycle ' + (mi5 + 1)), sess5.name || ('Session ' + (si5 + 1)), planCanonicalGetExerciseName(ex5.exerciseId)]) +
+      planLevelEyebrow('Progression') +
+      progressionFieldsHtml(mi5, si5, ei5, ex5);
+  }
+
+  root.innerHTML = globalHeaderHtml + '<div class="plan-editor">' + bodyHtml + '</div>';
+}
+
+// =============================================================================
+// CANONICAL PLAN LIBRARY (Phase A requirement 2) -- a discoverable canonical
+// Program library that normal PLAN navigation opens FIRST, instead of
+// dropping directly into the single-Program editor with no Template Id
+// required. Reads ONLY through the new fsPlanPersistence.fsPlanListTemplateSummaries
+// browser method (Phase A requirement 1), which itself delegates to the
+// existing, already-tested buildCanonicalPlanReaderSuite(...).listTemplateSummariesPage(...)
+// -- never a new query, never the legacy `programs` collection. Opening a
+// card always goes through the existing, unmodified planReopenCanonicalTemplate(...)
+// full verified-read path (the exact same one Reopen and auto-reopen-after-
+// save already use) -- a list-page summary is never treated as the editable
+// Program graph. The single-screen editor this section hands off to is
+// unmodified scaffolding, per this round's scope -- this section only adds a
+// discovery/entry layer in front of it.
+// =============================================================================
+
+var PLAN_CANONICAL_LIBRARY_CONTAINER_ID = 'canonical-plan-library-root';
+
+// Module-scoped, mirroring planCanonicalEditorState's own convention above:
+// { ctx, status, items, hasMore, nextCursor, error, openingTemplateId,
+//   openError }.
+//   status: 'loading' | 'ready' | 'disabled' | 'retryable' | 'error'
+var planCanonicalLibraryState = null;
+
+function planCanonicalLibraryGetState() { return planCanonicalLibraryState; }
+
+// Production ctx: reads ownerUid from the SAME live Firebase Auth handle
+// planCanonicalEditorBuildProductionCtx() already reads it from (never a
+// UI-supplied value), and delegates listTemplateSummaries to the one new
+// approved persistence method (Phase A requirement 1) -- never a raw
+// Firestore query, never the reader suite directly.
+//
+// buildEditorCtx is carried on this SAME ctx object (defaulting to the real
+// planCanonicalEditorBuildProductionCtx) rather than HandleNew/HandleOpen
+// below calling planCanonicalEditorBuildProductionCtx() directly -- matching
+// the one injection point every other handler in this file already relies
+// on for testability (a Node-only test passes a ctxOverride to
+// planCanonicalLibraryBoot with its own buildEditorCtx, driving these
+// IDENTICAL production handler functions against a fake editor ctx instead
+// of requiring a real auth.currentUser/fsPlanPersistence for every library
+// test).
+function planCanonicalLibraryBuildProductionCtx() {
+  var uid = (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null;
+  planCanonicalAdapterRequire(typeof uid === 'string' && uid,
+    'planCanonicalLibraryBuildProductionCtx: no authenticated user -- the canonical Program library must never be booted before real authentication resolves');
+  return {
+    ownerUid: uid,
+    listTemplateSummaries: function (input) { return fsPlanPersistence.fsPlanListTemplateSummaries(input); },
+    buildEditorCtx: planCanonicalEditorBuildProductionCtx
+  };
+}
+
+function planCanonicalLibraryRequireBooted(callerName) {
+  planCanonicalAdapterRequire(planCanonicalLibraryState && typeof planCanonicalLibraryState === 'object',
+    callerName + ': the canonical Program library has not been booted -- call planCanonicalLibraryBoot() first');
+}
+
+// ---- planCanonicalLibraryBoot(ctxOverride) ----
+// Same injection pattern as planCanonicalEditorBoot: production always
+// calls this with zero arguments (real ctx, real auth); a Node-only test
+// passes a ctx whose listTemplateSummaries is bound to
+// __test.dispatchCanonicalTemplateListForTest, driving this IDENTICAL
+// production function -- there is no separate "test version" of the list
+// UI, exactly the same testability contract the editor section above
+// already documents.
+function planCanonicalLibraryBoot(ctxOverride) {
+  var ctx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalLibraryBuildProductionCtx();
+  var st = {
+    ctx: ctx,
+    status: 'loading',
+    items: [],
+    hasMore: false,
+    nextCursor: null,
+    error: null,
+    openingTemplateId: null,
+    openError: null
+  };
+  planCanonicalLibraryState = st;
+  planCanonicalLibraryRender();
+  planCanonicalLibraryRunFetch(st, null, false);
+  return st;
+}
+
+// ---- planCanonicalLibraryRunFetch(st, cursor, append) ----
+// The one and only place this section calls ctx.listTemplateSummaries.
+// `.items` returned by listTemplateSummariesPage already excludes
+// malformed/terminated/inactive entries (the reader suite's own
+// classification/active-item filtering) -- rendered directly, never
+// re-filtered here. On append (Load More), new items are merged by
+// templateId so a page boundary landing between concurrent edits can never
+// produce a duplicate card; nextCursor/hasMore are always taken from the
+// freshest response. A response arriving after a newer boot has replaced
+// planCanonicalLibraryState is discarded rather than applied to stale state.
+//
+// A retryable engine failure inside listTemplateSummariesPage does not
+// reject -- it RESOLVES with { outcome: 'retryableFailure', ... } (the same
+// contract fsPlanReadCanonicalTemplate already uses, handled identically by
+// planReopenCanonicalTemplate above). That resolved-but-failed shape is
+// checked for explicitly, before treating the response as a page of items --
+// otherwise a retryable engine failure would be silently rendered as an
+// empty Program list instead of a retryable error.
+async function planCanonicalLibraryRunFetch(st, cursor, append) {
+  if (planCanonicalLibraryState !== st) return;
+  st.status = 'loading';
+  st.error = null;
+  planCanonicalLibraryRender();
+  try {
+    var page = await st.ctx.listTemplateSummaries({ ownerUid: st.ctx.ownerUid, cursor: cursor || null });
+    if (planCanonicalLibraryState !== st) return;
+    if (page && page.outcome === 'retryableFailure') {
+      st.status = 'retryable';
+      st.error = { status: 'retryable', error: { message: page.reason || 'retryable failure' }, result: page };
+      return;
+    }
+    var incoming = (page && Array.isArray(page.items)) ? page.items : [];
+    if (append) {
+      var seen = {};
+      st.items.forEach(function (it) { seen[it.templateId] = true; });
+      incoming.forEach(function (it) { if (!seen[it.templateId]) { st.items.push(it); seen[it.templateId] = true; } });
+    } else {
+      st.items = incoming.slice();
+    }
+    st.hasMore = !!(page && page.hasMore);
+    st.nextCursor = (page && page.nextCursor) || null;
+    st.status = 'ready';
+  } catch (err) {
+    if (planCanonicalLibraryState !== st) return;
+    var classified = planClassifyCanonicalReadError(err);
+    st.status = (classified.status === 'disabled') ? 'disabled' : (classified.status === 'retryable') ? 'retryable' : 'error';
+    st.error = classified;
+  } finally {
+    if (planCanonicalLibraryState === st) planCanonicalLibraryRender();
+  }
+}
+
+function planCanonicalLibraryHandleRetry() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleRetry');
+  return planCanonicalLibraryRunFetch(planCanonicalLibraryState, null, false);
+}
+
+function planCanonicalLibraryHandleLoadMore() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleLoadMore');
+  var st = planCanonicalLibraryState;
+  if (st.status === 'loading' || !st.hasMore || !st.nextCursor) return { status: 'ignored', reason: 'noMoreOrBusy' };
+  return planCanonicalLibraryRunFetch(st, st.nextCursor, true);
+}
+
+// ---- planCanonicalLibraryMountEditorContainer() ----
+// Mirrors planOpenCanonicalEditorFromPlanNavigation's own mount step
+// exactly -- clears page-programs, mounts a fresh
+// PLAN_CANONICAL_EDITOR_CONTAINER_ID div -- so the editor's own render
+// function finds the container it expects regardless of whether the editor
+// is reached via the library's New/Open, or (still, temporarily) directly.
+function planCanonicalLibraryMountEditorContainer() {
+  if (typeof document === 'undefined') return;
+  var page = planContainer();
+  if (!page) return;
+  page.innerHTML = '';
+  var mountedRoot = document.createElement('div');
+  mountedRoot.id = PLAN_CANONICAL_EDITOR_CONTAINER_ID;
+  page.appendChild(mountedRoot);
+}
+
+// ---- planCanonicalLibraryHandleNew() ----
+// A genuinely fresh editor: builds state directly with
+// planCanonicalEditorBuildFreshState(ctx) rather than going through
+// planCanonicalEditorBoot, deliberately -- Boot's own recovery-marker check
+// exists to catch an UNKNOWN prior uncertain save from a previous session,
+// which is only meaningful when reopening/resuming; a brand-new Program has
+// no marker of its own to check, and running that check here would risk
+// surfacing a stale marker belonging to whatever Program was open before
+// New was clicked.
+function planCanonicalLibraryHandleNew() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleNew');
+  // Phase A correction (final round, Finding 4): re-check for a valid,
+  // owner-matched recovery marker immediately before proceeding -- a marker
+  // may have been written (by another tab/session) after this library
+  // already finished booting with none present, while its New Program
+  // control stayed mounted and clickable. If one now exists, this locks
+  // into the existing recovery UI/status-check flow instead: no fresh
+  // editor is created, and the marker itself is never touched here.
+  var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(planCanonicalLibraryState.ctx);
+  if (recoveryCheck.locked) return recoveryCheck.editorState;
+  var ctx = planCanonicalLibraryState.ctx.buildEditorCtx();
+  planCanonicalLibraryMountEditorContainer();
+  planCanonicalEditorState = planCanonicalEditorBuildFreshState(ctx);
+  planCanonicalEditorRender();
+  return planCanonicalEditorState;
+}
+
+// ---- planCanonicalLibraryHandleOpen(templateId) ----
+// Uses the card's own stable Template Id and the SAME full verified-read
+// path (planReopenCanonicalTemplate) Reopen and auto-reopen-after-save
+// already use -- never the summary data itself. Enters the editor only
+// after that read succeeds; on failure, the library stays mounted and
+// shows the failure on the card's own action so a person can retry from the
+// library instead of being dropped into a broken editor screen.
+async function planCanonicalLibraryHandleOpen(templateId) {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryHandleOpen');
+  var st = planCanonicalLibraryState;
+  if (st.openingTemplateId) return { status: 'ignored', reason: 'openInProgress' };
+  planCanonicalAdapterRequire(typeof templateId === 'string' && templateId, 'planCanonicalLibraryHandleOpen: templateId is required');
+  // Phase A correction (final round, Finding 4): the same re-check
+  // planCanonicalLibraryHandleNew above performs, immediately before this
+  // proceeds -- a marker may have been written (by another tab/session)
+  // after this library already finished booting with none present, while
+  // its Open/Edit controls stayed mounted and clickable. If one now
+  // exists, this locks into the existing recovery UI/status-check flow
+  // instead: the selected Template is never opened, and the marker itself
+  // is never touched here. Checked BEFORE st.openingTemplateId is set and
+  // before any read is issued, so a locked outcome never leaves a stray
+  // "opening" state behind.
+  var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(st.ctx);
+  if (recoveryCheck.locked) return { status: 'ignored', reason: 'recoveryPending', editorState: recoveryCheck.editorState };
+  st.openingTemplateId = templateId;
+  st.openError = null;
+  planCanonicalLibraryRender();
+  // Phase A correction (finding 1): a successful reopen must leave the
+  // editor mounted -- planCanonicalLibraryRender() looks up
+  // PLAN_CANONICAL_LIBRARY_CONTAINER_ID by id; once
+  // planCanonicalLibraryMountEditorContainer() below has replaced
+  // #page-programs's content with the editor container, that library root
+  // no longer exists in the DOM, so an unconditional finally-block render
+  // would find it missing, wipe #page-programs, and remount a brand-new
+  // (empty-looking) library over the editor that was just opened. This
+  // flag is the one clean way to tell the finally block "this call already
+  // reached a successful, still-current transition to the editor -- do not
+  // touch the DOM again on the way out."
+  var openedEditor = false;
+  try {
+    var editorCtx = st.ctx.buildEditorCtx();
+    var reopenResult = await planReopenCanonicalTemplate(editorCtx.ownerUid, templateId, editorCtx);
+    // Stale-result guard: if the library itself has been replaced (a fresh
+    // boot, a Retry, or the user navigated away) while this reopen was in
+    // flight, this result belongs to a session that no longer exists --
+    // never act on it, and never touch st (a different object now).
+    if (planCanonicalLibraryState !== st) return reopenResult;
+    if (reopenResult.status === 'success' && reopenResult.editorState) {
+      var freshState = planCanonicalEditorBuildFreshState(editorCtx);
+      freshState.editorState = reopenResult.editorState;
+      freshState.lastSavedTemplateId = templateId;
+      freshState.reopenTemplateIdInput = templateId;
+      planCanonicalLibraryMountEditorContainer();
+      planCanonicalEditorState = freshState;
+      // Clear the in-flight marker on the (still-retained, not discarded)
+      // library state now, inline, rather than relying on the finally
+      // block below -- so a LATER return to the library (Back to
+      // Programs) never shows this Program as still "opening".
+      st.openingTemplateId = null;
+      openedEditor = true;
+      planCanonicalEditorRender();
+      return reopenResult;
+    }
+    st.openError = reopenResult;
+    return reopenResult;
+  } catch (err) {
+    var classified = planClassifyCanonicalReadError(err);
+    if (planCanonicalLibraryState === st) st.openError = classified;
+    return classified;
+  } finally {
+    // Only the non-success paths (failure, stale, or an exception) still
+    // own #page-programs as the library -- render it there, honestly
+    // reflecting st.openError. A successful transition to the editor
+    // (openedEditor) must never be followed by a library render here.
+    if (!openedEditor && planCanonicalLibraryState === st) {
+      st.openingTemplateId = null;
+      planCanonicalLibraryRender();
+    }
+  }
+}
+
+function planCanonicalLibraryOutcomeLabel(err) {
+  if (!err || !err.status) return '';
+  var labels = { disabled: 'Disabled (canonical capability is off)', retryable: 'Retryable failure -- try again' };
+  return labels[err.status] || 'Could not open this Program';
+}
+
+// ---- planCanonicalLibraryRender() ----
+// Real DOM, guarded no-op under Node -- same convention as
+// planCanonicalEditorRender above. Covers every state requirement 2 names:
+// loading, empty, one active-Program card per valid summary (name plus
+// whichever of description/structureLabel/assignmentCount are available),
+// New Program, Open/Edit, retry for a retryable list failure, and honest
+// disabled/unknown-error states.
+function planCanonicalLibraryRender() {
+  if (typeof document === 'undefined') return;
+  if (!planCanonicalLibraryState) return;
+  var page = planContainer();
+  var root = document.getElementById(PLAN_CANONICAL_LIBRARY_CONTAINER_ID);
+  if (!root) {
+    root = document.createElement('div');
+    root.id = PLAN_CANONICAL_LIBRARY_CONTAINER_ID;
+    if (page) { page.innerHTML = ''; page.appendChild(root); }
+    else if (typeof document.body !== 'undefined') { document.body.appendChild(root); }
+  }
+  var st = planCanonicalLibraryState;
+  var newBtnHtml = '<button type="button" class="btn btn-primary" data-testid="library-new-btn" onclick="planCanonicalLibraryHandleNew()">New Program</button>';
+
+  if (st.status === 'loading' && !st.items.length) {
+    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
+      '<div data-testid="library-loading" style="padding:16px">Loading Programs...</div>';
+    return;
+  }
+  if (st.status === 'disabled') {
+    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
+      '<div data-testid="library-disabled" style="padding:8px;border-radius:6px;background:#eee">The canonical Program library is currently disabled.</div>' +
+      newBtnHtml;
+    return;
+  }
+  if (st.status === 'retryable' || st.status === 'error') {
+    var isRetryable = st.status === 'retryable';
+    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
+      '<div data-testid="' + (isRetryable ? 'library-retryable' : 'library-error') + '" style="padding:8px;border-radius:6px;' + (isRetryable ? 'background:#ffe;color:#740' : 'background:#fee;color:#900') + '">Could not load Programs' + (isRetryable ? ' -- a retryable error occurred.' : '.') +
+      (st.error && st.error.error && st.error.error.message ? ' -- ' + escapeHtml(st.error.error.message) : '') + '</div>' +
+      '<button type="button" class="btn btn-secondary" data-testid="library-retry-btn" onclick="planCanonicalLibraryHandleRetry()">Retry</button>' +
+      newBtnHtml;
+    return;
+  }
+
+  var openErrorHtml = st.openError
+    ? '<div class="plan-canonical-library-open-error" data-testid="library-open-error" style="margin:8px 0;padding:8px;border-radius:6px;background:#fee;color:#900">' +
+      escapeHtml(planCanonicalLibraryOutcomeLabel(st.openError)) +
+      (st.openError.error && st.openError.error.message ? ' -- ' + escapeHtml(st.openError.error.message) : '') +
+      '</div>'
+    : '';
+
+  var cardsHtml = !st.items.length
+    ? '<div data-testid="library-empty" style="padding:16px">No Programs yet. Use New Program to create one.</div>'
+    : st.items.map(function (item) {
+      var opening = st.openingTemplateId === item.templateId;
+      var detailBits = [];
+      if (item.description) detailBits.push(escapeHtml(item.description));
+      if (item.structureLabel) detailBits.push(escapeHtml(item.structureLabel));
+      if (typeof item.assignmentCount === 'number') detailBits.push(item.assignmentCount + ' assignment' + (item.assignmentCount === 1 ? '' : 's'));
+      var safeTemplateId = escapeHtml(item.templateId).replace(/'/g, "\\'");
+      return '<div class="plan-canonical-library-card" data-testid="library-card" data-template-id="' + escapeHtml(item.templateId) + '" style="border:1px solid #ccc;border-radius:6px;padding:8px;margin:6px 0">' +
+        '<div style="font-weight:600">' + escapeHtml(item.name || '(untitled Program)') + '</div>' +
+        (detailBits.length ? '<div style="font-size:12px;color:#555">' + detailBits.join(' -- ') + '</div>' : '') +
+        '<button type="button" class="btn btn-sm" data-testid="library-open-btn" data-template-id="' + escapeHtml(item.templateId) + '" ' + (opening ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleOpen(\'' + safeTemplateId + '\')">' + (opening ? 'Opening...' : 'Open / Edit') + '</button>' +
+        '</div>';
+    }).join('');
+
+  var loadMoreHtml = st.hasMore
+    ? '<button type="button" class="btn btn-secondary" data-testid="library-load-more-btn" ' + (st.status === 'loading' ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleLoadMore()">Load More</button>'
+    : '';
+
+  root.innerHTML =
+    '<div class="page-title-zone"><h2>Programs</h2></div>' +
+    openErrorHtml +
+    newBtnHtml +
+    '<div data-testid="library-cards">' + cardsHtml + '</div>' +
+    loadMoreHtml;
+}
+
+// ---- planCanonicalOwnsPageProgramsView() ----
+// Phase A correction, finding 3: a single explicit canonical-ownership
+// predicate, exported so app-core.js's legacy `programs` collection
+// snapshot listener can ask "does the canonical library/editor (including
+// the canonical editor's own boot-time recovery-check screen -- it's just
+// planCanonicalEditorState with recoveryChecking true) currently own the
+// #page-programs container?" instead of re-deriving that answer from
+// scattered DOM guesses. Both planCanonicalLibraryBoot and
+// planCanonicalEditorBoot assign their respective module-scoped state
+// synchronously, before any async work begins, and
+// planOpenCanonicalLibraryFromPlanNavigation (the sole normal-PLAN-
+// navigation entry point, called synchronously from showPage() the moment
+// #page-programs becomes the active page) always ends by calling one of
+// them -- so by the time any other code can observe #page-programs as the
+// active page, canonical ownership is already established. The only time
+// both are null is when planResetCanonicalUserScopedState() has just torn
+// everything down (auth boundary), which also clears the canonical
+// containers' own DOM -- correctly reporting "canonical does not own it"
+// in that narrow window, since there is nothing canonical left to protect.
+function planCanonicalOwnsPageProgramsView() {
+  return !!(planCanonicalLibraryState || planCanonicalEditorState);
+}
+
+// ---- planCanonicalLibraryCheckAndLockOnPendingRecovery(libraryCtx) ----
+// Phase A correction (final round, Finding 4 -- multi-tab recovery-marker
+// race). Closes a gap the boot-time-only check below could not: a valid,
+// owner-matched recovery marker written by ANOTHER tab/session AFTER this
+// library already finished booting with none present -- so its rendered
+// New/Open controls are still mounted and clickable, even though a prior
+// save attempt from elsewhere is now genuinely unresolved. This is the ONE
+// shared route used both by initial PLAN navigation
+// (planOpenCanonicalLibraryFromPlanNavigation below) and immediately before
+// New/Open on an ALREADY-mounted library (planCanonicalLibraryHandleNew/
+// HandleOpen further below) -- there is no second, separate recovery
+// protocol; every locked path still mounts the exact same pre-existing
+// recovery UI/status-check/Retry-Check/Abandon flow via the unmodified
+// planCanonicalEditorBoot / planCanonicalEditorRunBootRecoveryCheck /
+// planCanonicalEditorApplyBootRecoveryOutcome machinery, and never touches
+// or clears the marker itself (only that machinery's own resolution
+// branches do).
+//
+// Returns { locked: true, editorState } once a valid marker is found (or
+// one is already being checked -- see below), having already, synchronously,
+// mounted the locked recovery screen; or { locked: false } when it is safe
+// for the caller to proceed with an ordinary New/Open/library boot.
+//
+// Duplicate-check prevention (requirement: "two rapid actions cannot start
+// duplicate recovery checks"): if a recovery check is ALREADY running
+// (planCanonicalEditorState.recoveryChecking, set synchronously by an
+// earlier call to this exact function, strictly before its own async status
+// check ever settles), this returns that ALREADY-locked state immediately
+// without re-reading localStorage or starting a second status check. This
+// is sufficient, not merely best-effort: browser click handlers (and this
+// function's own synchronous body) each run to completion before the next
+// begins, so the first call's synchronous lock is always already visible to
+// a second call for the same or a different action, however "simultaneous"
+// the two triggering clicks were. A malformed or wrong-owner marker still
+// returns null from the unmodified planCanonicalEditorReadValidRecoveryMarker
+// check below, so this falls through to { locked: false } exactly as
+// before this correction for those cases.
+function planCanonicalLibraryCheckAndLockOnPendingRecovery(libraryCtx) {
+  if (planCanonicalEditorState && planCanonicalEditorState.recoveryChecking) {
+    return { locked: true, editorState: planCanonicalEditorState };
+  }
+  var pendingMarker = planCanonicalEditorReadValidRecoveryMarker(libraryCtx.ownerUid);
+  if (!pendingMarker) return { locked: false };
+  var editorCtxForRecovery = libraryCtx.buildEditorCtx();
+  // Carries the library ctx along so that, if this recovery check resolves
+  // as confirmed-absent, the library can be reopened with the SAME injected
+  // ctx (production or test) rather than silently reverting to a fresh
+  // production ctx build -- identical to planOpenCanonicalLibraryFromPlanNavigation's
+  // own pre-existing behavior.
+  editorCtxForRecovery.__planCanonicalReturnToLibraryOnConfirmedAbsent = libraryCtx;
+  if (typeof document !== 'undefined') {
+    var recoveryPage = planContainer();
+    if (recoveryPage) {
+      recoveryPage.innerHTML = '';
+      var recoveryRoot = document.createElement('div');
+      recoveryRoot.id = PLAN_CANONICAL_EDITOR_CONTAINER_ID;
+      recoveryPage.appendChild(recoveryRoot);
+    }
+  }
+  // The editor's own existing, unmodified rendering already covers every
+  // state this needs while locked: the "checking previous save..." message,
+  // and (for a retryable/unrecognized result) the established Retry Check /
+  // Abandon controls -- there is no New/Open control anywhere on this
+  // screen, so neither is reachable while locked.
+  var lockedState = planCanonicalEditorBoot(editorCtxForRecovery);
+  return { locked: true, editorState: lockedState };
+}
+
+// ---- planOpenCanonicalLibraryFromPlanNavigation() ----
+// The new normal-PLAN-navigation entry point (Phase A requirement 2):
+// app-core.js's page-programs branch now calls this instead of calling
+// planOpenCanonicalEditorFromPlanNavigation() directly (that function stays
+// defined, untouched, for the diagnostic Reopen-by-Id path and any test
+// that still exercises it directly -- see the implementation report).
+// Re-entering PLAN while the library is already booted simply re-renders it
+// (mirroring planOpenCanonicalEditorFromPlanNavigation's own "revisiting
+// preserves state" behavior) rather than discarding its current page/items
+// and re-fetching every time.
+function planOpenCanonicalLibraryFromPlanNavigation(ctxOverride) {
+  if (planCanonicalEditorState) {
+    // An editor session (new or reopened) is already open -- normal PLAN
+    // navigation while mid-edit re-enters that editor exactly as it did
+    // before this correction, not the library, so in-progress editing (and
+    // any unresolved save/recovery state) is never silently abandoned by a
+    // plain nav click. "Back to Programs" is the explicit, safety-checked
+    // way back to the library (see planCanonicalEditorHandleBackToPrograms).
+    planCanonicalLibraryMountEditorContainer();
+    planCanonicalEditorRender();
+    return planCanonicalEditorState;
+  }
+
+  // Phase A correction (finding 2): normal PLAN navigation must not offer
+  // New/Open (i.e. must not open the library at all) while an
+  // owner-matched, well-formed recovery marker from an earlier unresolved
+  // save is still pending -- otherwise New/Open could silently bypass, and
+  // a later Save could silently overwrite, the one thing standing between
+  // the app and losing track of that earlier uncertain write. This reuses
+  // the exact, already-accepted recovery-marker check
+  // (planCanonicalEditorReadValidRecoveryMarker) and boot-time
+  // recovery-check machinery (planCanonicalEditorBoot /
+  // planCanonicalEditorRunBootRecoveryCheck /
+  // planCanonicalEditorApplyBootRecoveryOutcome) the editor has always
+  // had -- nothing here reimplements or duplicates that logic, and a
+  // malformed/wrong-owner marker still returns null from that same,
+  // unmodified check (falling through to an ordinary library boot exactly
+  // as before this correction).
+  var libraryCtx = (ctxOverride && typeof ctxOverride === 'object') ? ctxOverride : planCanonicalLibraryBuildProductionCtx();
+  // Phase A correction (final round, Finding 4): this check is now the
+  // shared planCanonicalLibraryCheckAndLockOnPendingRecovery helper (see
+  // its own comment above) -- the SAME route planCanonicalLibraryHandleNew/
+  // HandleOpen below also call immediately before proceeding, closing the
+  // multi-tab race where a marker appears after a library is already
+  // mounted. Behavior here is byte-for-byte unchanged from before this
+  // correction.
+  var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(libraryCtx);
+  if (recoveryCheck.locked) return recoveryCheck.editorState;
+
+  if (typeof document !== 'undefined') {
+    var page = planContainer();
+    if (page) {
+      page.innerHTML = '';
+      var mountedRoot = document.createElement('div');
+      mountedRoot.id = PLAN_CANONICAL_LIBRARY_CONTAINER_ID;
+      page.appendChild(mountedRoot);
+    }
+  }
+  if (!planCanonicalLibraryState) return planCanonicalLibraryBoot(libraryCtx);
+  planCanonicalLibraryRender();
+  return planCanonicalLibraryState;
 }
 
 // -----------------------------------------------------------------------------
@@ -11066,6 +13776,66 @@ if (typeof module !== 'undefined' && module.exports) {
     planCanonicalEditorHandleMoveSet: planCanonicalEditorHandleMoveSet,
     planCanonicalEditorValidateBeforeSave: planCanonicalEditorValidateBeforeSave,
     planCanonicalEditorExerciseOptions: planCanonicalEditorExerciseOptions,
-    planCanonicalEditorIdxAttrs: planCanonicalEditorIdxAttrs
+    planCanonicalEditorIdxAttrs: planCanonicalEditorIdxAttrs,
+    // Phase A requirement 3: save-progress/safe-to-leave behavior
+    planCanonicalEditorIsSafeToLeave: planCanonicalEditorIsSafeToLeave,
+    planCanonicalEditorSyncBeforeUnloadGuard: planCanonicalEditorSyncBeforeUnloadGuard,
+    planCanonicalEditorBeforeUnloadHandler: planCanonicalEditorBeforeUnloadHandler,
+    planCanonicalEditorHandleBackToPrograms: planCanonicalEditorHandleBackToPrograms,
+    // Phase A requirement 4: development-only save-performance instrumentation
+    planCanonicalPerfNow: planCanonicalPerfNow,
+    planCanonicalEditorComputeGraphSize: planCanonicalEditorComputeGraphSize,
+    // Phase A correction, finding 4: pure planned-read/manifest-chunk/
+    // candidate-write count helpers.
+    planCanonicalComputePlannedReadCount: planCanonicalComputePlannedReadCount,
+    planCanonicalComputeManifestChunkCount: planCanonicalComputeManifestChunkCount,
+    planCanonicalComputeCandidateWriteCount: planCanonicalComputeCandidateWriteCount,
+    // Phase A requirement 2: canonical Program library
+    PLAN_CANONICAL_LIBRARY_CONTAINER_ID: PLAN_CANONICAL_LIBRARY_CONTAINER_ID,
+    planCanonicalLibraryGetState: planCanonicalLibraryGetState,
+    planCanonicalLibraryBuildProductionCtx: planCanonicalLibraryBuildProductionCtx,
+    planCanonicalLibraryBoot: planCanonicalLibraryBoot,
+    planCanonicalLibraryRunFetch: planCanonicalLibraryRunFetch,
+    planCanonicalLibraryHandleRetry: planCanonicalLibraryHandleRetry,
+    planCanonicalLibraryHandleLoadMore: planCanonicalLibraryHandleLoadMore,
+    planCanonicalLibraryMountEditorContainer: planCanonicalLibraryMountEditorContainer,
+    planCanonicalLibraryHandleNew: planCanonicalLibraryHandleNew,
+    planCanonicalLibraryHandleOpen: planCanonicalLibraryHandleOpen,
+    planCanonicalLibraryOutcomeLabel: planCanonicalLibraryOutcomeLabel,
+    planCanonicalLibraryRender: planCanonicalLibraryRender,
+    planOpenCanonicalLibraryFromPlanNavigation: planOpenCanonicalLibraryFromPlanNavigation,
+    // Phase A: extracted fresh-state builder (used by Boot, and now by the
+    // library's New/Open flows)
+    planCanonicalEditorBuildFreshState: planCanonicalEditorBuildFreshState,
+    // Phase A correction, finding 3: canonical-ownership predicate, used by
+    // app-core.js's legacy programs-collection snapshot listener.
+    planCanonicalOwnsPageProgramsView: planCanonicalOwnsPageProgramsView,
+    // Phase B (Round 10 implementation) -- Duplicate Microcycle / shared
+    // duplication-lineage preparation helper
+    planPrepareDuplicationLineageForCommit: planPrepareDuplicationLineageForCommit,
+    planCanonicalEditorEnsureSourceIdentities: planCanonicalEditorEnsureSourceIdentities,
+    planCanonicalEditorResolvePersistedSource: planCanonicalEditorResolvePersistedSource,
+    planCanonicalEditorHandleDuplicateMicrocycle: planCanonicalEditorHandleDuplicateMicrocycle,
+    planCanonicalEditorCollectLiveIds: planCanonicalEditorCollectLiveIds,
+    planCanonicalEditorPruneDuplicationLineage: planCanonicalEditorPruneDuplicationLineage,
+    planCanonicalEditorPreviewDuplicationSave: planCanonicalEditorPreviewDuplicationSave,
+    // Phase B partial-implementation correction (Finding 1) -- rendered
+    // Duplicate Microcycle confirm/cancel wrapper
+    planCanonicalEditorHandleRequestDuplicateMicrocycle: planCanonicalEditorHandleRequestDuplicateMicrocycle,
+    planCanonicalEditorHandleConfirmDuplicateMicrocycle: planCanonicalEditorHandleConfirmDuplicateMicrocycle,
+    planCanonicalEditorHandleCancelDuplicateMicrocycle: planCanonicalEditorHandleCancelDuplicateMicrocycle,
+    // Phase B multi-screen editor -- navigation controller
+    planCanonicalEditorFreshNavState: planCanonicalEditorFreshNavState,
+    planCanonicalEditorResolveNavLocation: planCanonicalEditorResolveNavLocation,
+    planCanonicalEditorNavOpenMicrocycle: planCanonicalEditorNavOpenMicrocycle,
+    planCanonicalEditorNavBackToProgram: planCanonicalEditorNavBackToProgram,
+    planCanonicalEditorNavOpenSession: planCanonicalEditorNavOpenSession,
+    planCanonicalEditorNavBackToMicrocycle: planCanonicalEditorNavBackToMicrocycle,
+    planCanonicalEditorNavOpenExercise: planCanonicalEditorNavOpenExercise,
+    planCanonicalEditorNavBackToSession: planCanonicalEditorNavBackToSession,
+    planCanonicalEditorNavOpenSet: planCanonicalEditorNavOpenSet,
+    planCanonicalEditorNavOpenProgression: planCanonicalEditorNavOpenProgression,
+    planCanonicalEditorNavBackToExercise: planCanonicalEditorNavBackToExercise,
+    planCanonicalGetExerciseName: planCanonicalGetExerciseName
   };
 }
