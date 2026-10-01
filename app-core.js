@@ -190,6 +190,50 @@ auth.onAuthStateChanged(async user => {
   if (typeof planResetCanonicalUserScopedState === 'function') {
     planResetCanonicalUserScopedState();
   }
+  // SLICE 1 CORRECTION (independent-review, account-change gap): the
+  // canonical Program-Run UI (app-plan-run-ui.js) is user-scoped too, but
+  // its own renderHome()-driven reset only ran once THIS async callback
+  // eventually reached its own renderHome() call below -- well after #app
+  // is made visible a few lines down, and (on sign-in) well after this
+  // callback's own asynchronous init has started. In that window the
+  // PREVIOUS owner's Run list or Session preview could still be sitting in
+  // the DOM underneath the now-visible #app. Reset it here, synchronously,
+  // before anything else in this transition proceeds -- this is now the
+  // PRIMARY auth boundary for that UI (see planRunUiResetForOwner's own
+  // header comment); the later renderHome() reset is kept only as a
+  // defensive backstop.
+  if (typeof planRunUiResetForOwner === 'function') {
+    planRunUiResetForOwner(user ? user.uid : null);
+  }
+  // SLICE 3 CORRECTION (independent-review, auth-boundary gap): the Start
+  // screen (app-plan-run-start-ui.js) holds owner-scoped Program details
+  // and progression suggestions in its own in-memory state, but nothing
+  // previously reset it on this same transition. Reuses the exact same
+  // function that screen's own Cancel/Back control already calls
+  // (planRunStartClose()) -- it already does exactly what this boundary
+  // needs (invalidate every outstanding read/Start/status response by
+  // bumping its epoch and nulling its state, and clear its own rendered
+  // DOM synchronously, before the app can display another owner's
+  // content), so no new function was added for this.
+  if (typeof planRunStartClose === 'function') {
+    planRunStartClose();
+  }
+  // LOGGER-FINISH SLICE ADDITION -- the same auth boundary, for
+  // app-plan-run-logger-ui.js's own pending/uncertain Finish-attempt
+  // tracking. Deliberately does NOT touch `currentWorkout` itself -- see
+  // planRunLoggerFinishResetForAuthChange's own header for why.
+  if (typeof planRunLoggerFinishResetForAuthChange === 'function') {
+    planRunLoggerFinishResetForAuthChange();
+  }
+  // END RUN SLICE ADDITION -- the same auth boundary, for
+  // app-plan-run-end-ui.js's own per-Run End-attempt tracking. An End
+  // attempt has no local, editable content to preserve across an owner
+  // change (unlike a Finish attempt's own currentWorkout) -- there is
+  // nothing to lose here, only stale tracking to discard so a later
+  // response for the previous owner can never be applied to the next one.
+  if (typeof planRunEndResetForAuthChange === 'function') {
+    planRunEndResetForAuthChange();
+  }
   appReady = false;
   resetImportedSetsState();
   // Reset preference defaults on every transition too, before the next user's
@@ -444,6 +488,38 @@ function showPage(id) {
     collActiveId = null;
     collReturnTo = null;
   }
+  // SLICE 3 CORRECTION (independent-review, navigation-boundary gap):
+  // ordinary navigation away from the Start flow (any real destination
+  // other than page-run-start itself) must invalidate its own pending
+  // reads/Start/status responses and clear its screen state -- otherwise a
+  // late response (e.g. a slow fsPlanRunStart that finally resolves
+  // 'committed' after the person has already navigated to PLAN/Library)
+  // could redirect them back to TRAIN or render a success message on a
+  // screen they already left. planRunStartClose() is idempotent (a no-op
+  // when no Start attempt is open), so this call is always safe here,
+  // including during the flow's OWN successful Start -> TRAIN handoff --
+  // planRunStartApplyStartOutcome/planRunStartGoToActiveRun already call
+  // planRunStartClose() themselves before ever navigating here, so by the
+  // time that same navigation reaches this line there is nothing left to
+  // close. This line runs only once actual navigation is committed (after
+  // the Library-dirty-draft confirmation gate above, which can otherwise
+  // return without navigating at all), so declining that confirmation
+  // never closes a Start screen the person never actually left.
+  if (id !== 'page-run-start' && typeof planRunStartClose === 'function') planRunStartClose();
+  // LIFECYCLE-SAFETY CORRECTION (logger-finish slice, issue 2) -- the prior
+  // planRunLoggerFinishInvalidateForNav() call here bumped an epoch that
+  // planRunLoggerFinishApplyOutcome/the uncertain path never actually
+  // consulted, so it did nothing real. Navigating away from #page-log no
+  // longer needs any call here at all: a pending/uncertain Finish attempt's
+  // own currency is now checked directly, at the moment its response
+  // arrives, against the CURRENT currentWorkout/owner/operationId
+  // (app-plan-run-logger-ui.js's planRunLoggerFinishResultStillCurrent) --
+  // not against whether #page-log happened to be visible back when the
+  // attempt was started. Whether #page-log is visible RIGHT NOW (checked
+  // live, at resolution time, by planRunLoggerFinishIsPageVisible) governs
+  // only whether a resulting success shows its toast/redirect on this
+  // navigation, never whether the underlying save is applied. See that
+  // file's own header for the full design.
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.getElementById(id).classList.add('active');
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.toggle('active', b.dataset.page === id));
@@ -452,6 +528,14 @@ function showPage(id) {
   if (id === 'page-home')     renderHome();
   if (id === 'page-history')  loadHistoryThenRender(renderHistory);
   if (id === 'page-db')       renderLibraryRoute();
+  // LOGGER-FINISH SLICE ADDITION -- re-renders any surviving canonical
+  // Finish status (pending/uncertain/conflict/...) whenever #page-log
+  // becomes the active page, covering every entry path uniformly (a fresh
+  // planRunLoggerLaunch, goToActiveWorkout() resuming an in-progress
+  // canonical Session, or any other existing navigation into page-log). A
+  // null/absent Finish state (the ordinary case) renders nothing, so this
+  // is a no-op for every non-Program-Run workout.
+  if (id === 'page-log' && typeof planRunLoggerFinishRender === 'function') planRunLoggerFinishRender();
   // Canonical PLAN adoption: the regular PLAN destination now owns the
   // canonical editor. Legacy Program records remain untouched in Firestore,
   // but the primary navigation no longer routes into their editor/library.
@@ -483,6 +567,12 @@ function getActivePrograms() {
 
 function renderHome() {
   renderHomeCarousel();
+  // SLICE 1 ADDITION -- additive canonical Program Run section. Guarded by
+  // typeof so this call is a harmless no-op if app-plan-run-ui.js is ever
+  // absent from a page load; the function itself checks the (disabled)
+  // capability flag and renders nothing when it is off, which is its real
+  // state today -- this line changes nothing a real user sees.
+  if (typeof planRunUiRenderHomeSection === 'function') planRunUiRenderHomeSection();
   const sorted = [...appDb.workouts].slice(0, 3);
   document.getElementById('home-recent').innerHTML = sorted.length
     ? sorted.map(w => workoutHistoryCard(w, true)).join('')
@@ -2028,7 +2118,24 @@ function checkSetPR(exIdx, setIdx) {
   const s = currentWorkout.exercises[exIdx].sets[setIdx];
   if (s.weight && s.reps) { s.isNew1RM = calc1RM(+s.weight, +s.reps) > getBest1RM(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id); s.isPR = +s.weight > getBestWeight(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id); }
 }
+// LOGGER-FINISH SLICE ADDITION (all three functions below): a Run-linked
+// Session's own persisted canonical shape requires EVERY Set to resolve to
+// a real, already-verified prescribed planSetId (plan-run-model.js's
+// planRunWorkoutContextMatchesOccurrence, not reopened by this slice) --
+// an ad-hoc added Set has no such identity, and this already-accepted,
+// already-reviewed model has no mechanism to invent or waive one. Rather
+// than either fabricate an id (a lie about what was actually prescribed)
+// or silently drop the Set at Finish time (a silent, undisclosed data
+// loss), a Run-linked Session declines the action outright, honestly, at
+// the moment it's attempted -- logging exactly its prescribed Sets,
+// matching what the read-only preview already showed before Finish
+// existed. This is a direct, disclosed consequence of the addendum's own
+// decision 1 ("preserve every required... Set identity"), not a new
+// design decision, and does not change this function's own behavior for
+// any ordinary (non-Program-Run) workout.
+function planRunLoggerIsCanonicalRunSession() { return !!(currentWorkout && currentWorkout.canonicalRun); }
 function addSet(idx) {
+  if (planRunLoggerIsCanonicalRunSession()) { showToast('This Program Run Session logs exactly its prescribed sets.', 'error'); return; }
   const sets = currentWorkout.exercises[idx].sets; const last = sets.length > 0 ? sets[sets.length-1] : null;
   sets.push({ weight: last ? last.weight : '', reps: '', time: '', rpe: '', completed: false });
   const container = document.getElementById(`sets-container-${idx}`); const exData = getExercise(currentWorkout.exercises[idx].exerciseId);
@@ -2036,6 +2143,7 @@ function addSet(idx) {
   if (container) { container.innerHTML = buildSetsHTML(currentWorkout.exercises[idx], idx, isTime, currentWorkout.rpeEnabled); currentWorkout.exercises[idx].sets.forEach((s, si) => attachSwipeToSet(idx, si)); } else renderWorkoutExercises();
 }
 function removeSet(exIdx, si) {
+  if (planRunLoggerIsCanonicalRunSession()) { showToast('This Program Run Session logs exactly its prescribed sets.', 'error'); return; }
   currentWorkout.exercises[exIdx].sets.splice(si, 1);
   const container = document.getElementById(`sets-container-${exIdx}`); const exData = getExercise(currentWorkout.exercises[exIdx].exerciseId);
   const isTime = exData && (exData.tracking === 'time' || exData.tracking === 'weight_time');
@@ -2045,6 +2153,7 @@ function removeSet(exIdx, si) {
 // ==================== PR SET ====================
 function addPRSet(idx) {
   if (!currentWorkout) return;
+  if (planRunLoggerIsCanonicalRunSession()) { showToast('This Program Run Session logs exactly its prescribed sets.', 'error'); return; }
   const ex = currentWorkout.exercises[idx]; const exData = getExercise(ex.exerciseId); if (!exData) return;
   const isTime = exData.tracking === 'time' || exData.tracking === 'weight_time'; const isBW = exData.tracking === 'bodyweight_reps';
   const inc = appDb.unit === 'kg' ? 1.25 : 2.5;
@@ -2099,6 +2208,18 @@ function finishWorkout() {
     stopWorkoutTimer(); currentWorkout = null; showToast('Workout updated!', 'success'); showPage('page-home'); return;
   }
   currentWorkout.duration = getElapsedSeconds();
+  // LOGGER-FINISH SLICE ADDITION -- a Run-linked Session (currentWorkout.
+  // canonicalRun, stamped only by app-plan-run-logger-ui.js's
+  // planRunLoggerLaunch) is finished through the real fsPlanRunFinish
+  // transaction, never through this function's own legacy tail below. This
+  // branch is additive and returns immediately -- it never falls through to
+  // the programId/activeProgramId branches or the unconditional
+  // appDb.workouts.unshift(...)/fsSaveWorkout(...) tail that follows them,
+  // per the program-run-logger-finish-slice-addendum.md decision 2. See
+  // app-plan-run-logger-ui.js's own header for the full Finish design
+  // (honest pending/uncertain/conflict/notEligible/budgetExceeded states,
+  // Retry/Check Status, duplicate-submission prevention).
+  if (currentWorkout.canonicalRun) { finishCanonicalRunWorkout(); return; }
   let reviewActive = null, reviewPending = null;
   if (currentWorkout.programId) {
     const prog = appDb.programs.find(p => p.id === currentWorkout.programId);
@@ -2155,7 +2276,23 @@ function finishWorkout() {
     showToast('Workout saved!','success'); showPage('page-home');
   }
 }
-function cancelWorkout() { confirm2('Cancel Workout','Discard this workout? All data will be lost.', () => { stopWorkoutTimer(); currentWorkout = null; showPage('page-home'); }, 'Discard'); }
+// LOGGER-FINISH SLICE ADDITION -- a canonical Run Session with a real
+// in-flight or uncertain Finish attempt (planRunLoggerFinishState) must
+// never be discarded mid-attempt: the transaction may already have
+// committed server-side even though this screen doesn't yet know it, and
+// discarding currentWorkout here would strand the person with no way to
+// Retry/Check Status/Abandon that specific attempt. Declines honestly
+// instead of guessing; a definitively rejected/dismissable state (conflict/
+// notEligible/budgetExceeded/error/competing) does not block Cancel, since
+// nothing from that attempt is or ever will be persisted.
+function planRunLoggerFinishBlocksCancel() {
+  return !!(currentWorkout && currentWorkout.canonicalRun && planRunLoggerFinishState &&
+    (planRunLoggerFinishState.phase === 'pending' || planRunLoggerFinishState.phase === 'uncertain'));
+}
+function cancelWorkout() {
+  if (planRunLoggerFinishBlocksCancel()) { showToast('Resolve the current Finish attempt (Retry, Check Status, or Abandon) before canceling.', 'error'); return; }
+  confirm2('Cancel Workout','Discard this workout? All data will be lost.', () => { stopWorkoutTimer(); currentWorkout = null; showPage('page-home'); }, 'Discard');
+}
 
 // ==================== PROGRESSION V1 — SUGGESTIONS REVIEW (Build 3) ====================
 // Consumes the read-only evaluation results from Build 2 and lets the user Apply,
@@ -2799,7 +2936,17 @@ function buildRecentExpandedHtml(wid) {
     }).join('');
     return `<div class="recent-ex-block"><div class="recent-ex-name-row"><span class="recent-ex-num">${ei+1}</span><span class="recent-ex-name">${name}</span>${videoIcon}</div><div class="recent-ex-sets">${setsHtml}</div></div>`;
   }).join('');
-  return `<div class="recent-expanded-inner"><div class="recent-ex-list">${exercisesHtml}</div><div class="recent-expanded-actions"><button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="editHistoricalWorkout('${wid}');event.stopPropagation()">Edit</button><button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="openCopyModal('${wid}');event.stopPropagation()">Export</button></div></div>`;
+  // FOUNDATION SLICE ADDITION (spec §3A.9) -- a canonical (Program Run)
+  // workout OMITS the Edit control entirely (never merely disables it) and
+  // substitutes non-interactive explanatory text in its place. Export
+  // remains unrestricted (read-only -- no write path, so no immutability
+  // concern). Legacy/imported workouts (no recordKind at all) are
+  // unaffected and keep both controls exactly as before.
+  const isCanonical = w.recordKind === 'canonicalWorkout';
+  const editOrNotice = isCanonical
+    ? `<span style="flex:1;text-align:center;font-size:12px;color:var(--text3);align-self:center">Completed via Program Run — not editable here</span>`
+    : `<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="editHistoricalWorkout('${wid}');event.stopPropagation()">Edit</button>`;
+  return `<div class="recent-expanded-inner"><div class="recent-ex-list">${exercisesHtml}</div><div class="recent-expanded-actions">${editOrNotice}<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="openCopyModal('${wid}');event.stopPropagation()">Export</button></div></div>`;
 }
 function openExpandedVideosModal(wid, exIdx) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return;
@@ -2810,14 +2957,35 @@ function openExpandedVideosModal(wid, exIdx) {
   document.getElementById('ex-videos-modal-body').innerHTML = refHtml + perfHtml || '<div style="color:var(--text3);font-size:14px">No videos found.</div>';
   openModal('modal-ex-videos');
 }
+// FOUNDATION SLICE ADDITION (canonical-program-run-ui-logger-integration-
+// specification-round8.md §3A.9, unchanged since Round 5) -- a workout
+// carrying `recordKind === 'canonicalWorkout'` (either completionState,
+// sessionCompleted or historyOnly -- deliberately not distinguished, since
+// neither can be safely routed through this generic legacy code, which has
+// no awareness of the canonical shape) must never be edited or deleted
+// through the ordinary History path. This guard is a zero-write
+// short-circuit at the top of both functions -- effective regardless of
+// invocation path (a stale DOM element, a direct console call, or any
+// future UI addition that might otherwise become a silent bypass), and
+// independent of the History-rendering omission below (buildRecentExpandedHtml),
+// which only prevents a NEW Edit control from being shown in the first
+// place. Both layers matter: legacy `finishWorkout()`'s own `_isEdit`
+// branch and `fsDelWorkout` are fire-and-forget (rejections never surface
+// to the user), so UI-layer blocking alone would leave a misleading
+// false-success possibility open if either guard were skipped.
 function editHistoricalWorkout(wid) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return;
+  if (w.recordKind === 'canonicalWorkout') { showToast('This session was completed through a Program Run and cannot be edited here.', 'error'); return; }
   currentWorkout = JSON.parse(JSON.stringify(w)); currentWorkout._isEdit = true;
   const nameDisplay = document.getElementById('log-session-name-display'); if (nameDisplay) nameDisplay.textContent = (w.name || 'WORKOUT').toUpperCase();
   const timerEl = document.getElementById('log-timer-display'); if (timerEl) { timerEl.textContent = w.duration ? fmtDuration(w.duration) : '0:00'; timerEl.style.opacity = '0.5'; timerEl.style.pointerEvents = 'none'; }
   document.getElementById('active-bar').classList.remove('visible'); renderWorkoutExercises(); showPage('page-log');
 }
-function deleteWorkout(id) { confirm2('Delete Workout','Permanently delete this workout log?', () => { appDb.workouts = appDb.workouts.filter(w=>w.id!==id); fsDelWorkout(id); renderHistory(); showToast('Workout deleted'); }); }
+function deleteWorkout(id) {
+  const w = appDb.workouts.find(x => x.id === id);
+  if (w && w.recordKind === 'canonicalWorkout') { showToast('This session was completed through a Program Run and cannot be deleted here.', 'error'); return; }
+  confirm2('Delete Workout','Permanently delete this workout log?', () => { appDb.workouts = appDb.workouts.filter(w=>w.id!==id); fsDelWorkout(id); renderHistory(); showToast('Workout deleted'); });
+}
 
 // ==================== ADD EXERCISE TO WORKOUT ====================
 function addExToWorkout(exId) { if (!currentWorkout) return; currentWorkout.exercises.push({ exerciseId: exId, sets: [{ weight:'', reps:'', time:'', rpe:'', completed:false }], perfVideos:[] }); renderWorkoutExercises(); }

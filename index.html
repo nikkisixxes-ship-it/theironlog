@@ -101,6 +101,15 @@
         <div id="home-carousel-dots" style="display:none"></div>
       </div>
 
+      <!-- SLICE 1 ADDITION -- canonical Program Run section. Empty container,
+           additive: filled only by app-plan-run-ui.js's own capability-gated
+           renderer (planRunUiRenderHomeSection), which leaves this empty and
+           issues zero Run I/O whenever the canonical Run capability is
+           disabled (its real, hardcoded-false state today) -- identical
+           pattern to page-db/page-programs below, which are also filled
+           entirely by their own script. -->
+      <div id="planrun-home-section"></div>
+
       <!-- START BLANK WORKOUT -->
       <div style="padding:10px 16px 4px">
         <button class="btn-blank-workout" onclick="startNewWorkout()">START BLANK WORKOUT</button>
@@ -135,8 +144,14 @@
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             Add Exercise
           </button>
-          <button class="btn log-actions btn-finish" onclick="finishWorkout()">Finish Workout</button>
+          <button class="btn log-actions btn-finish" id="log-finish-btn" onclick="finishWorkout()">Finish Workout</button>
         </div>
+        <!-- LOGGER-FINISH SLICE ADDITION -- honest pending/uncertain/
+             conflict/notEligible/budgetExceeded/error status for a
+             canonical Program Run Finish (app-plan-run-logger-ui.js's
+             planRunLoggerFinishRender()). Empty and untouched for an
+             ordinary (non-Program-Run) workout. -->
+        <div id="plan-run-finish-status"></div>
       </div>
     </div>
 
@@ -155,6 +170,37 @@
 
     <!-- PLAN PAGE — content injected by renderPlanLibrary() / app-plan.js -->
     <div class="page" id="page-programs"></div>
+
+    <!-- SLICE 1+2 (read-only descriptive content) PLUS LOGGER-FINISH SLICE
+         (this round, the "Open Logger" control) -- canonical Run Session
+         preview. Its descriptive per-Set content (planFormatSetSummary,
+         no numeric auto-fill) is unchanged from Slice 1. The one write-
+         capable control this screen now offers is "Open Logger"
+         (app-plan-run-logger-ui.js's planRunLoggerLaunch), reached only for
+         an occurrence already confirmed inProgress by app-plan-run-ui.js's
+         own planRunUiStartSession -- it opens the real, interactive
+         #page-log screen (never writes anything itself); the only
+         subsequent write is the person's own later, explicit Finish, which
+         calls the real fsPlanRunFinish transaction, never legacy
+         finishWorkout()'s own fsSaveWorkout() tail (see app-core.js's own
+         diff -- currentWorkout.canonicalRun is an early, additive branch
+         that returns before that legacy tail is ever reached). Content
+         otherwise still injected by app-plan-run-ui.js's
+         planRunUiRenderSessionPreviewContent(); no Save or Start control of
+         any kind lives on this page. -->
+    <div class="page" id="page-run-session-preview"></div>
+
+    <!-- START-FLOW SLICE ADDITION -- the deferred canonical Program Run
+         "Start" flow. Content injected entirely by
+         app-plan-run-start-ui.js's planRunStartRender(); this page has no
+         static markup of its own, matching page-run-session-preview's own
+         convention above. Reached only from the PLAN library's own new
+         "Start on Train" button (planCanonicalLibraryRender, app-plan.js),
+         which calls planRunStartOpen(templateId). CANONICAL_PLAN_RUN_
+         CAPABILITY_ENABLED remains hardcoded false, so this page renders
+         only the "Starting a Program is currently disabled." message until
+         that capability is explicitly activated in a future round. -->
+    <div class="page" id="page-run-start"></div>
 
   </div><!-- /#main -->
 
@@ -554,6 +600,29 @@
 <script src="app-collections.js"></script>
 <script src="app-plan.js"></script>
 <script src="firebase-plan-progression.js"></script>
+<!-- SLICE 1 ADDITION -- canonical Program-Run persistence + UI. Neither
+     file was referenced by this document before this slice; both are
+     submitted for independent review only (see each file's own header) --
+     CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is hardcoded false in
+     firebase-plan-run.js, so loading these two scripts changes nothing a
+     real user sees until that capability is separately, explicitly
+     activated. -->
+<script src="plan-run-model.js"></script>
+<script src="firebase-plan-run.js"></script>
+<script src="app-plan-run-ui.js"></script>
+<script src="app-plan-run-start-ui.js"></script>
+<!-- LOGGER-FINISH SLICE ADDITION -- Run-aware real logger launch + Finish
+     (see this file's own header). Same capability gate as the three
+     scripts above; loading it changes nothing a real user sees until
+     CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is separately, explicitly
+     activated. -->
+<script src="app-plan-run-logger-ui.js"></script>
+<!-- END RUN SLICE ADDITION -- the End Run control on the active-Run card
+     (see this file's own header). Same capability gate as the scripts
+     above; loading it changes nothing a real user sees until
+     CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is separately, explicitly
+     activated. -->
+<script src="app-plan-run-end-ui.js"></script>
 <script src="app-core.js"></script>
 </body>
 </html>
