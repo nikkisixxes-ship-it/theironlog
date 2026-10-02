@@ -12925,18 +12925,17 @@ function planCanonicalLibraryRender() {
       if (item.structureLabel) detailBits.push(escapeHtml(item.structureLabel));
       if (typeof item.assignmentCount === 'number') detailBits.push(item.assignmentCount + ' assignment' + (item.assignmentCount === 1 ? '' : 's'));
       var safeTemplateId = escapeHtml(item.templateId).replace(/'/g, "\\'");
+      // Program Run is a separately gated capability. Keep its write entry
+      // point completely absent while disabled; the handler retains its own
+      // gate as defense in depth for stale controls or direct calls.
+      var startOnTrainHtml = (typeof planRunStartCapabilityEnabled === 'function' && planRunStartCapabilityEnabled())
+        ? '<button type="button" class="btn btn-sm" data-testid="library-start-btn" data-template-id="' + escapeHtml(item.templateId) + '" onclick="planRunStartOpen(\'' + safeTemplateId + '\')">Start on Train</button>'
+        : '';
       return '<div class="plan-canonical-library-card" data-testid="library-card" data-template-id="' + escapeHtml(item.templateId) + '" style="border:1px solid #ccc;border-radius:6px;padding:8px;margin:6px 0">' +
         '<div style="font-weight:600">' + escapeHtml(item.name || '(untitled Program)') + '</div>' +
         (detailBits.length ? '<div style="font-size:12px;color:#555">' + detailBits.join(' -- ') + '</div>' : '') +
         '<button type="button" class="btn btn-sm" data-testid="library-open-btn" data-template-id="' + escapeHtml(item.templateId) + '" ' + (opening ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleOpen(\'' + safeTemplateId + '\')">' + (opening ? 'Opening...' : 'Open / Edit') + '</button> ' +
-        // START-FLOW SLICE ADDITION -- rendered unconditionally on every
-        // card (deliberate simplification, see app-plan-run-start-ui.js's
-        // own header: this lightweight list item carries no Sessions count,
-        // so eligibility is determined at click-time by planRunStartOpen's
-        // own verified read, not pre-checked here). Wired the same safe,
-        // escaped-string-literal way as the existing Open/Edit button
-        // above -- never a raw, unescaped interpolation.
-        '<button type="button" class="btn btn-sm" data-testid="library-start-btn" data-template-id="' + escapeHtml(item.templateId) + '" onclick="planRunStartOpen(\'' + safeTemplateId + '\')">Start on Train</button>' +
+        startOnTrainHtml +
         '</div>';
     }).join('');
 
