@@ -37,7 +37,7 @@
   // default to disabled, with isolated test-only access absent from real
   // browser loads." This is the ONE such capability this slice introduces.
   // It is never switched true anywhere in this file, in any real code path.
-  var CANONICAL_PLAN_RUN_CAPABILITY_ENABLED = true;
+  var CANONICAL_PLAN_RUN_CAPABILITY_ENABLED = false;
 
   function M(name) {
     var f = root[name];
