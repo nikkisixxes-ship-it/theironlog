@@ -164,6 +164,9 @@ function planRunUiHandleHomeSectionClick(event) {
   // above already is.
   else if (action === 'end-run-cancel') { if (typeof planRunEndRequestCancel === 'function') planRunEndRequestCancel(btn.getAttribute('data-planrun-run-id')); }
   else if (action === 'end-run-abandon') { if (typeof planRunEndRequestAbandon === 'function') planRunEndRequestAbandon(btn.getAttribute('data-planrun-run-id')); }
+  // USABILITY CORRECTION ADDITION (independent-review finding, this round):
+  // the card's own secondary overflow menu (hosts "End Run" when idle).
+  else if (action === 'toggle-menu') { planRunUiToggleRunMenu(btn.getAttribute('data-planrun-run-id')); }
 }
 function planRunUiWireHomeSectionEvents(el) {
   if (!el || el.__planRunUiWired) return;
@@ -202,8 +205,12 @@ var planRunUiState = {
   nextCursor: null,
   loadingMore: false,
   loadMoreError: false,
-  expandedRunId: null,      // which run card's detail is currently open
-  detailByRunId: {}         // planRunId -> {phase, run, occurrence, epoch} | {phase:'error', epoch} etc.
+  expandedRunId: null,      // which run card's OPTIONAL extra detail is currently shown (see planRunUiRenderRunDetail)
+  detailByRunId: {},        // planRunId -> {phase, run, occurrence, epoch} | {phase:'error', epoch} etc.
+  // USABILITY CORRECTION ADDITION (independent-review finding, this round):
+  // which run card's secondary overflow menu (End Run, when idle) is open.
+  // Independent of expandedRunId -- the two controls no longer overlap.
+  menuOpenRunId: null
 };
 
 // ---- Stale-response guarding (independent-review Finding 3) ---------------
@@ -265,7 +272,7 @@ function planRunUiIsPreviewResponseCurrent(epoch, expectedUid) {
 // section`) -- callers that are not immediately followed by a render call
 // (i.e. `planRunUiResetForOwner` below) must clear that themselves.
 function planRunUiResetState() {
-  planRunUiState = { phase: 'idle', runs: [], hasMore: false, nextCursor: null, loadingMore: false, loadMoreError: false, expandedRunId: null, detailByRunId: {} };
+  planRunUiState = { phase: 'idle', runs: [], hasMore: false, nextCursor: null, loadingMore: false, loadMoreError: false, expandedRunId: null, detailByRunId: {}, menuOpenRunId: null };
   planRunUiListEpoch++;
   planRunUiPreviewEpoch++;
   planRunUiLastPreviewRunOccurrence = null;
@@ -379,6 +386,12 @@ function planRunUiApplyFirstPageResult(result) {
       loadingMore: false,
       loadMoreError: false
     });
+    // USABILITY CORRECTION (independent-review finding, this round): kick
+    // off each new Run's own detail read automatically, the instant the
+    // list itself resolves -- never waiting for a "View" click. See
+    // planRunUiEnsureRunDetailLoaded's own header for exactly why this is
+    // safe alongside the existing, unchanged toggle mechanism.
+    result.runs.forEach(function (r) { planRunUiEnsureRunDetailLoaded(r.planRunId); });
   } else if (result.outcome === 'integrityConflict') {
     // §3A.2.2: a distinct state, no Start/Resume/Choose-Session affordance
     // against anything on this section while it is showing.
@@ -432,6 +445,10 @@ function planRunUiFetchNextPage() {
     planRunUiState.nextCursor = result.hasMore ? result.nextCursor : null;
     planRunUiState.loadingMore = false;
     planRunUiState.loadMoreError = false;
+    // USABILITY CORRECTION (independent-review finding, this round): same
+    // eager detail load as the first page, applied to this newly-appended
+    // page's own Runs.
+    result.runs.forEach(function (r) { planRunUiEnsureRunDetailLoaded(r.planRunId); });
     planRunUiRenderSection();
   }).catch(function (err) {
     if (!planRunUiIsListResponseCurrent(epoch, expectedUid)) return;
@@ -456,7 +473,13 @@ function planRunUiRenderSection() {
   if (!planRunUiCapabilityEnabled()) { el.innerHTML = ''; return; }
 
   var html = '<div class="planrun-section" style="padding:0 16px 4px">';
-  html += '<div class="home-section-label" style="margin:6px 0 8px">Program Run (Preview)</div>';
+  // DUPLICATE-PRESENTATION USABILITY CORRECTION (Round 2, Approach 4) --
+  // label text only, changed from "Program Run (Preview)" to the
+  // user-facing wording approved in the Round 2 specification ("Started
+  // From Plan"), tying this section to the already user-facing "Plan" nav
+  // tab instead of internal engineering terms. No markup structure,
+  // handler, data fetch, or action in this section changes.
+  html += '<div class="home-section-label" style="margin:6px 0 8px">Started From Plan</div>';
 
   if (planRunUiState.phase === 'loading') {
     html += '<div class="planrun-loading" style="padding:14px;color:var(--text2)">Loading active Program Runs…</div>';
@@ -497,25 +520,120 @@ function planRunUiRenderSection() {
 function planRunUiRenderRunCard(run) {
   var detail = planRunUiState.detailByRunId[run.planRunId];
   var isOpen = planRunUiState.expandedRunId === run.planRunId;
+  var menuOpen = planRunUiState.menuOpenRunId === run.planRunId;
   var name = escapeHtml(run.nameSnapshot || run.planTemplateId || 'Program Run');
   var card = '<div class="planrun-card" style="border:1px solid var(--border,#ccc);border-radius:8px;padding:10px 12px;margin-bottom:8px">';
+
+  // END RUN SLICE ADDITION, kept as the SAME call with the SAME unmodified
+  // side effects (see app-plan-run-end-ui.js's own header -- that file is
+  // not touched by this round). USABILITY CORRECTION (independent-review
+  // finding, this round) -- only WHERE this returned markup is placed
+  // changes: the plain, steady-state "End Run" entry point (no attempt in
+  // flight, nothing blocking it) is no longer a prominent, always-visible
+  // top-row button sitting above the actual workout action -- it moves
+  // into this card's own secondary overflow area, opened via the "⋯"
+  // control below. Any OTHER state this returns (pending, competing
+  // elsewhere, blocked by an open Session, uncertain, or rejected) is a
+  // real recovery/safety state, not idle chrome, and stays exactly where
+  // it already rendered: inline and unmissable, never behind a menu. The
+  // distinction is made by checking this control's own public data-testid
+  // contract, never by reading app-plan-run-end-ui.js's internal state.
+  var endHtml = (typeof planRunEndRenderControl === 'function') ? planRunEndRenderControl(run) : '';
+  var endIsPlainIdleButton = endHtml.indexOf('data-testid="planrun-end-run-btn"') !== -1;
+
   card += '<div style="display:flex;justify-content:space-between;align-items:center">';
   card += '<div><div style="font-weight:600">' + name + '</div>'
     + '<div style="font-size:12px;color:var(--text2)">' + escapeHtml(run.status || '') + '</div></div>';
+  card += '<div>';
+  if (endIsPlainIdleButton) {
+    card += '<button class="btn-secondary" data-testid="planrun-overflow-btn" data-planrun-action="toggle-menu" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" title="Program Run options" aria-label="Program Run options">⋯</button> ';
+  }
   card += '<button class="btn-secondary" data-planrun-action="toggle-run" data-planrun-run-id="' + escapeHtml(run.planRunId) + '">' + (isOpen ? 'Hide' : 'View') + '</button>';
   card += '</div>';
-  // END RUN SLICE ADDITION -- always rendered when this card is (never
-  // gated behind expanding "View" detail, since ending is a Run-level
-  // decision, not tied to any one Session's own detail read -- per the
-  // accepted spec, canonical-program-run-ui-logger-integration-
-  // specification round1 §2.9). A different file's function (see this
-  // file's own header); returns '' outright for a non-active Run.
-  if (typeof planRunEndRenderControl === 'function') { card += planRunEndRenderControl(run); }
-  if (isOpen) {
-    card += planRunUiRenderRunDetail(run, detail);
+  card += '</div>';
+
+  // USABILITY CORRECTION (independent-review finding, this round): the
+  // next Session, its status, and the Start Session/Resume action are now
+  // always rendered -- never gated behind the "View" expansion click.
+  // planRunUiEnsureRunDetailLoaded already kicked off this Run's own
+  // detail read automatically when the list itself loaded (see the fetch
+  // handlers above), so `detail` is populated (or honestly still
+  // "Loading Session…") without the person ever having to click anything.
+  // "View"/"Hide" still exists, but now only ever gates genuinely OPTIONAL
+  // extra detail (see planRunUiRenderRunDetail's own isOpen parameter) --
+  // never the primary workout action.
+  card += planRunUiRenderRunDetail(run, detail, isOpen);
+
+  if (endIsPlainIdleButton) {
+    if (menuOpen) {
+      card += '<div class="planrun-card-menu" data-testid="planrun-overflow-menu" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border,#eee)">' + endHtml + '</div>';
+    }
+  } else if (endHtml) {
+    card += endHtml;
   }
   card += '</div>';
   return card;
+}
+
+// USABILITY CORRECTION ADDITION (independent-review finding, this round):
+// kicks off the identical real read (fsPlanRunReadForDisplay, 'display'
+// mode) planRunUiToggleRunDetail already performs on open -- but
+// automatically, once per Run, the instant that Run first has somewhere to
+// render into, and WITHOUT ever touching expandedRunId. Idempotent: a Run
+// that already has a cached-or-in-flight detail entry (by either this
+// function or the existing toggle) is never refetched merely because its
+// card re-rendered. Shares planRunUiDetailEpochCounter/
+// planRunUiIsDetailResponseCurrent with the existing toggle path -- that
+// guard already supports multiple concurrent per-Run fetches safely (a
+// different Run, or this same Run refetched later by an explicit "View"
+// click), so this addition introduces no new stale-response surface.
+function planRunUiEnsureRunDetailLoaded(planRunId) {
+  if (Object.prototype.hasOwnProperty.call(planRunUiState.detailByRunId, planRunId)) return;
+  var run = planRunUiState.runs.filter(function (r) { return r.planRunId === planRunId; })[0];
+  if (!run) return;
+  if (!run.nextOccurrenceId) {
+    // Mirrors planRunUiToggleRunDetail's own identical, already-accepted
+    // handling of this data state.
+    planRunUiState.detailByRunId[planRunId] = { phase: 'noNextOccurrence' };
+    return;
+  }
+  var epoch = ++planRunUiDetailEpochCounter;
+  var expectedUid = planRunUiCurrentUid();
+  planRunUiState.detailByRunId[planRunId] = { phase: 'loading', epoch: epoch };
+  var ownerUid = expectedUid;
+  var p;
+  try {
+    p = fsPlanRunPersistence.fsPlanRunReadForDisplay({
+      ownerUid: ownerUid, planRunId: run.planRunId, occurrenceId: run.nextOccurrenceId, mode: 'display'
+    });
+  } catch (err) {
+    planRunUiState.detailByRunId[planRunId] = { phase: 'error', epoch: epoch };
+    planRunUiRenderSection();
+    return;
+  }
+  p.then(function (result) {
+    if (!planRunUiIsDetailResponseCurrent(planRunId, epoch, expectedUid)) return; // superseded/owner changed -- drop silently
+    if (result && result.outcome === 'verified') {
+      planRunUiState.detailByRunId[planRunId] = { phase: 'verified', run: result.run, occurrence: result.occurrence, epoch: epoch };
+    } else {
+      planRunUiState.detailByRunId[planRunId] = { phase: 'unverified', outcome: result && result.outcome, epoch: epoch };
+    }
+    planRunUiRenderSection();
+  }).catch(function (err) {
+    if (!planRunUiIsDetailResponseCurrent(planRunId, epoch, expectedUid)) return;
+    planRunUiState.detailByRunId[planRunId] = { phase: 'error', epoch: epoch };
+    planRunUiRenderSection();
+  });
+}
+
+// USABILITY CORRECTION ADDITION (independent-review finding, this round):
+// toggles this one Run's secondary overflow menu (which hosts the idle
+// "End Run" entry point -- see planRunUiRenderRunCard above). Independent
+// of expandedRunId/planRunUiToggleRunDetail; at most one Run's menu is
+// open at a time, same convention as the existing View/Hide toggle.
+function planRunUiToggleRunMenu(planRunId) {
+  planRunUiState.menuOpenRunId = (planRunUiState.menuOpenRunId === planRunId) ? null : planRunId;
+  planRunUiRenderSection();
 }
 
 function planRunUiToggleRunDetail(planRunId) {
@@ -600,10 +718,33 @@ function planRunUiFormatOccurrenceName(nameSnapshot, fallback) {
   var mc = (typeof nameSnapshot.microcycleName === 'string' && nameSnapshot.microcycleName) ? nameSnapshot.microcycleName : '';
   var sess = (typeof nameSnapshot.sessionName === 'string' && nameSnapshot.sessionName) ? nameSnapshot.sessionName : '';
   if (mc && sess) return mc + ' — ' + sess;
-  return sess || mc || fallback;
+  // DEFENSIVE ADDITION (independent-review finding, this round): this
+  // function's own fallback parameter is always a real occurrenceId in
+  // production (every real occurrence document satisfies PLAN_RUN_
+  // OCCURRENCE_KEYS and is id-validated before ever reaching here), but
+  // this detail view now renders unconditionally for every Run card
+  // instead of only once "View" is clicked (see planRunUiRenderRunCard),
+  // so it is reached far more often -- including against test fixtures
+  // built only for an unrelated (e.g. End-recovery) scenario that never
+  // exercised this path before and can supply an incomplete stub. A
+  // final `|| ''` keeps this pure formatter's own contract (always
+  // returns a string, never undefined) rather than letting a malformed
+  // fallback crash escapeHtml downstream -- it changes no real,
+  // production-shaped call's output.
+  return sess || mc || fallback || '';
 }
 
-function planRunUiRenderRunDetail(run, detail) {
+// USABILITY CORRECTION (independent-review finding, this round): this is
+// now called UNCONDITIONALLY for every rendered Run card (see
+// planRunUiRenderRunCard above), never gated behind "View" -- every branch
+// below was already safe to render without any detail-specific precondition
+// other than `detail` itself existing, so the only real change is that
+// `detail` now gets populated automatically (planRunUiEnsureRunDetailLoaded)
+// instead of only after a click. The new third parameter, `isOpen`, governs
+// ONLY the genuinely optional extra identifying detail appended at the end
+// for a verified Session -- never the Session name/status/action above it,
+// which stays visible regardless of isOpen.
+function planRunUiRenderRunDetail(run, detail, isOpen) {
   if (!detail || detail.phase === 'loading') {
     return '<div style="padding:8px 0;color:var(--text2)">Loading Session…</div>';
   }
@@ -615,13 +756,23 @@ function planRunUiRenderRunDetail(run, detail) {
   }
   // detail.phase === 'verified'
   var occ = detail.occurrence;
+  // DEFENSIVE ADDITION (independent-review finding, this round): every
+  // `occ.occurrenceId || ''` below (mirroring this function's own
+  // pre-existing `occ.status || ''` convention two lines down) guards
+  // against a test fixture built for an unrelated scenario (several exist
+  // across the End-recovery suites) that stubs only the `status` field --
+  // never reachable before because detail rendering was gated behind
+  // "View" and those fixtures' Runs were never expanded. A real production
+  // occurrence always has a real, id-validated occurrenceId, so this
+  // changes no real call's output.
+  var occId = occ.occurrenceId || '';
   var isInProgress = occ.status === 'inProgress';
   var isPending = occ.status === 'pending';
   var label = isInProgress ? 'In Progress' : (isPending ? 'Not Started' : escapeHtml(occ.status || ''));
   var html = '<div style="padding:8px 0;border-top:1px solid var(--border,#eee);margin-top:6px">';
-  html += '<div style="font-size:13px;margin-bottom:4px"><strong>Next Session:</strong> ' + escapeHtml(planRunUiFormatOccurrenceName(occ.nameSnapshot, occ.occurrenceId)) + ' &mdash; <em>' + label + '</em></div>';
+  html += '<div style="font-size:13px;margin-bottom:4px"><strong>Next Session:</strong> ' + escapeHtml(planRunUiFormatOccurrenceName(occ.nameSnapshot, occId)) + ' &mdash; <em>' + label + '</em></div>';
   if (isInProgress) {
-    html += '<button class="btn-secondary" data-planrun-action="resume" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" data-planrun-occurrence-id="' + escapeHtml(occ.occurrenceId) + '">Resume (view only)</button>';
+    html += '<button class="btn-secondary" data-planrun-action="resume" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" data-planrun-occurrence-id="' + escapeHtml(occId) + '">Resume (view only)</button>';
   } else if (isPending) {
     // SAFETY CORRECTION (this round): never render Start Session as a
     // working control while a DIFFERENT file's End attempt for this SAME
@@ -630,14 +781,37 @@ function planRunUiRenderRunDetail(run, detail) {
     // is the rendered-control half of that same guard, never a substitute
     // for it.
     if (typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId)) {
-      html += '<div data-testid="planrun-start-session-blocked" style="font-size:13px;color:var(--text2)">This Program Run is being ended — Start Session is unavailable until that finishes.</div>';
+      // DEFENSIVE ADDITION (independent-review finding, this round): a
+      // data-planrun-run-id attribute, matching every other per-Run control
+      // in this file, now that this div can co-exist on-screen with
+      // OTHER Runs' own cards (detail renders unconditionally for every
+      // Run now, not just whichever one was expanded) -- lets a query
+      // scope to this specific Run rather than matching the first such
+      // div anywhere on the page.
+      html += '<div data-testid="planrun-start-session-blocked" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" style="font-size:13px;color:var(--text2)">This Program Run is being ended — Start Session is unavailable until that finishes.</div>';
     } else {
       // SLICE 2 addition: a real action, gated entirely on the persistence
       // layer's own honest confirmation (planRunUiStartSession below) --
       // merely rendering this button, or merely opening the preview
       // afterward, never itself marks anything in progress.
-      html += '<button class="btn-secondary" data-planrun-action="start-session" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" data-planrun-occurrence-id="' + escapeHtml(occ.occurrenceId) + '">Start Session</button>';
+      html += '<button class="btn-secondary" data-planrun-action="start-session" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" data-planrun-occurrence-id="' + escapeHtml(occId) + '">Start Session</button>';
     }
+  }
+  // USABILITY CORRECTION ADDITION (independent-review finding, this round):
+  // "View"/"Hide" still exists, now gating only this genuinely optional
+  // extra identifying detail -- every value here is a real stored field
+  // off the already-fetched, already-verified occurrence (PLAN_RUN_
+  // OCCURRENCE_KEYS), never a fabricated or display-name-derived value.
+  // Defensive `|| ''`/`Number.isInteger` guards match occId above, for the
+  // same pre-existing-fixture reason.
+  if (isOpen) {
+    var assignCount = Array.isArray(occ.assignments) ? occ.assignments.length : 0;
+    var mcOrdinal = Number.isInteger(occ.microcycleOrdinal) ? occ.microcycleOrdinal : '?';
+    var sessOrdinal = Number.isInteger(occ.sessionOrdinal) ? occ.sessionOrdinal : '?';
+    html += '<div style="padding:6px 0;margin-top:4px;font-size:12px;color:var(--text2)">'
+      + 'Occurrence: ' + escapeHtml(occId) + ' &middot; Microcycle ' + escapeHtml(String(mcOrdinal))
+      + ', Session ' + escapeHtml(String(sessOrdinal)) + ' &middot; ' + assignCount + ' exercise' + (assignCount === 1 ? '' : 's')
+      + '</div>';
   }
   html += '</div>';
   return html;

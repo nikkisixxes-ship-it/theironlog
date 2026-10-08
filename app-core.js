@@ -44,6 +44,12 @@ let moveDayProgId = null, moveDayMi = null, moveDaySi = null;
 let customExTempVideos  = [];
 let videosExIdx         = null;
 let prDebounceTimers    = {};
+// AUTH-BOUNDARY CORRECTION (legacy active-program gap) -- tracks the one
+// pending setTimeout shared by openProgramFromCard/openTemplateFromActiveCard
+// (both delay their own planOpenProfile(...) call by 150ms so showPage can
+// finish its own transition first). See resetLegacyProgramsForAuthChange's
+// own header for why this needs to be cancellable at the auth boundary.
+let legacyProfileOpenTimer = null;
 
 // ==================== AUTH ====================
 let authMode = 'login';
@@ -141,6 +147,114 @@ function resetImportedSetsState() {
   appDb.importedSets = [];
 }
 
+// AUTH-BOUNDARY CORRECTION (independent-review, account-change gap): the
+// legacy active-program system (appDb.programs) and its directly-associated
+// UI state/DOM were never reset on sign-out, sign-in, or an owner switch --
+// unlike every canonical Program-Run surface (planRunUiResetForOwner,
+// planRunTmResetForOwner, planRunStartClose, planRunLoggerFinishReset
+// ForAuthChange, planRunEndResetForAuthChange -- all called from this same
+// auth boundary, below). Concretely, without this function: (1) a
+// signed-out owner's own programs stayed in appDb.programs and in whatever
+// legacy DOM had last rendered them (the Home carousel, a Program Profile
+// view, a template editor) until some unrelated later render happened to
+// overwrite it -- sign-out only ever hid #app, it never cleared any of
+// this; (2) a direct A->B switch never hides #app at all (unlike
+// sign-out), so A's own #home-program-carousel HTML -- already painted on
+// screen -- stayed visibly on screen, genuinely showing A's program
+// name(s) to B, for the entire async window between this synchronous
+// reset and whenever B's own sign-in boot eventually reaches its own
+// renderHome() call; blanking #home-program-carousel/#home-carousel-dots
+// here, synchronously, closes that window rather than leaving it to
+// chance. Separately, if A had navigated to Plan and opened a Program
+// Profile or template editor before the switch, #page-programs (shared by
+// the legacy Profile/editor/library view and, when enabled, the canonical
+// Library) kept showing A's own rendered content indefinitely, since
+// nothing else re-renders that container the way renderHome() does for
+// the Home page; (3) the legacy card's own "..." menu
+// (openActiveProgCardMenu/openPlanProfileMenu), the generic confirm dialog
+// (confirm2 -- shared by End/Restart/Delete Template and others), and the
+// session/move-week modals could all stay open across the switch with
+// stale, previous-owner-scoped ids and text baked into their rendered HTML
+// or their tracked callback closures; (4) openProgramFromCard/
+// openTemplateFromActiveCard's own delayed (150ms) planOpenProfile(...)
+// call had no session guard at all and could fire AFTER a sign-out or
+// switch, rendering the previous owner's own template profile into
+// whichever owner is current by the time it fires.
+//
+// This is the new, PRIMARY auth boundary for all of that -- called
+// synchronously, at the top of the real auth transition, before #app can
+// become visible or any asynchronous initialization begins, exactly
+// alongside the canonical resets it now sits next to. The real Firestore
+// `COL_PROGRAMS.onSnapshot` listener already guarded itself correctly
+// before this correction (`if (mySession !== initSession) return;`,
+// PHASE A CORRECTION FINDING 3, below) -- a delayed legacy SNAPSHOT was
+// never the gap; the gap was always this function's own absence.
+//
+// Deliberately NOT touched here: `currentWorkout`, and the legacy %TM/1RM/
+// working-load prompt continuations (activeTMPromptContinue/
+// active1RMPromptContinue/activeWLPromptContinue). Those belong to the
+// Logger's own, already-established, intentionally-preserved-across-auth-
+// changes in-progress workout -- see planRunLoggerFinishResetForAuthChange's
+// own header ("An ordinary LEGACY currentWorkout (no canonicalRun) is left
+// completely untouched"). This correction has no more license to destroy
+// that unsaved, user-authored work than any prior round did; see this
+// round's own correction report for the full disclosure of this boundary.
+function resetLegacyProgramsForAuthChange() {
+  appDb.programs = [];
+  homeCarouselIdx = 0;
+  homeCarouselProgs = [];
+  currentProgramId = null;
+  currentMicrocycleIdx = null;
+  currentSessionIdx = null;
+  moveDayProgId = null;
+  moveDayMi = null;
+  moveDaySi = null;
+  planDraft = null;
+  planSnapshot = null;
+  planEditorOrigin = null;
+  planCurrentProgId = null;
+  if (legacyProfileOpenTimer) { clearTimeout(legacyProfileOpenTimer); legacyProfileOpenTimer = null; }
+  closeDropdown();
+  closeModal('modal-session');
+  closeModal('modal-move-week');
+  closeModal('modal-program');
+  confirmCallback = null;
+  confirmRejectCallback = null;
+  const confirmOverlayEl = document.getElementById('confirm-overlay');
+  if (confirmOverlayEl) confirmOverlayEl.classList.remove('open');
+  // #page-programs is shared by the legacy Profile/editor/library view and
+  // (when the canonical capability is ever enabled) the canonical Library --
+  // blanking it here removes any stale, owner-scoped rendered HTML from
+  // either system rather than leaving it indefinitely visible if it
+  // happened to be the active page at the moment of this transition. A
+  // later render (renderPlanLibrary/planCanonicalLibraryRender), reached
+  // the normal way by navigating to the Plan tab, repopulates it correctly
+  // for whichever owner is now signed in.
+  const pageProgramsEl = document.getElementById('page-programs');
+  if (pageProgramsEl) pageProgramsEl.innerHTML = '';
+  // CORRECTION (found by this round's own smoke-test coverage, not merely
+  // asserted): unlike #page-programs, #home-program-carousel is NOT gated
+  // behind navigating to a particular page -- it is part of #page-home,
+  // which stays visible across a direct A->B owner switch (no intervening
+  // sign-out ever hides #app in that case). Clearing appDb.programs above
+  // does not, by itself, touch this already-rendered HTML; the next
+  // correct repaint only happens later, asynchronously, when the new
+  // owner's own sign-in boot sequence reaches its own renderHome() call
+  // (after its own persistenceReady/prefs/setupListeners awaits settle).
+  // Without blanking it here too, the previous owner's own program
+  // name(s) could remain visibly on screen for that entire async window --
+  // exactly the "briefly render the previous owner's legacy data" risk
+  // this round was asked to rule out. Blanking to empty string (rather
+  // than reproducing renderHomeCarousel's own "No Active Programs"
+  // empty-state markup) is deliberately the smallest change: the next
+  // real renderHome() -- reached the normal way, during this same
+  // transition's own boot sequence -- repopulates it correctly either way.
+  const carouselEl = document.getElementById('home-program-carousel');
+  if (carouselEl) carouselEl.innerHTML = '';
+  const carouselDotsEl = document.getElementById('home-carousel-dots');
+  if (carouselDotsEl) carouselDotsEl.innerHTML = '';
+}
+
 function ensureImportedSetsLoaded(reason) {
   if (importedSetsLoaded) return Promise.resolve(appDb.importedSets);
   if (importedSetsLoadPromise) return importedSetsLoadPromise;
@@ -205,6 +319,15 @@ auth.onAuthStateChanged(async user => {
   if (typeof planRunUiResetForOwner === 'function') {
     planRunUiResetForOwner(user ? user.uid : null);
   }
+  // OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION -- the
+  // same auth boundary, for app-plan-run-training-max-ui.js's own
+  // "Needs Attention" list/pagination/attempt-tracking state, which is
+  // owner-scoped exactly the same way the Program Run list immediately
+  // above already is. Reuses that same function's own signature
+  // (planRunTmResetForOwner(uid)) for the identical reason.
+  if (typeof planRunTmResetForOwner === 'function') {
+    planRunTmResetForOwner(user ? user.uid : null);
+  }
   // SLICE 3 CORRECTION (independent-review, auth-boundary gap): the Start
   // screen (app-plan-run-start-ui.js) holds owner-scoped Program details
   // and progression suggestions in its own in-memory state, but nothing
@@ -234,6 +357,15 @@ auth.onAuthStateChanged(async user => {
   if (typeof planRunEndResetForAuthChange === 'function') {
     planRunEndResetForAuthChange();
   }
+  // LEGACY AUTH-BOUNDARY CORRECTION -- same auth boundary as every canonical
+  // Program-Run reset above. app-core.js and app-plan.js are always-present
+  // core files (not an optional slice), so this call is unguarded, matching
+  // how appDb/homeCarouselIdx etc. are already referenced unguarded elsewhere
+  // in this file. See resetLegacyProgramsForAuthChange's own header for the
+  // full list of gaps this closes. currentWorkout and the TM/1RM/WL prompt
+  // continuations are deliberately NOT touched by this call -- see that
+  // function's header for why.
+  resetLegacyProgramsForAuthChange();
   appReady = false;
   resetImportedSetsState();
   // Reset preference defaults on every transition too, before the next user's
@@ -573,6 +705,11 @@ function renderHome() {
   // capability flag and renders nothing when it is off, which is its real
   // state today -- this line changes nothing a real user sees.
   if (typeof planRunUiRenderHomeSection === 'function') planRunUiRenderHomeSection();
+  // OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
+  // additive "Needs Attention" section (app-plan-run-training-max-ui.js).
+  // Same guarded, no-op-when-absent, disabled-renders-nothing posture as
+  // the Program Run section immediately above.
+  if (typeof planRunTmRenderHomeSection === 'function') planRunTmRenderHomeSection();
   const sorted = [...appDb.workouts].slice(0, 3);
   document.getElementById('home-recent').innerHTML = sorted.length
     ? sorted.map(w => workoutHistoryCard(w, true)).join('')
@@ -673,7 +810,7 @@ function openProgCardMenu(e, progId) {
 
 function openProgramFromCard(progId) {
   showPage('page-programs');
-  setTimeout(() => { if (typeof planOpenProfile === 'function') planOpenProfile(progId); }, 150);
+  legacyProfileOpenTimer = setTimeout(() => { legacyProfileOpenTimer = null; if (typeof planOpenProfile === 'function') planOpenProfile(progId); }, 150);
 }
 
 function endProgramFromCard(progId) {
@@ -714,7 +851,8 @@ function openActiveProgCardMenu(e, activeId) {
 function openTemplateFromActiveCard(activeId) {
   const active = appDb.programs.find(p => p.id === activeId); if (!active || !active.templateId) return;
   showPage('page-programs');
-  setTimeout(() => { if (typeof planOpenProfile === 'function') planOpenProfile(active.templateId); }, 150);
+  const templateId = active.templateId;
+  legacyProfileOpenTimer = setTimeout(() => { legacyProfileOpenTimer = null; if (typeof planOpenProfile === 'function') planOpenProfile(templateId); }, 150);
 }
 
 function endActiveProgram(activeId) {

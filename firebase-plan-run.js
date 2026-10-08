@@ -361,6 +361,18 @@
               }
             };
           });
+          // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS2, versioning
+          // corrected Round 4 SS3.2/SS4: every progression-state document
+          // Start creates from here on is schema-version-2 -- the unedited
+          // v1 shape/validators/rules remain fully available for whatever
+          // (if anything) still needs to read an existing v1 document, but
+          // Start itself never constructs one, per Round 4 SS3.4's own
+          // disclosed application-layer discipline. `isCurrentValueUnresolved`
+          // mirrors `v.amount === null` exactly (enforced by
+          // `planRunProgressionStateDocValidV2` before this is ever
+          // persisted); `lastEstablishOperationId` starts `null` on every
+          // document and is set exactly once, only by the explicit
+          // training-max establishment operation (below).
           var stateWrites = pkg.progressionInitialValues.map(function (v) {
             var stateId = M('planRunBuildRuleStateId')(pkg.planRunId, v.planRuleId);
             return {
@@ -370,7 +382,8 @@
                 planAssignmentId: v.planAssignmentId, planRuleId: v.planRuleId, ruleRevisionId: v.ruleRevisionId, exerciseId: v.exerciseId,
                 currentValue: { kind: v.kind, amount: v.amount, unit: v.unit }, status: 'active', needsManualReviewReason: null,
                 initializationSource: v.initializationSource, lastProcessedWorkoutId: null, lastEvaluatedAt: null,
-                schemaVersion: 1, createdAt: now, updatedAt: now
+                schemaVersion: 2, createdAt: now, updatedAt: now,
+                lastEstablishOperationId: null, isCurrentValueUnresolved: v.amount === null
               }
             };
           });
@@ -710,7 +723,11 @@
           resultRefsOccurrenceId: receiptSnap.data.resultRefs.occurrenceId,
           resultRefsPlanRunId: receiptSnap.data.resultRefs.planRunId,
           preparedPackageHash: receiptSnap.data.preparedPackageHash,
-          appliedRuleIds: receiptSnap.data.resultRefs.appliedRuleIds, needsManualReviewRuleIds: receiptSnap.data.resultRefs.needsManualReviewRuleIds
+          appliedRuleIds: receiptSnap.data.resultRefs.appliedRuleIds, needsManualReviewRuleIds: receiptSnap.data.resultRefs.needsManualReviewRuleIds,
+          // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2: the two
+          // new buckets, read out alongside the original two so branch (a)'s
+          // receipt reconciliation (plan-run-model.js) can compare all four.
+          establishedRuleIds: receiptSnap.data.resultRefs.establishedRuleIds, stillUnresolvedRuleIds: receiptSnap.data.resultRefs.stillUnresolvedRuleIds
         };
       }
 
@@ -790,12 +807,29 @@
         requestedWorkoutRaw = await tx.get(workoutPath(pkg.ownerUid, pkg.workoutId));
       }
 
-      // Step 7.
+      // Step 7. OPTIONAL PROGRESSION STARTING VALUES spec Round 4 SS3.2:
+      // this structural-boundary check must now accept EITHER a legal v1 or
+      // a legal v2 progression-state document for a given expected Rule
+      // (the unedited v1 validator is never widened -- a version-dispatching
+      // helper is used here instead, so a v1 Rule from a possibly-live
+      // pre-this-feature Run and a v2 Rule from a Run started under this
+      // feature can coexist on the same occurrence without either being
+      // rejected).
       var stateFlags = {}, requestedFlags = {}, winningFlags = {};
+      // Round 2 SS8.2/SS7 mechanics, implemented this round: a Rule whose
+      // CURRENT state is schema-version-2 and still unresolved is "still
+      // unresolved" evidence for Finish's own receipt-reconciliation (no
+      // application record is ever written for it -- see the per-Rule loop
+      // below) -- see plan-run-model.js's planRunClassifyFinishOccurrence
+      // for the full reasoning on why "currently still unresolved" is sound,
+      // sufficient evidence on its own.
+      var perRuleStillUnresolved = {};
       expectedIds.forEach(function (rid) {
-        stateFlags[rid] = classifyDocFlags(stateRaw[rid], M('planRunProgressionStateDocValid'), M('planRunStateIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid]);
+        stateFlags[rid] = classifyDocFlags(stateRaw[rid], M('planRunProgressionStateDocValidAnyVersion'), M('planRunStateIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid]);
         requestedFlags[rid] = classifyDocFlags(requestedRecRaw[rid], M('planRunApplicationDocValid'), M('planRunApplicationIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid, pkg.workoutId]);
         if (winningRecRaw) winningFlags[rid] = classifyDocFlags(winningRecRaw[rid], M('planRunApplicationDocValid'), M('planRunApplicationIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid, winningWorkoutId]);
+        var sd = stateRaw[rid] && stateRaw[rid].exists ? stateRaw[rid].data : null;
+        perRuleStillUnresolved[rid] = !!(sd && sd.schemaVersion === 2 && sd.currentValue && sd.currentValue.amount === null);
       });
       var boundaryOk = M('planRunFinishStructuralBoundaryOk')({
         expectedRuleIds: expectedIds, stateDocs: stateFlags, requestedRecordDocs: requestedFlags,
@@ -879,7 +913,8 @@
         haveFullPackage: haveFullPackage, actualPackageHash: haveFullPackage ? packageHash(pkg) : null,
         terminalSlotOk: terminalSlotOk, terminalSlotReason: terminalSlotFlag ? terminalSlotFlag.reason : null,
         activeSlotOk: activeSlotOk, activeSlotReason: activeSlotFlag ? activeSlotFlag.reason : null,
-        requestedWorkoutCollision: requestedWorkoutCollision
+        requestedWorkoutCollision: requestedWorkoutCollision,
+        perRuleStillUnresolved: perRuleStillUnresolved
       });
 
       return {
@@ -942,7 +977,7 @@
 
           // Step 11 -- pure computation only; nothing is written to `tx` yet.
           var now = deps.timestamp();
-          var appliedIds = [], reviewedIds = [], stagedStateWrites = [], stagedRecordWrites = [];
+          var appliedIds = [], reviewedIds = [], establishedIds = [], stillUnresolvedIds = [], stagedStateWrites = [], stagedRecordWrites = [];
           for (var k = 0; k < r.enabledRules.length; k++) {
             var ruleEntry = r.enabledRules[k].ruleEntry, assignment = r.enabledRules[k].assignment;
             var rid = ruleEntry.planRuleId;
@@ -955,8 +990,27 @@
             } else if (stateData.currentValue.kind !== (ruleEntry.adjustmentType === 'addLoad' ? 'workingLoad' : 'trainingMax')) {
               reviewReason = 'adjustmentTypeChanged';
             }
+            // OPTIONAL PROGRESSION STARTING VALUES spec Round 3 SS8 (the
+            // explicit Finish validator-chain writeup), implemented this
+            // round. The identity/revision/kind review checks above are
+            // UNCHANGED and run first for every Rule regardless of schema
+            // version or resolution state -- they are about whether the
+            // stored state document still genuinely corresponds to the Rule
+            // entry being evaluated right now, which matters identically for
+            // a resolved or an unresolved value. Only once those pass does
+            // this Rule's CURRENT resolution state decide what happens next:
+            // resolved (either schema version) -> the existing evaluator
+            // path, byte-for-byte unchanged; unresolved workingLoad -> an
+            // establishment attempt against this Finish's own workout
+            // evidence; unresolved trainingMax -> the evaluator is NEVER
+            // called, unconditionally (spec SS8 item 3 -- this is the one
+            // case the guard below exists specifically to prevent from ever
+            // reaching `planEvaluateCanonicalProgression`, whose own body
+            // does `currentValue.amount + amount` with no null-guard).
             var evaluatedDecision = null;
-            if (!reviewReason) {
+            var isUnresolved = !reviewReason && stateData.currentValue.amount === null;
+            var establishedAmount = null, establishedUnit = null;
+            if (!reviewReason && !isUnresolved) {
               var triple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, occurrenceDoc, pkg.workout, pkg.workoutId);
               var validation = M('planValidateProgressionEvaluationInput')(triple.rule, triple.evidence, triple.basis);
               if (!validation.ok) { reviewReason = 'notEvaluable'; }
@@ -964,17 +1018,78 @@
                 var evaluated = M('planEvaluateCanonicalProgression')(triple.rule, stateData.currentValue, triple.evidence, triple.basis);
                 if (evaluated.decision === 'notEvaluable') reviewReason = 'notEvaluable'; else evaluatedDecision = evaluated;
               }
+            } else if (!reviewReason && isUnresolved && stateData.currentValue.kind === 'workingLoad') {
+              // Spec Round 3 SS4.3: automatic establishment is attempted
+              // against THIS Finish's own workout, for THIS Rule's own
+              // assignment only -- never guessed when identity is ambiguous
+              // (zero or two-or-more matching exercises[] entries both mean
+              // "not qualifying", exactly alike, per
+              // planRunSelectQualifyingWorkingLoadWeight).
+              var sel = M('planRunSelectQualifyingWorkingLoadWeight')(pkg.workout, assignment);
+              if (sel.qualifies) {
+                establishedAmount = sel.amount;
+                // JUDGMENT CALL (disclosed in the implementation report): a
+                // Rule left fully blank at Start (spec's own paired-null
+                // shape) has no stored unit of its own to establish FROM --
+                // no "Run-wide governing unit" field exists anywhere in the
+                // real, traced schema (confirmed by direct search across
+                // plan-run-model.js's own field-key lists; the Run document
+                // itself, PLAN_RUN_KEYS, carries no unit field at all). This
+                // reuses the app's own PRE-EXISTING global weight-unit
+                // preference (`appDb.unit`, already the real, accepted
+                // default source for every other load-increment default in
+                // this codebase -- app-core.js's own `appDb.unit === 'kg' ?
+                // ... : ...` idiom, unedited, reused via `deps.resolveDefaultWeightUnit()`)
+                // rather than inventing a new source or leaving the
+                // established value unit-less.
+                establishedUnit = deps.resolveDefaultWeightUnit ? deps.resolveDefaultWeightUnit() : 'lb';
+              }
+              // else: no qualifying evidence this Finish -- stays unresolved,
+              // zero writes (spec Round 2 SS4.5).
             }
+            // kind === 'trainingMax' && isUnresolved: nothing to compute --
+            // falls through to the stillUnresolved bucket below, zero writes.
+
             var statePath = colPath(pkg.ownerUid, 'progressionState', M('planRunBuildRuleStateId')(pkg.planRunId, rid));
             var recPath = colPath(pkg.ownerUid, 'applications', M('planRunBuildApplicationId')(pkg.planRunId, rid, pkg.workoutId));
             if (reviewReason) {
-              stagedStateWrites.push({ path: statePath, data: { status: 'needsManualReview', needsManualReviewReason: reviewReason, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
+              stagedStateWrites.push({ path: statePath, ruleId: rid, data: { status: 'needsManualReview', needsManualReviewReason: reviewReason, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
               stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'reviewed', decision: null, reviewReason: reviewReason, recordedAt: now } });
               reviewedIds.push(rid);
-            } else {
-              stagedStateWrites.push({ path: statePath, data: { currentValue: evaluatedDecision.nextValue, status: 'active', needsManualReviewReason: null, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
+            } else if (!isUnresolved) {
+              stagedStateWrites.push({ path: statePath, ruleId: rid, data: { currentValue: evaluatedDecision.nextValue, status: 'active', needsManualReviewReason: null, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
               stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'applied', decision: evaluatedDecision.decision, reviewReason: null, recordedAt: now } });
               appliedIds.push(rid);
+            } else if (establishedAmount !== null) {
+              // Spec Round 2 SS4.5: establishment and evaluation are
+              // different operations -- the evaluator is never called for
+              // this Rule in this same Finish; `initializationSource`
+              // becomes 'establishedFromLoggedPerformance';
+              // `isCurrentValueUnresolved` flips to false in the SAME write
+              // that resolves `currentValue` (kept consistent, never a
+              // separate write); `lastEstablishOperationId` is NOT touched
+              // here (left at its existing `null` -- it is reserved
+              // exclusively for the explicit training-max establishment
+              // operation, below, and this Rule remains eligible for that
+              // field's own one-shot semantics even after this automatic
+              // establishment, consistent with it being a workingLoad-only
+              // path that trainingMax's own field never needs to interact
+              // with).
+              stagedStateWrites.push({
+                path: statePath, ruleId: rid, data: {
+                  currentValue: { kind: 'workingLoad', amount: establishedAmount, unit: establishedUnit },
+                  status: 'active', needsManualReviewReason: null, initializationSource: 'establishedFromLoggedPerformance',
+                  isCurrentValueUnresolved: false, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now
+                }
+              });
+              stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'established', decision: null, reviewReason: null, recordedAt: now } });
+              establishedIds.push(rid);
+            } else {
+              // Spec Round 2 SS4.5/SS7: no qualifying evidence (workingLoad)
+              // or always (trainingMax) -- ZERO writes, nothing to record.
+              // This Rule's progression-state document is left completely
+              // untouched by this Finish.
+              stillUnresolvedIds.push(rid);
             }
           }
 
@@ -1004,7 +1119,7 @@
           var runUpdate = { remainingOccurrenceIds: removal.remainingOccurrenceIds, nextOccurrenceId: removal.nextOccurrenceId, updatedAt: now };
           if (runBecomesComplete) { runUpdate.status = 'complete'; runUpdate.completedAt = now; }
           var finalRunData = Object.assign({}, runDoc, runUpdate);
-          var resultRefs = { workoutId: pkg.workoutId, occurrenceId: pkg.occurrenceId, planRunId: pkg.planRunId, appliedRuleIds: appliedIds, needsManualReviewRuleIds: reviewedIds };
+          var resultRefs = { workoutId: pkg.workoutId, occurrenceId: pkg.occurrenceId, planRunId: pkg.planRunId, appliedRuleIds: appliedIds, needsManualReviewRuleIds: reviewedIds, establishedRuleIds: establishedIds, stillUnresolvedRuleIds: stillUnresolvedIds };
           var receiptData2 = { ownerUid: pkg.ownerUid, operationId: pkg.operationId, operationType: 'runFinish', preparedPackageHash: packageHash(pkg), outcome: 'committed', resultRefs: resultRefs, createdAt: now };
 
           // ROUND 3 CORRECTION (finding 3): the real, non-bypassable
@@ -1023,9 +1138,16 @@
           var stagedByteWrites = [
             { path: workoutPath(pkg.ownerUid, pkg.workoutId), kind: 'workout', data: pkg.workout },
             { path: r.occPath, kind: 'occurrence', data: finalOccurrenceData }
-          ].concat(stagedStateWrites.map(function (w, idx) {
-            var rid = r.expectedIds[idx];
-            return { path: w.path, kind: 'progressionState', data: Object.assign({}, r.stateRaw[rid].data, w.data) };
+          ].concat(stagedStateWrites.map(function (w) {
+            // ROUND 6 IMPLEMENTATION NOTE: a stillUnresolved Rule now
+            // produces ZERO entries in stagedStateWrites (spec Round 2
+            // SS4.5/SS7 -- "nothing to record"), so stagedStateWrites can no
+            // longer be safely zipped to r.expectedIds by array index (that
+            // 1:1 correspondence only held when every enabled Rule always
+            // produced exactly one state write, which was true in every
+            // prior round but is no longer true here). Each push above now
+            // carries its own `ruleId`, read directly here instead.
+            return { path: w.path, kind: 'progressionState', data: Object.assign({}, r.stateRaw[w.ruleId].data, w.data) };
           })).concat(stagedRecordWrites.map(function (w) {
             return { path: w.path, kind: 'application', data: w.data };
           })).concat([{ path: r.runPath, kind: 'run', data: finalRunData }]);
@@ -1512,6 +1634,221 @@
     }
 
     // =========================================================================
+    // OPTIONAL PROGRESSION STARTING VALUES -- EXPLICIT TRAINING-MAX
+    // ESTABLISHMENT (spec Round 2 SS5, corrected Round 3 SS5/Round 4 SS6,
+    // this implementation round's Required Implementation item 5). A
+    // separately-initiated operation -- NEVER inferred from logged
+    // performance (that is workingLoad's own, entirely different, automatic
+    // Finish-time path above) -- that resolves exactly one v2 trainingMax
+    // Rule's unresolved starting value. Reuses
+    // `planRunClassifyOperationReceiptGuard` exactly as End/Cancel do (spec
+    // SS5.1's explicit instruction), with the receipt's "subject" keyed on
+    // the COMBINED planRunId+planRuleId pair (a plain `<planRunId>::
+    // <planRuleId>` string -- this operation's real subject is one Rule
+    // within one Run, never the whole Run, so the generic guard's single
+    // `receiptResultRefsPlanRunId`/`requestedPlanRunId` slot is reused with
+    // that combined key rather than widening the guard itself). Does NOT
+    // introduce any new "pending training max" collection -- the existing
+    // `operations` receipt collection is the only coordination record this
+    // operation ever writes, matching every other mutation in this file.
+    //
+    // Read order (max 3 of the 4 reads PLAN_RUN_SAFETY_CAPS budgets for this
+    // operation): receipt (cheapest fail-first -- an idempotent retry or a
+    // conflicting reuse is detected before either of the other two documents
+    // is ever read) -> state document -> Run document (read last, since it
+    // is only ever consulted for its own identity/status fields once the
+    // state document has already been proven valid and genuinely
+    // unresolved-or-matching).
+    //
+    // JUDGMENT CALL (disclosed in the implementation report): the controlling
+    // specification's own outcome vocabulary for this operation
+    // (`planRunClassifyTrainingMaxEstablishRequest`, in plan-run-model.js)
+    // covers resolution-state/receipt logic only -- it does not itself
+    // define a cross-document "does this state document still genuinely
+    // belong to the Run/Template/manifest it claims" check, the same kind of
+    // check Finish's own per-Rule loop performs inline (assignment/Template/
+    // revision identity) rather than inside its own classify function. This
+    // function follows that exact precedent: the binding check below runs
+    // BEFORE `planRunClassifyTrainingMaxEstablishRequest` is ever called,
+    // using the just-read Run document as ground truth for the state
+    // document's `planTemplateId`/`headRevisionId` (never the caller-
+    // supplied package, which carries no Template/manifest fields of its
+    // own to begin with -- only `planAssignmentId`/`ruleRevisionId`/
+    // `exerciseId`, checked against the state document directly).
+    // =========================================================================
+    async function fsPlanRunEstablishTrainingMax(pkg) {
+      disabledGate();
+      if (!M('planRunIsPlainObject')(pkg)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      if (pkg.ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      var v = M('planRunValidateTrainingMaxEstablishPackage')(pkg);
+      if (!v.ok) return { outcome: 'invalidInput', reason: v.reason };
+
+      var receiptPath = colPath(pkg.ownerUid, 'operations', pkg.operationId);
+      var statePath = colPath(pkg.ownerUid, 'progressionState', M('planRunBuildRuleStateId')(pkg.planRunId, pkg.planRuleId));
+      var runPath = colPath(pkg.ownerUid, 'runs', pkg.planRunId);
+      var subjectKey = pkg.planRunId + '::' + pkg.planRuleId;
+
+      try {
+        return await deps.transaction(async function (tx) {
+          // Read 1 of 3: the receipt, first, cheapest-fail-first.
+          var receiptSnap = await tx.get(receiptPath);
+          var receiptValid = receiptSnap.exists && M('planRunOperationDocValid')(receiptSnap.data);
+          var receiptIdentityOk = receiptValid && M('planRunOperationIdentityOk')(receiptSnap.data, pkg.ownerUid, pkg.operationId, 'runProgressionEstablishTrainingMax');
+          var actualHash = packageHash(pkg);
+          var receiptGuard = M('planRunClassifyOperationReceiptGuard')({
+            receiptExists: receiptSnap.exists, receiptValid: receiptValid, receiptIdentityOk: receiptIdentityOk,
+            receiptResultRefsPlanRunId: receiptIdentityOk ? (receiptSnap.data.resultRefs.planRunId + '::' + receiptSnap.data.resultRefs.planRuleId) : null,
+            requestedPlanRunId: subjectKey, haveFullPackage: true, actualPackageHash: actualHash,
+            receiptPreparedPackageHash: receiptValid ? receiptSnap.data.preparedPackageHash : null
+          });
+          if (receiptGuard.result === 'integrityConflict') return { outcome: 'integrityConflict', reason: receiptGuard.reason };
+          if (receiptGuard.result === 'recognizedMatchingPackage') {
+            // Idempotent retry of this exact operation, already committed --
+            // zero further writes, zero further reads.
+            return { outcome: 'alreadyEstablished', resultRefs: receiptSnap.data.resultRefs };
+          }
+          // `recognizedIdentityOnly` is unreachable here (haveFullPackage is
+          // always true for this mutation, exactly like End/Cancel above).
+          // Reaching here means receiptGuard.result === 'absent'.
+
+          // Read 2 of 3 (at most -- see below): the state document.
+          //
+          // CORRECTION (this implementation round, pre-delivery self-check):
+          // the first-drafted version of this read validated the state
+          // document with `planRunProgressionStateDocValidV2` alone, which
+          // REJECTS a genuine, perfectly-legal v1 document outright (v1's
+          // 17-key shape fails v2's own 19-key exact-keys check) -- meaning
+          // a real v1 Rule would have been misreported as
+          // `documentMalformed:stateMalformed` ("malformed") rather than the
+          // specific, already-designed-for outcome
+          // `rejected:legacySchemaNotEligible` that
+          // `planRunClassifyTrainingMaxEstablishRequest`'s own
+          // `stateSchemaVersion !== 2` branch exists to produce. Fixed by
+          // validating shape with the version-dispatching
+          // `planRunProgressionStateDocValidAnyVersion` instead (v1's and
+          // v2's own field names agree on every field this function reads:
+          // ownerUid/planRunId/planRuleId/planTemplateId/headRevisionId/
+          // planAssignmentId/ruleRevisionId/exerciseId/currentValue/
+          // schemaVersion all exist, identically named, in both shapes), and
+          // checking `schemaVersion` immediately -- BEFORE the Run document
+          // is ever read -- so a v1 Rule's ineligibility is reported
+          // correctly, and cheaply (one read, not two), never conflated with
+          // a real integrity failure.
+          var stateSnap = await tx.get(statePath);
+          if (!stateSnap.exists) return { outcome: 'requiredDocumentMissing', reason: 'stateMissing' };
+          var stateValid = M('planRunProgressionStateDocValidAnyVersion')(stateSnap.data);
+          var stateIdentityOk = stateValid && M('planRunStateIdentityOk')(stateSnap.data, pkg.ownerUid, pkg.planRunId, pkg.planRuleId);
+          if (!stateValid || !stateIdentityOk) return { outcome: 'documentMalformed', reason: !stateValid ? 'stateMalformed' : 'stateForeign' };
+          var stateData = stateSnap.data;
+          if (stateData.schemaVersion !== 2) return { outcome: 'rejected', reason: 'legacySchemaNotEligible' };
+
+          // Read 3 of 3: the Run document -- consulted both as the ground
+          // truth for the state document's own Template/manifest binding
+          // (below) and, further down, for the active-Run precondition.
+          var runSnap = await tx.get(runPath);
+          if (!runSnap.exists) return { outcome: 'requiredDocumentMissing', reason: 'runMissing' };
+          if (!M('planRunDocValid')(runSnap.data) || !M('planRunActiveSlotIdOk')(runSnap.data) || !M('planRunDocIdentityOk')(runSnap.data, pkg.ownerUid, pkg.planRunId)) {
+            return { outcome: 'documentMalformed', reason: 'runMalformed' };
+          }
+          var runDoc = runSnap.data;
+
+          // Cross-document binding (Rule/Template/revision/manifest), run
+          // BEFORE the classify function, mirroring Finish's own inline
+          // identity-check layering (see this function's own header comment
+          // above). ANY mismatch here means the state document no longer
+          // genuinely corresponds either to the Run's current Template/
+          // manifest identity, or to the specific Rule entry the caller
+          // claims to be establishing -- never a case this operation
+          // resolves by guessing; always a zero-write integrity refusal.
+          if (stateData.planTemplateId !== runDoc.planTemplateId || stateData.headRevisionId !== runDoc.headRevisionId) {
+            return { outcome: 'crossDocumentBindingMismatch', reason: 'templateOrManifestMismatch' };
+          }
+          if (stateData.planAssignmentId !== pkg.planAssignmentId || stateData.ruleRevisionId !== pkg.ruleRevisionId || stateData.exerciseId !== pkg.exerciseId) {
+            return { outcome: 'crossDocumentBindingMismatch', reason: 'ruleIdentityMismatch' };
+          }
+
+          // ROUND 7/8 CORRECTION: `runDoc.status` here is always this
+          // transaction's own freshly-read, authoritative value (never a
+          // stale UI copy) -- the classify function below now accepts all
+          // three canonical PLAN_RUN_STATUSES values ('active', 'complete',
+          // 'ended') for a genuinely new attempt (plan-run-model.js's own
+          // header/branch comment has the full rationale and trace, across
+          // both rounds). Because every read above is inside this same
+          // transaction, an active-to-ended OR active-to-complete transition
+          // racing a Firestore retry of this same transaction is handled for
+          // free: whichever attempt actually commits reads the Run
+          // document's real status at that moment, and any of the three
+          // legitimate values proceeds. `runDoc.status` was already required
+          // to be one of `PLAN_RUN_STATUSES` by `planRunDocValid` above
+          // (unchanged) before this call is ever reached, so the classifier's
+          // own defensive fallthrough for an unrecognized value is dead code
+          // on this real call path -- it exists only for this function's own
+          // direct unit tests.
+          var decision = M('planRunClassifyTrainingMaxEstablishRequest')({
+            stateExists: true, stateValid: true, stateIdentityOk: true,
+            stateSchemaVersion: stateData.schemaVersion, stateKindIsTrainingMax: stateData.currentValue.kind === 'trainingMax',
+            stateStatus: stateData.status, stateCurrentlyUnresolved: stateData.currentValue.amount === null,
+            resolvedAmount: stateData.currentValue.amount, resolvedUnit: stateData.currentValue.unit,
+            requestedAmount: pkg.amount, requestedUnit: pkg.unit,
+            receiptGuardResult: receiptGuard, runStatus: runDoc.status
+          });
+          if (decision.outcome !== 'proceed') return decision;
+
+          // Write path -- exactly 2 writes (state + receipt), matching
+          // PLAN_RUN_SAFETY_CAPS.maxTrainingMaxEstablishTransactionWrites.
+          var now = deps.timestamp();
+          var resultRefs = { planRunId: pkg.planRunId, planRuleId: pkg.planRuleId, amount: pkg.amount, unit: pkg.unit };
+          var receiptData = { ownerUid: pkg.ownerUid, operationId: pkg.operationId, operationType: 'runProgressionEstablishTrainingMax', preparedPackageHash: actualHash, outcome: 'committed', resultRefs: resultRefs, createdAt: now };
+          var stateWriteData = {
+            currentValue: { kind: 'trainingMax', amount: pkg.amount, unit: pkg.unit },
+            status: 'active', needsManualReviewReason: null, initializationSource: 'manual',
+            isCurrentValueUnresolved: false, lastEstablishOperationId: pkg.operationId, updatedAt: now
+          };
+
+          var stagedByteWrites = [
+            { path: statePath, kind: 'progressionState', data: Object.assign({}, stateData, stateWriteData) },
+            { path: receiptPath, kind: 'operation', data: receiptData }
+          ];
+          var byteBudget = M('planRunCheckStagedTransactionBytes')(stagedByteWrites);
+          if (!byteBudget.ok) return { outcome: 'budgetExceeded', reasons: byteBudget.reasons };
+
+          tx.update(statePath, stateWriteData);
+          tx.set(receiptPath, receiptData);
+          return { outcome: 'committed', resultRefs: resultRefs };
+        });
+      } catch (err) { throw classifyRunTransactionFailure(err); }
+    }
+
+    // Read-only status check for the explicit training-max establishment
+    // operation, mirroring `fsPlanRunCheckEndStatus`'s own minimal shape
+    // exactly (spec Round 2 SS5.8): identity-only input, a single-transaction
+    // receipt read, 'confirmedAbsent' when no committed receipt exists yet
+    // for this operationId at all (never inferred as a failure -- the
+    // operation may simply not have reached the server yet, exactly like
+    // every other Check*Status function in this file).
+    async function fsPlanRunCheckTrainingMaxEstablishStatus(pkg) {
+      disabledGate();
+      if (!M('planRunIsPlainObject')(pkg)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      var inputCheck = M('planRunValidateCheckTrainingMaxEstablishStatusInput')(pkg);
+      if (!inputCheck.ok) return { outcome: 'invalidInput', reason: inputCheck.reason };
+      if (pkg.ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      var receiptPath = colPath(pkg.ownerUid, 'operations', pkg.operationId);
+      try {
+        return await deps.transaction(async function (tx) {
+          var receiptSnap = await tx.get(receiptPath);
+          var receiptValid = receiptSnap.exists && M('planRunOperationDocValid')(receiptSnap.data);
+          var receiptIdentityOk = receiptValid && M('planRunOperationIdentityOk')(receiptSnap.data, pkg.ownerUid, pkg.operationId, 'runProgressionEstablishTrainingMax');
+          if (!receiptSnap.exists) return { outcome: 'confirmedAbsent' };
+          if (!receiptValid || !receiptIdentityOk) return { outcome: 'integrityConflict', reason: 'receiptMalformedOrForeign' };
+          var subjectKey = pkg.planRunId + '::' + pkg.planRuleId;
+          var receiptSubjectKey = receiptSnap.data.resultRefs.planRunId + '::' + receiptSnap.data.resultRefs.planRuleId;
+          if (receiptSubjectKey !== subjectKey) return { outcome: 'confirmedAbsent' };
+          return { outcome: 'committed', resultRefs: receiptSnap.data.resultRefs };
+        });
+      } catch (err) { throw classifyRunTransactionFailure(err); }
+    }
+
+    // =========================================================================
     // SLICE 1 ADDITION -- LIST ACTIVE RUNS (spec Round 3 §3A.2, corrected
     // Round 4 §3A.2 Finding 8: `unavailable` -- and any other thrown,
     // retryable SDK failure -- is THROWN via classifyRunTransactionFailure,
@@ -1670,6 +2007,99 @@
       };
     }
 
+    // =========================================================================
+    // OPTIONAL PROGRESSION STARTING VALUES -- NEEDS-ATTENTION DISCOVERY
+    // (Round 6 controlling contract, this implementation round's Required
+    // Implementation item 6). Direct structural mirror of
+    // `fsPlanRunListActiveRuns` immediately above: same owner-scope
+    // validation, same single-query-per-call discipline, same fail-closed-
+    // per-page integrity behavior, same deep-cloned return shape -- the
+    // README-level precedent the Round 6 spec itself names for this
+    // function. Read-only; never writes.
+    //
+    // Query (exact, per the Round 6 controlling contract): `schemaVersion ==
+    // 2`, `currentValue.kind == 'trainingMax'`, `isCurrentValueUnresolved ==
+    // true`, `orderBy('createdAt','asc')`, then
+    // `orderBy(FieldPath.documentId(),'asc')` as the unique tiebreaker
+    // (never `planRuleId`, which repeats across different Runs for the same
+    // Rule). Cursor shape `{createdAtTimestamp, documentId}`, versioned/
+    // owner-bound via `planRunEncodeUnresolvedTrainingMaxCursor`/
+    // `planRunDecodeUnresolvedTrainingMaxCursor` (plan-run-model.js),
+    // validated BEFORE any Firestore I/O, exactly mirroring
+    // `fsPlanRunListActiveRuns`'s own cursor-first-validation discipline.
+    //
+    // Pagination/refresh contract (Required Implementation item 7): this
+    // function itself has no notion of "page one" vs. a later page beyond
+    // whatever cursor the caller passes -- "always start from page one on
+    // open/reopen", "no cursor survives close/reopen", and "an explicit
+    // refresh action" are all caller-side (UI) state-management behaviors,
+    // not something this read-only query function enforces on its own
+    // (mirroring `fsPlanRunListActiveRuns`, which is equally agnostic to
+    // when its own caller chooses to start over). DISCLOSED IN THE
+    // IMPLEMENTATION REPORT: the rendered-browser UI screen that actually
+    // calls this function, applies that open/reopen/refresh contract, and
+    // renders the returned entries was NOT built this round -- this round
+    // delivers the complete, independently testable persistence-layer
+    // function only; wiring it into a real needs-attention screen is an
+    // unresolved activation prerequisite, not a silently-skipped
+    // requirement.
+    // =========================================================================
+    async function fsPlanRunListUnresolvedTrainingMaxStates(ownerUid, opts) {
+      disabledGate();
+      if (!M('planRunIsId')(ownerUid)) return { outcome: 'invalidInput', reason: 'malformedOwnerUid' };
+      if (ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      var o = opts || {};
+      if (!M('planRunIsPlainObject')(o)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      var cursorInput = (o.cursor === undefined) ? null : o.cursor;
+      if (cursorInput !== null && typeof cursorInput !== 'string') {
+        return { outcome: 'invalidInput', reason: 'malformedInput' };
+      }
+
+      var PAGE_SIZE = 20;
+
+      if (cursorInput !== null && deps.decodeUnresolvedTrainingMaxCursor(cursorInput, ownerUid).invalid) {
+        return { outcome: 'invalidCursor' };
+      }
+
+      var page;
+      try {
+        // Exactly ONE call to deps.queryUnresolvedTrainingMaxPage per
+        // invocation that reaches this point, mirroring
+        // deps.queryActiveRunsPage's own single-query discipline.
+        page = await deps.queryUnresolvedTrainingMaxPage(ownerUid, { limit: PAGE_SIZE, cursor: cursorInput });
+      } catch (err) {
+        throw classifyRunTransactionFailure(err);
+      }
+
+      var stateDocValidV2 = M('planRunProgressionStateDocValidV2');
+      var clone = M('planRunDeepClone');
+      var entries = [];
+      for (var i = 0; i < page.docs.length; i++) {
+        var data = page.docs[i].data;
+        var documentId = page.docs[i].id;
+        // Narrowed integrity contract (Round 6 controlling §6, carried
+        // unchanged from the specification): validate ONLY the documents
+        // this query actually returned. A malformed returned document fails
+        // the entire page as an integrity conflict, exactly like
+        // fsPlanRunListActiveRuns -- but this function never claims to have
+        // discovered a contradiction among documents the query's own
+        // filters would have excluded (e.g. a v1 document, or a resolved
+        // v2 document) -- those are simply never fetched, and their
+        // non-appearance here is never reported as a finding.
+        if (!stateDocValidV2(data) || data.ownerUid !== ownerUid || data.currentValue.kind !== 'trainingMax' || data.isCurrentValueUnresolved !== true) {
+          return { outcome: 'integrityConflict', reason: 'malformedOrForeignUnresolvedTrainingMaxState' };
+        }
+        entries.push({ documentId: documentId, state: clone(data) });
+      }
+
+      return {
+        outcome: 'ok',
+        entries: entries,
+        hasMore: !!page.hasMore,
+        nextCursor: page.hasMore ? page.lastCursor : null
+      };
+    }
+
     return Object.freeze({
       fsPlanRunPreflightStart: fsPlanRunPreflightStart, fsPlanRunStart: fsPlanRunStart, fsPlanRunCheckStartStatus: fsPlanRunCheckStartStatus,
       fsPlanRunPreflightFinish: fsPlanRunPreflightFinish, fsPlanRunFinish: fsPlanRunFinish, fsPlanRunCheckFinishStatus: fsPlanRunCheckFinishStatus,
@@ -1686,6 +2116,12 @@
       fsPlanRunMarkOccurrenceInProgress: fsPlanRunMarkOccurrenceInProgress,
       // FOUNDATION SLICE addition (spec §3A.7) -- Save-without-completing.
       fsPlanRunSaveHistoryOnly: fsPlanRunSaveHistoryOnly,
+      // OPTIONAL PROGRESSION STARTING VALUES -- Round 6 implementation
+      // additions: explicit training-max establishment, its status check,
+      // and owner-scoped needs-attention discovery.
+      fsPlanRunEstablishTrainingMax: fsPlanRunEstablishTrainingMax,
+      fsPlanRunCheckTrainingMaxEstablishStatus: fsPlanRunCheckTrainingMaxEstablishStatus,
+      fsPlanRunListUnresolvedTrainingMaxStates: fsPlanRunListUnresolvedTrainingMaxStates,
       CanonicalPlanRunWriterDisabledError: CanonicalPlanRunWriterDisabledError,
       CanonicalPlanRunAuthorizationError: CanonicalPlanRunAuthorizationError,
       CanonicalPlanRunUnavailableError: CanonicalPlanRunUnavailableError,
@@ -1768,7 +2204,61 @@
       // this file's own established convention that pure decision/encoding
       // logic lives in the model file, never in this Firestore-facing layer.
       encodeCursor: function (fields) { return M('planRunEncodePageCursor')(fields); },
-      decodeCursor: function (cursor, ownerUid) { return M('planRunDecodePageCursor')(cursor, ownerUid); }
+      decodeCursor: function (cursor, ownerUid) { return M('planRunDecodePageCursor')(cursor, ownerUid); },
+
+      // OPTIONAL PROGRESSION STARTING VALUES -- JUDGMENT CALL (disclosed in
+      // the implementation report): no "Run-wide governing unit" field
+      // exists anywhere in the real, traced schema (confirmed by direct
+      // search across every field-key list this file and plan-run-model.js
+      // define; the Run document itself carries no unit field at all). This
+      // reuses the app's own PRE-EXISTING global weight-unit preference,
+      // `appDb.unit` -- already the real, accepted default source for every
+      // other load-increment default in this codebase (app-core.js's own
+      // `appDb.unit === 'kg' ? ... : ...` idiom, unedited) -- rather than
+      // inventing a new source or leaving an automatically-established
+      // workingLoad value unit-less.
+      resolveDefaultWeightUnit: function () {
+        return (root.appDb && root.appDb.unit === 'kg') ? 'kg' : 'lb';
+      },
+
+      // OPTIONAL PROGRESSION STARTING VALUES -- needs-attention discovery
+      // (Round 6 controlling §6). Direct structural mirror of
+      // `queryActiveRunsPage` immediately above, over the `progressionState`
+      // collection instead of `runs`, using the exact Round 6 composite
+      // index (`schemaVersion` asc, `currentValue.kind` asc,
+      // `isCurrentValueUnresolved` asc, `createdAt` asc) plus the document-
+      // ID tiebreaker this query's own `orderBy` clause adds on top of that
+      // index (Firestore automatically appends `__name__` to satisfy a
+      // trailing `orderBy(FieldPath.documentId())`, per the Round 6 spec's
+      // own §9 "do NOT add an explicit __name__ ... unless real emulator
+      // output proves the declaration invalid" instruction -- unverified in
+      // this sandbox, disclosed below and in the implementation report).
+      queryUnresolvedTrainingMaxPage: async function (ownerUid, opts) {
+        var limit = opts.limit;
+        var col = db.collection('users').doc(ownerUid).collection(M('PLAN_RUN_COLLECTIONS').progressionState);
+        var q = col.where('schemaVersion', '==', 2).where('currentValue.kind', '==', 'trainingMax').where('isCurrentValueUnresolved', '==', true)
+          .orderBy('createdAt', 'asc').orderBy(root.firebase.firestore.FieldPath.documentId(), 'asc');
+        if (opts.cursor) {
+          var decoded = M('planRunDecodeUnresolvedTrainingMaxCursor')(opts.cursor, ownerUid);
+          if (decoded.invalid) {
+            throw new CanonicalPlanRunPersistenceError('queryUnresolvedTrainingMaxPage received an already-invalid cursor; the caller must validate via decodeUnresolvedTrainingMaxCursor before calling this method.');
+          }
+          var startAfterTs = new root.firebase.firestore.Timestamp(decoded.createdAtSeconds, decoded.createdAtNanoseconds);
+          q = q.startAfter(startAfterTs, decoded.documentId);
+        }
+        var snap = await q.limit(limit + 1).get();
+        var allDocs = snap.docs.map(function (d) { return { id: d.id, data: d.data() }; });
+        var hasMore = allDocs.length > limit;
+        var pageDocs = allDocs.slice(0, limit);
+        var lastCursor = null;
+        if (hasMore && pageDocs.length > 0) {
+          var last = pageDocs[pageDocs.length - 1];
+          lastCursor = M('planRunEncodeUnresolvedTrainingMaxCursor')({ ownerUid: ownerUid, createdAtTimestamp: last.data.createdAt, documentId: last.id });
+        }
+        return { docs: pageDocs, hasMore: hasMore, lastCursor: lastCursor };
+      },
+      encodeUnresolvedTrainingMaxCursor: function (fields) { return M('planRunEncodeUnresolvedTrainingMaxCursor')(fields); },
+      decodeUnresolvedTrainingMaxCursor: function (cursor, ownerUid) { return M('planRunDecodeUnresolvedTrainingMaxCursor')(cursor, ownerUid); }
     };
   }
 

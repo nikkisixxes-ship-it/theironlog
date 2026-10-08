@@ -62,7 +62,16 @@ var PLAN_RUN_VALUE_KINDS = Object.freeze(['workingLoad', 'trainingMax']);
 var PLAN_RUN_VALUE_UNITS = Object.freeze(['lb', 'kg']);
 var PLAN_RUN_STATUSES = Object.freeze(['active', 'complete', 'ended']);
 var PLAN_RUN_OCCURRENCE_STATUSES = Object.freeze(['pending', 'inProgress', 'completed', 'skipped']);
-var PLAN_RUN_OPERATION_TYPES = Object.freeze(['runStart', 'runFinish', 'runEnd']);
+var PLAN_RUN_OPERATION_TYPES = Object.freeze(['runStart', 'runFinish', 'runEnd', 'runProgressionEstablishTrainingMax']);
+// Optional-progression-values spec Round 2 SS8.1: one shared logical list,
+// still independently duplicated at its real call sites (this file's own
+// planRunProgressionStateDocValidV2/planRunValidateStartPackage below;
+// firebase-plan-progression.js's Template-scoped validateManualInput is
+// UNCHANGED and never needs the two new members, since Template-level state
+// is never unresolved) -- collapsing that duplication is an unrelated
+// maintainability improvement, out of scope here, matching every prior
+// specification round's own explicit decision not to attempt it.
+var PLAN_RUN_VALUE_INITIALIZATION_SOURCES = Object.freeze(['manual', 'confirmedFromSuggestion', 'deferred', 'establishedFromLoggedPerformance']);
 
 // ---- Field-key lists (exact-key validation -- spec Part 5, field-by-field).
 // ROUND 5 CORRECTION (amendment Rounds 2+3, "activeSlotId" field addition) --
@@ -86,6 +95,33 @@ var PLAN_RUN_STATE_KEYS = Object.freeze([
   'planRuleId', 'ruleRevisionId', 'exerciseId', 'currentValue', 'status',
   'needsManualReviewReason', 'initializationSource', 'lastProcessedWorkoutId',
   'lastEvaluatedAt', 'schemaVersion', 'createdAt', 'updatedAt'
+]);
+// -----------------------------------------------------------------------------
+// OPTIONAL PROGRESSION STARTING VALUES -- canonical-program-run-optional-
+// progression-values-specification, Round 6 (controlling; supersedes Rounds
+// 1-5 wherever they differ). IMPLEMENTATION ROUND, submitted for independent
+// review only -- see firebase-plan-run.js's header for the full
+// non-authorization notice, which applies equally here.
+// `CANONICAL_PLAN_RUN_CAPABILITY_ENABLED` (firebase-plan-run.js) remains
+// hardcoded `false`; nothing added by this feature is reachable from any
+// real browser load path.
+//
+// `PLAN_RUN_STATE_KEYS`/`planRunProgressionStateDocValid` immediately above
+// are the ORIGINAL, schema-version-1 shape and validator -- ZERO EDITS, per
+// Round 4 SS3.1/SS3.2's explicit correction: a document that may already be
+// live from the brief production-enabled window (Round 4 SS0) must remain
+// readable/writable forever under exactly its original contract. A new,
+// independent, SECOND shape (`PLAN_RUN_STATE_KEYS_V2`,
+// `planRunProgressionStateDocValidV2`, directly below) is what every
+// genuinely new document created by this feature uses instead -- never a
+// widened version of the original key list.
+// -----------------------------------------------------------------------------
+var PLAN_RUN_STATE_KEYS_V2 = Object.freeze([
+  'ownerUid', 'planRunId', 'planTemplateId', 'headRevisionId', 'planAssignmentId',
+  'planRuleId', 'ruleRevisionId', 'exerciseId', 'currentValue', 'status',
+  'needsManualReviewReason', 'initializationSource', 'lastProcessedWorkoutId',
+  'lastEvaluatedAt', 'schemaVersion', 'createdAt', 'updatedAt',
+  'lastEstablishOperationId', 'isCurrentValueUnresolved'
 ]);
 var PLAN_RUN_VALUE_KEYS = Object.freeze(['amount', 'kind', 'unit']);
 var PLAN_RUN_APPLICATION_KEYS = Object.freeze(['ownerUid', 'planRunId', 'planRuleId', 'workoutId', 'outcome', 'decision', 'reviewReason', 'recordedAt']);
@@ -243,12 +279,25 @@ function planRunBuildActiveSlotId(ownerUid, planTemplateId, hashDeps) {
 // mirroring the accepted `stateValid`/`statePathIdentityOk` split in
 // firebase-plan-progression.js).
 // =============================================================================
+// OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS2 (preserved unchanged
+// through Round 6): widened to accept TWO legal shapes -- fully resolved
+// (real finite amount, real unit) or fully unresolved/paired-null (amount
+// and unit both null). This widening is purely PERMISSIVE (it accepts a
+// shape the prior version rejected; it never rejects a shape the prior
+// version accepted), so it is safe to apply to the one shared function even
+// though `planRunProgressionStateDocValid`/`PLAN_RUN_STATE_KEYS` (the
+// schema-version-1 validator/shape) themselves are never edited -- Round 4
+// SS3.3 proves no schema-version-1 document can ever actually be
+// paired-null (the only path that ever created one, the pre-this-feature
+// Start contract, required a real number), so this widening changes zero
+// real behavior for any existing/legacy document and is exercised only by
+// the new schema-version-2 validator below.
 function planRunCurrentValueValid(v) {
   if (!planRunExactKeys(v, PLAN_RUN_VALUE_KEYS)) return false;
   if (!PLAN_RUN_VALUE_KINDS.includes(v.kind)) return false;
-  if (typeof v.amount !== 'number' || !Number.isFinite(v.amount)) return false;
-  if (!PLAN_RUN_VALUE_UNITS.includes(v.unit)) return false;
-  return true;
+  var bothNull = v.amount === null && v.unit === null;
+  var bothReal = typeof v.amount === 'number' && Number.isFinite(v.amount) && PLAN_RUN_VALUE_UNITS.includes(v.unit);
+  return bothNull || bothReal;
 }
 
 function planRunPrescribedValid(v) {
@@ -389,16 +438,79 @@ function planRunProgressionStateDocValid(v) {
   return true;
 }
 
+// OPTIONAL PROGRESSION STARTING VALUES spec Round 4 SS3.2 (unchanged through
+// Round 6): the schema-version-2 sibling of `planRunProgressionStateDocValid`
+// immediately above -- a wholly independent validator over the independent
+// 19-key `PLAN_RUN_STATE_KEYS_V2` shape, never a widened copy of the
+// 17-key v1 validator. Reuses the now-paired-null-aware
+// `planRunCurrentValueValid` for the `currentValue` sub-check (the one
+// function genuinely shared between the two schema versions), and
+// additionally requires the new `isCurrentValueUnresolved` boolean to never
+// silently drift from the value it mirrors -- `isCurrentValueUnresolved ===
+// (currentValue.amount === null)` -- checked here so no v2 writer can ever
+// persist a document where the two disagree, independent of whatever the
+// rules layer separately enforces (plan-run-model.js's own validator is the
+// pure-function authority this feature's Firestore-facing code calls before
+// any write; the rules layer is a second, independent enforcement surface,
+// never the only one).
+function planRunProgressionStateDocValidV2(v) {
+  if (!planRunExactKeys(v, PLAN_RUN_STATE_KEYS_V2)) return false;
+  if (!planRunIsId(v.ownerUid) || !planRunIsId(v.planRunId) || !planRunIsId(v.planTemplateId)) return false;
+  if (!planRunIsId(v.headRevisionId) || !planRunIsId(v.planAssignmentId) || !planRunIsId(v.planRuleId)) return false;
+  if (!planRunIsId(v.ruleRevisionId) || !planRunIsId(v.exerciseId)) return false;
+  if (!planRunCurrentValueValid(v.currentValue)) return false;
+  if (!['active', 'needsManualReview'].includes(v.status)) return false;
+  if (v.status === 'active' && v.needsManualReviewReason !== null) return false;
+  if (v.status === 'needsManualReview' && !PLAN_RUN_REVIEW_REASONS.includes(v.needsManualReviewReason)) return false;
+  if (!PLAN_RUN_VALUE_INITIALIZATION_SOURCES.includes(v.initializationSource)) return false;
+  if (!planRunIsNullableId(v.lastProcessedWorkoutId)) return false;
+  if (!planRunIsNullableTimestamp(v.lastEvaluatedAt)) return false;
+  if (v.schemaVersion !== 2) return false;
+  if (!planRunIsTimestamp(v.createdAt) || !planRunIsTimestamp(v.updatedAt)) return false;
+  if (!planRunIsNullableId(v.lastEstablishOperationId)) return false;
+  if (typeof v.isCurrentValueUnresolved !== 'boolean') return false;
+  if (v.isCurrentValueUnresolved !== (v.currentValue.amount === null)) return false;
+  return true;
+}
+
+// Version-dispatching shape check: a document is a legal
+// `planProgramRunProgressionState` document if it satisfies EITHER the
+// unedited v1 validator or the new v2 validator above -- never a third,
+// merged shape. Used wherever existing code (Finish's own structural-
+// boundary check, firebase-plan-run.js) previously called the v1 validator
+// alone and must now accept either version's documents, since a single
+// occurrence's enabled Rules can legitimately be a mix of pre-existing v1
+// Rules and newly-created v2 Rules (a live Run from the brief
+// production-enabled window, Round 4 SS0, could in principle still be
+// active when this feature is ever turned on).
+function planRunProgressionStateDocValidAnyVersion(v) {
+  return planRunProgressionStateDocValid(v) || planRunProgressionStateDocValidV2(v);
+}
+
+// OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2/SS8.3 (unchanged
+// through Round 6): one new `outcome` member, `'established'`, for a
+// schema-version-2 workingLoad Rule that was unresolved at the start of a
+// Finish and became resolved during it (firebase-plan-run.js's per-Rule
+// loop). Carries no `decision` (it was never evaluated pass/fail -- it
+// received its first baseline value) and no `reviewReason` (it is not a
+// review case), mirroring the existing 'reviewed' branch's own "the field
+// that doesn't apply here is null" shape. There is deliberately NO third
+// outcome member for "still unresolved" -- per spec SS7's table, a Rule
+// that remains unresolved after a Finish has NOTHING recorded here at all
+// (no document is written), so no enum member is needed for it.
 function planRunApplicationDocValid(v) {
   if (!planRunExactKeys(v, PLAN_RUN_APPLICATION_KEYS)) return false;
   if (!planRunIsId(v.ownerUid) || !planRunIsId(v.planRunId) || !planRunIsId(v.planRuleId) || !planRunIsId(v.workoutId)) return false;
-  if (!['applied', 'reviewed'].includes(v.outcome)) return false;
+  if (!['applied', 'reviewed', 'established'].includes(v.outcome)) return false;
   if (v.outcome === 'applied') {
     if (!['passed', 'failed'].includes(v.decision)) return false;
     if (v.reviewReason !== null) return false;
-  } else {
+  } else if (v.outcome === 'reviewed') {
     if (v.decision !== null) return false;
     if (!PLAN_RUN_REVIEW_REASONS.includes(v.reviewReason)) return false;
+  } else {
+    // 'established'
+    if (v.decision !== null || v.reviewReason !== null) return false;
   }
   if (!planRunIsTimestamp(v.recordedAt)) return false;
   return true;
@@ -418,16 +530,83 @@ function planRunOperationResultRefsValid(operationType, refs) {
     return planRunExactKeys(refs, ['planRunId']) && planRunIsId(refs.planRunId);
   }
   if (operationType === 'runFinish') {
-    if (!planRunExactKeys(refs, ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds'])) return false;
+    // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2 (unchanged
+    // through Round 6): widened from the original two-bucket shape to the
+    // four-bucket partition -- appliedRuleIds/needsManualReviewRuleIds
+    // (unchanged meaning) plus establishedRuleIds/stillUnresolvedRuleIds
+    // (new). Every expected Rule id appears in EXACTLY one of the four
+    // arrays; no Rule id appears in more than one (checked below via one
+    // combined duplicate check across all four, generalizing the prior
+    // two-array check).
+    //
+    // ROUND 10 CORRECTION (emulator-correction finding 2) -- this is a
+    // READ-CLASSIFICATION function only. It is called exclusively at the
+    // five receiptSnap.exists/receiptValid call sites in
+    // firebase-plan-run.js (lines 293, 719, 1320, 1593, 1695, 1839 at the
+    // time of this correction) to decide whether an ALREADY-STORED receipt
+    // document is well-formed -- never to gate a new write. The one and
+    // only authoritative gate for what a NEW runFinish receipt may contain
+    // is the Firestore rules file's own planRunOperationResultRefsValid
+    // (unchanged by this correction, still requiring exactly the current
+    // seven-key shape for every create). Widening THIS function's read-side
+    // tolerance therefore cannot be used to smuggle an ambiguous or
+    // legacy-shaped document through the real write path -- the rules
+    // still reject that at the server, unconditionally, regardless of what
+    // this function now also accepts for classifying an existing document.
+    //
+    // Two EXPLICIT, mutually exclusive branches (per the correction's own
+    // "prefer separate validators or explicit legacy/current branches"
+    // guidance), not one widened/blended check -- so a document must match
+    // one contract or the other EXACTLY, never some mixture of the two:
+    //
+    //   CURRENT (seven keys) -- every receipt this application has ever
+    //   been able to WRITE since the four-bucket partition was introduced.
+    //
+    //   LEGACY (five keys) -- the original two-bucket shape this
+    //   application wrote before the four-bucket partition existed. No
+    //   deployment of any rules version that could accept this shape has
+    //   ever occurred (CANONICAL_PLAN_RUN_CAPABILITY_ENABLED has been
+    //   hardcoded false throughout this engagement, and
+    //   program-run-deployment-and-rollback-procedure-PROPOSED.md records
+    //   that no rules deployment has ever been executed) -- so no REAL
+    //   stored receipt in this shape exists today. This branch exists so
+    //   that IF this feature is deployed and later receives a genuine
+    //   legacy receipt from before this widening, reading it back does not
+    //   misclassify it as corrupted (receiptMalformed) merely because the
+    //   two new buckets did not exist when it was written -- not because
+    //   any such receipt has been proven to exist.
+    var finishCurrentKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds'];
+    var finishLegacyKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds'];
+    var isCurrentShape = planRunExactKeys(refs, finishCurrentKeys);
+    var isLegacyShape = !isCurrentShape && planRunExactKeys(refs, finishLegacyKeys);
+    if (!isCurrentShape && !isLegacyShape) return false;
     if (!planRunIsId(refs.workoutId) || !planRunIsId(refs.occurrenceId) || !planRunIsId(refs.planRunId)) return false;
-    if (!Array.isArray(refs.appliedRuleIds) || !refs.appliedRuleIds.every(planRunIsId)) return false;
-    if (!Array.isArray(refs.needsManualReviewRuleIds) || !refs.needsManualReviewRuleIds.every(planRunIsId)) return false;
-    if (planRunArrayHasDuplicates(refs.appliedRuleIds.concat(refs.needsManualReviewRuleIds))) return false;
+    var finishBuckets = isCurrentShape
+      ? ['appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds']
+      : ['appliedRuleIds', 'needsManualReviewRuleIds'];
+    var allFinishIds = [];
+    for (var fb = 0; fb < finishBuckets.length; fb++) {
+      var arr = refs[finishBuckets[fb]];
+      if (!Array.isArray(arr) || !arr.every(planRunIsId)) return false;
+      allFinishIds = allFinishIds.concat(arr);
+    }
+    if (planRunArrayHasDuplicates(allFinishIds)) return false;
     return true;
   }
   if (operationType === 'runEnd') {
     return planRunExactKeys(refs, ['planRunId', 'skippedOccurrenceIds']) && planRunIsId(refs.planRunId) &&
       Array.isArray(refs.skippedOccurrenceIds) && refs.skippedOccurrenceIds.every(planRunIsId);
+  }
+  // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS5.10/SS5.4 (unchanged
+  // through Round 6): the explicit training-max establishment operation's
+  // own, narrower resultRefs shape -- a single-subject receipt (one Rule,
+  // one value), unrelated to Finish's per-occurrence fan-out shape above.
+  if (operationType === 'runProgressionEstablishTrainingMax') {
+    if (!planRunExactKeys(refs, ['planRunId', 'planRuleId', 'amount', 'unit'])) return false;
+    if (!planRunIsId(refs.planRunId) || !planRunIsId(refs.planRuleId)) return false;
+    if (typeof refs.amount !== 'number' || !Number.isFinite(refs.amount)) return false;
+    if (!PLAN_RUN_VALUE_UNITS.includes(refs.unit)) return false;
+    return true;
   }
   return false;
 }
@@ -753,6 +932,67 @@ function planRunDecodePageCursor(cursor, ownerUid) {
   if (!Number.isInteger(payload.startedAtNanoseconds) || payload.startedAtNanoseconds < 0 || payload.startedAtNanoseconds > 999999999) return { invalid: true };
   if (!planRunIsId(payload.planRunId)) return { invalid: true };
   return { startedAtSeconds: payload.startedAtSeconds, startedAtNanoseconds: payload.startedAtNanoseconds, planRunId: payload.planRunId };
+}
+
+// -----------------------------------------------------------------------------
+// OPTIONAL PROGRESSION STARTING VALUES spec Round 4 SS5.3, cursor shape
+// corrected Round 5 SS1.2 (document ID replaces planRuleId as the tiebreak),
+// Round 6 SS5/SS7.2 (best-effort/non-snapshot pagination contract; no
+// mechanical change to the codec itself). A sibling of
+// `planRunEncodePageCursor`/`planRunDecodePageCursor` immediately above --
+// SAME dependency-free UTF-8/base64 codec, SAME versioned/owner-bound/
+// pre-I/O-validated discipline -- but its OWN cursor shape
+// ({createdAtSeconds, createdAtNanoseconds, documentId}), because this is a
+// different query over the SAME collection with different order fields
+// (`createdAt` then the document's own ID, per Round 5 SS1.2 -- never
+// `planRuleId`, which Round 5 SS1.1 proved is not globally unique across a
+// single owner's Runs). This is a genuinely separate codec, not the
+// existing one reused for an unrelated shape.
+// -----------------------------------------------------------------------------
+var PLAN_RUN_UNRESOLVED_TM_CURSOR_VERSION = 1;
+var PLAN_RUN_UNRESOLVED_TM_CURSOR_KEYS = Object.freeze(['v', 'ownerUid', 'createdAtSeconds', 'createdAtNanoseconds', 'documentId']);
+
+// `fields`: {ownerUid, createdAtTimestamp: {seconds, nanoseconds}, documentId}
+// -- `createdAtTimestamp` must be read directly off the progression-state
+// document's own `createdAt` field. Never throws (mirrors
+// `planRunEncodePageCursor`'s own contract).
+function planRunEncodeUnresolvedTrainingMaxCursor(fields) {
+  var f = fields || {};
+  var t = f.createdAtTimestamp || {};
+  var payload = {
+    v: PLAN_RUN_UNRESOLVED_TM_CURSOR_VERSION,
+    ownerUid: f.ownerUid,
+    createdAtSeconds: t.seconds,
+    createdAtNanoseconds: t.nanoseconds,
+    documentId: f.documentId
+  };
+  return planRunBase64EncodeBytes(planRunUtf8EncodeToBytes(JSON.stringify(payload)));
+}
+
+// Returns {createdAtSeconds, createdAtNanoseconds, documentId} on a
+// well-formed, version-1, owner-matching cursor, or {invalid: true} --
+// **never throws** -- mirroring `planRunDecodePageCursor`'s own exhaustive
+// rejection discipline (decode/parse failure; wrong key set; wrong version;
+// foreign/malformed owner; out-of-range seconds/nanoseconds; malformed
+// documentId -- a document's real Firestore ID is checked with the same
+// `planRunIsId` grammar this file already applies to every other
+// identifier, since a document ID is itself just a path-segment string).
+function planRunDecodeUnresolvedTrainingMaxCursor(cursor, ownerUid) {
+  var payload;
+  try {
+    var bytes = planRunBase64DecodeToBytes(String(cursor));
+    if (bytes === null) return { invalid: true };
+    payload = JSON.parse(planRunUtf8DecodeFromBytes(bytes));
+  } catch (e) {
+    return { invalid: true };
+  }
+  if (!planRunExactKeys(payload, PLAN_RUN_UNRESOLVED_TM_CURSOR_KEYS)) return { invalid: true };
+  if (payload.v !== PLAN_RUN_UNRESOLVED_TM_CURSOR_VERSION) return { invalid: true };
+  if (!planRunIsId(payload.ownerUid) || payload.ownerUid !== ownerUid) return { invalid: true };
+  if (!Number.isInteger(payload.createdAtSeconds) || payload.createdAtSeconds < 0) return { invalid: true };
+  if (!Number.isInteger(payload.createdAtNanoseconds) || payload.createdAtNanoseconds < 0 || payload.createdAtNanoseconds > 999999999) return { invalid: true };
+  if (!planRunIsId(payload.documentId)) return { invalid: true };
+  return { createdAtSeconds: payload.createdAtSeconds, createdAtNanoseconds: payload.createdAtNanoseconds, documentId: payload.documentId };
 }
 
 // =============================================================================
@@ -1194,20 +1434,97 @@ function planRunFinishStructuralBoundaryOk(p) {
 //     'identicalButUncorroborated', via the shared workout discriminator)
 function planRunClassifyFinishOccurrence(p) {
   var expected = p.expectedRuleIds;
-  function perRuleFullyValid(map, key) {
+  // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2/SS7, mechanics
+  // completed this implementation round (not fully specified by any prior
+  // specification round -- disclosed in the implementation report as a
+  // genuine design completion, not a reinterpretation of anything already
+  // decided): a schema-version-2 Rule that remains unresolved after a
+  // Finish gets ZERO application record (spec SS7's table: "nothing to
+  // record"), so it can never satisfy the ORIGINAL per-Rule record check
+  // below. `p.perRuleStillUnresolved` (supplied by the caller,
+  // firebase-plan-run.js, from the SAME already-read/validated progression-
+  // state documents used everywhere else in this reconciliation) is `true`
+  // for a Rule id whose CURRENT, already-validated state is schema-version-2
+  // and still unresolved (`currentValue.amount === null`). Because the v2
+  // update rules enforce a one-way unresolved -> resolved transition with no
+  // reverse path (Round 4 SS3.4), a Rule that is STILL unresolved right now
+  // was necessarily unresolved at every earlier point too -- so "currently
+  // still unresolved" is sound, sufficient evidence that this Finish (and
+  // every Finish before it) legitimately produced no write for it, without
+  // needing a per-attempt record to prove it. A Rule id with neither a valid
+  // record NOR a confirmed-still-unresolved state is a genuine integrity gap,
+  // exactly as before this addition.
+  function perRuleStillUnresolved(key) {
+    return !!(p.perRuleStillUnresolved && p.perRuleStillUnresolved[key]);
+  }
+  // CORRECTION (this implementation round, pre-delivery self-check): the
+  // first-drafted version of this function was a single, widened
+  // `perRuleFullyValid` reused by EVERY call site below -- but those call
+  // sites ask two genuinely different questions, and conflating them
+  // produced a real false-positive integrity conflict on the very first
+  // Finish attempt for any Rule that happens to be unresolved:
+  //   - branches (a)/(b)/(c) below ask "is the OCCURRENCE, which is already
+  //     completed (occurrenceStatus === 'completed'), fully and consistently
+  //     accounted for" -- reached only after SOME Finish has already run,
+  //     so "no record, but currently/necessarily-always unresolved" is
+  //     exactly the right, sound evidence of a legitimate stillUnresolved
+  //     outcome (the widened reasoning in the block comment above).
+  //   - branch (h) below asks a DIFFERENT question: "has this Rule's record
+  //     already been written for this occurrence, while the occurrence is
+  //     NOT YET completed" -- a reachability/corruption sanity check on a
+  //     genuinely fresh, never-yet-finished occurrence. On a Rule's very
+  //     FIRST Finish attempt ever, "no record" and "currently unresolved"
+  //     are BOTH trivially true -- not because anything was already
+  //     accounted for, but because nothing has happened yet. Reusing the
+  //     widened check here made branch (h) read that as "already
+  //     accounted for" and incorrectly refuse the first-ever attempt with
+  //     `ruleRecordExistsForUnfinishedOccurrence`.
+  // Fixed by keeping the ORIGINAL, strict, unwidened record check
+  // (`perRuleHasValidRecordStrict`) for branch (h)'s own reachability use
+  // -- its question ("does a record already exist") is correctly answered
+  // by record-existence alone, exactly as before this round -- and using
+  // the widened version (`perRuleFullyValid`/`everyExpectedHasValidRecord`)
+  // ONLY where the question genuinely is "is this Rule fully and
+  // consistently accounted for" (branches a/b/c, all gated on
+  // occurrenceStatus === 'completed').
+  function perRuleHasValidRecordStrict(map, key) {
     var r = map && map[key];
     return !!(r && r.exists && r.valid && r.identityOk);
+  }
+  function perRuleFullyValid(map, key) {
+    if (perRuleHasValidRecordStrict(map, key)) return true;
+    var r = map && map[key];
+    // A record genuinely absent (never written) is the expected, legitimate
+    // shape for a still-unresolved Rule -- never when a record exists but
+    // failed shape/identity validation, which remains a hard failure.
+    return (!r || !r.exists) && perRuleStillUnresolved(key);
   }
   function everyExpectedHasValidRecord(map) {
     for (var i = 0; i < expected.length; i++) if (!perRuleFullyValid(map, expected[i])) return false;
     return true;
   }
+  // Returns one of 'applied' | 'reviewed' | 'established' | 'stillUnresolved'
+  // for an expected Rule id already confirmed accounted-for by
+  // `perRuleFullyValid` above -- never called otherwise.
+  function ruleOutcomeBucket(map, key) {
+    var r = map && map[key];
+    if (r && r.exists) return r.outcome; // 'applied' | 'reviewed' | 'established'
+    return 'stillUnresolved';
+  }
   function reconstructResultRefs(map, workoutId) {
-    var applied = [], reviewed = [];
+    var applied = [], reviewed = [], established = [], stillUnresolved = [];
     expected.forEach(function (rid) {
-      if (map[rid].outcome === 'applied') applied.push(rid); else reviewed.push(rid);
+      var bucket = ruleOutcomeBucket(map, rid);
+      if (bucket === 'applied') applied.push(rid);
+      else if (bucket === 'reviewed') reviewed.push(rid);
+      else if (bucket === 'established') established.push(rid);
+      else stillUnresolved.push(rid);
     });
-    return { workoutId: workoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId, appliedRuleIds: applied, needsManualReviewRuleIds: reviewed };
+    return {
+      workoutId: workoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId,
+      appliedRuleIds: applied, needsManualReviewRuleIds: reviewed,
+      establishedRuleIds: established, stillUnresolvedRuleIds: stillUnresolved
+    };
   }
   // FOUNDATION SLICE ADDITION (spec §3A.6.9.2/§3A.6.9.3) -- the slot
   // conjunct on branches (a)/(b)/(c) below. `terminalSlotOk`/`activeSlotOk`
@@ -1261,12 +1578,33 @@ function planRunClassifyFinishOccurrence(p) {
       !p.occurrenceInRemaining && everyExpectedHasValidRecord(p.perRuleAtRequested);
     var okA = okANonSlot && terminalSlotOk && activeSlotOk;
     if (okA) {
-      var actualApplied = expected.filter(function (rid) { return p.perRuleAtRequested[rid].outcome === 'applied'; }).sort();
-      var actualReviewed = expected.filter(function (rid) { return p.perRuleAtRequested[rid].outcome === 'reviewed'; }).sort();
+      // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2 (unchanged
+      // through Round 6): the receipt-reconciliation comparison widens from
+      // two buckets to all four -- 'established'/'stillUnresolved' are
+      // reconciled exactly like 'applied'/'reviewed' always were, via the
+      // same actual-vs-claimed sorted-array comparison, generalized rather
+      // than duplicated.
+      var actualRefs = reconstructResultRefs(p.perRuleAtRequested, p.requestedWorkoutId);
+      var actualApplied = actualRefs.appliedRuleIds.slice().sort();
+      var actualReviewed = actualRefs.needsManualReviewRuleIds.slice().sort();
+      var actualEstablished = actualRefs.establishedRuleIds.slice().sort();
+      var actualStillUnresolved = actualRefs.stillUnresolvedRuleIds.slice().sort();
       var claimedApplied = (p.receipt.appliedRuleIds || []).slice().sort();
       var claimedReviewed = (p.receipt.needsManualReviewRuleIds || []).slice().sort();
-      if (JSON.stringify(actualApplied) === JSON.stringify(claimedApplied) && JSON.stringify(actualReviewed) === JSON.stringify(claimedReviewed)) {
-        return { branch: 'a', outcome: 'alreadyCommitted', packageHashVerified: !!p.haveFullPackage, resultRefs: { workoutId: p.requestedWorkoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId, appliedRuleIds: claimedApplied, needsManualReviewRuleIds: claimedReviewed } };
+      var claimedEstablished = (p.receipt.establishedRuleIds || []).slice().sort();
+      var claimedStillUnresolved = (p.receipt.stillUnresolvedRuleIds || []).slice().sort();
+      if (JSON.stringify(actualApplied) === JSON.stringify(claimedApplied) &&
+          JSON.stringify(actualReviewed) === JSON.stringify(claimedReviewed) &&
+          JSON.stringify(actualEstablished) === JSON.stringify(claimedEstablished) &&
+          JSON.stringify(actualStillUnresolved) === JSON.stringify(claimedStillUnresolved)) {
+        return {
+          branch: 'a', outcome: 'alreadyCommitted', packageHashVerified: !!p.haveFullPackage,
+          resultRefs: {
+            workoutId: p.requestedWorkoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId,
+            appliedRuleIds: claimedApplied, needsManualReviewRuleIds: claimedReviewed,
+            establishedRuleIds: claimedEstablished, stillUnresolvedRuleIds: claimedStillUnresolved
+          }
+        };
       }
     }
     return { branch: 'a', outcome: 'integrityConflict', reason: slotFailureReason(okANonSlot, 'receiptEvidenceMismatch') };
@@ -1307,7 +1645,7 @@ function planRunClassifyFinishOccurrence(p) {
   if (p.occurrenceStatus === 'pending' || p.occurrenceStatus === 'inProgress') {
     if (p.occurrenceWorkoutId !== null) return { branch: 'g', outcome: 'integrityConflict', reason: 'unfinishedWithNonNullWorkoutId' };
     if (p.occurrenceInRemaining) {
-      var reachabilityOk = expected.every(function (rid) { return !perRuleFullyValid(p.perRuleAtRequested, rid); });
+      var reachabilityOk = expected.every(function (rid) { return !perRuleHasValidRecordStrict(p.perRuleAtRequested, rid); });
       if (!reachabilityOk) return { branch: 'h', outcome: 'integrityConflict', reason: 'ruleRecordExistsForUnfinishedOccurrence' };
       // FOUNDATION SLICE ADDITION (spec §3A.6.10.4) -- Finish collision
       // protection. Reaching branch (h) at all means the occurrence, Run,
@@ -1600,8 +1938,23 @@ function planRunValidateStartPackage(pkg) {
     var v = pkg.progressionInitialValues[j];
     if (!planRunExactKeys(v, PLAN_RUN_PROGRESSION_INITIAL_KEYS)) return { ok: false, reason: 'malformedProgressionInitialValues' };
     if (!planRunIsId(v.planRuleId) || !planRunIsId(v.planAssignmentId) || !planRunIsId(v.ruleRevisionId) || !planRunIsId(v.exerciseId)) return { ok: false, reason: 'malformedProgressionInitialValues' };
-    if (!PLAN_RUN_VALUE_KINDS.includes(v.kind) || typeof v.amount !== 'number' || !Number.isFinite(v.amount) || !PLAN_RUN_VALUE_UNITS.includes(v.unit)) return { ok: false, reason: 'malformedProgressionInitialValues' };
-    if (!['manual', 'confirmedFromSuggestion'].includes(v.initializationSource)) return { ok: false, reason: 'malformedProgressionInitialValues' };
+    if (!PLAN_RUN_VALUE_KINDS.includes(v.kind)) return { ok: false, reason: 'malformedProgressionInitialValues' };
+    // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS1/SS2 (unchanged
+    // through Round 6): every enabled Rule, of EITHER kind, may be left
+    // blank at Start. The 1:1 count-match invariant immediately below is
+    // UNCHANGED -- blank is a real, persisted, paired-null ENTRY, never an
+    // omission the server has to guess about. No carve-out by `kind`: the
+    // prior, Round-1-era restriction limiting this to `workingLoad` only
+    // was explicitly overturned.
+    var vBothNull = v.amount === null && v.unit === null;
+    var vBothReal = typeof v.amount === 'number' && Number.isFinite(v.amount) && PLAN_RUN_VALUE_UNITS.includes(v.unit);
+    if (!vBothNull && !vBothReal) return { ok: false, reason: 'malformedProgressionInitialValues' };
+    // `initializationSource` for a paired-null entry must be the literal
+    // 'deferred'; for a resolved entry it is 'manual'/'confirmedFromSuggestion'
+    // as before -- never the other way around, so a blank entry can never be
+    // mislabeled as if a value were actually supplied, and vice versa.
+    var sourceOk = vBothNull ? v.initializationSource === 'deferred' : ['manual', 'confirmedFromSuggestion'].includes(v.initializationSource);
+    if (!sourceOk) return { ok: false, reason: 'malformedProgressionInitialValues' };
     if (Object.prototype.hasOwnProperty.call(providedRuleIds, v.planRuleId)) return { ok: false, reason: 'duplicateProgressionInitialValue' };
     providedRuleIds[v.planRuleId] = true;
   }
@@ -1629,6 +1982,169 @@ function planRunValidateEndPackage(pkg) {
   if (!planRunExactKeys(pkg, ['operationId', 'ownerUid', 'planRunId'])) return { ok: false, reason: 'malformedPackageShape' };
   if (!planRunIsId(pkg.operationId) || !planRunIsId(pkg.ownerUid) || !planRunIsId(pkg.planRunId)) return { ok: false, reason: 'malformedPackageShape' };
   return { ok: true };
+}
+
+// =============================================================================
+// OPTIONAL PROGRESSION STARTING VALUES -- explicit training-max
+// establishment (spec Round 2 SS5, corrected Round 3 SS5/Round 4 SS6).
+// =============================================================================
+// CORRECTION (this implementation round, pre-wiring self-check): every
+// other package validator in this file (planRunValidateEndPackage,
+// planRunValidateBeginEndPackage, planRunValidateCancelEndPackage) includes
+// `ownerUid` as part of its own exact-key package shape, matching every
+// fsPlanRun<Verb> caller's own `if (pkg.ownerUid !== deps.currentUid())`
+// pattern -- which assumes `pkg.ownerUid` is itself a real, validated field
+// of the package, not an extra key the exact-keys check would otherwise
+// reject. The first-drafted version of this key list omitted `ownerUid`,
+// which would have made every real call site's package shape fail this
+// validator's own exact-keys check. Corrected here, before any firebase-
+// plan-run.js wiring is written against it.
+var PLAN_RUN_TRAINING_MAX_ESTABLISH_KEYS = Object.freeze(['operationId', 'ownerUid', 'planRunId', 'planRuleId', 'planAssignmentId', 'ruleRevisionId', 'exerciseId', 'kind', 'amount', 'unit']);
+
+// `kind` must be the literal 'trainingMax' -- a package claiming to
+// establish a workingLoad Rule through this operation is rejected here,
+// before any precondition inside the transaction is ever reached (spec
+// SS5.2: "This operation never touches a working-load Rule, by
+// construction, not by convention").
+function planRunValidateTrainingMaxEstablishPackage(pkg) {
+  if (!planRunExactKeys(pkg, PLAN_RUN_TRAINING_MAX_ESTABLISH_KEYS)) return { ok: false, reason: 'malformedPackageShape' };
+  var idFields = ['operationId', 'ownerUid', 'planRunId', 'planRuleId', 'planAssignmentId', 'ruleRevisionId', 'exerciseId'];
+  for (var i = 0; i < idFields.length; i++) if (!planRunIsId(pkg[idFields[i]])) return { ok: false, reason: 'malformedPackageShape' };
+  if (pkg.kind !== 'trainingMax') return { ok: false, reason: 'wrongKind' };
+  if (typeof pkg.amount !== 'number' || !Number.isFinite(pkg.amount)) return { ok: false, reason: 'malformedAmount' };
+  if (!PLAN_RUN_VALUE_UNITS.includes(pkg.unit)) return { ok: false, reason: 'malformedUnit' };
+  return { ok: true };
+}
+
+// Minimal, exact-required-field input validator for the read-only status
+// check, mirroring planRunValidateCheckEndStatusInput's own "identity fields
+// only" spirit (Section 6C above) -- spec Round 2 SS5.8.
+function planRunValidateCheckTrainingMaxEstablishStatusInput(input) {
+  if (!planRunIsPlainObject(input)) return { ok: false, reason: 'malformedInputShape' };
+  if (!planRunIsId(input.operationId) || !planRunIsId(input.ownerUid) || !planRunIsId(input.planRunId) || !planRunIsId(input.planRuleId)) {
+    return { ok: false, reason: 'malformedInputShape' };
+  }
+  return { ok: true };
+}
+
+// Preconditions + retry classification, spec Round 2 SS5.5/SS5.7, corrected
+// Round 3 SS5.5/SS5.7 (the Run-status/new-vs-retry split), Round 4 SS6.1
+// (the schema-version-2-only precondition), and Round 7 (ended-Run
+// correction, see the runStatus branch below) -- a new genuine attempt is
+// permitted while the Run is 'active' OR 'ended'. A pure decision function over
+// already-read flags, mirroring every other Classify* function's own shape
+// in this file. The caller is responsible for the operationId/receipt
+// corroboration step itself (via the EXISTING, reused
+// `planRunClassifyOperationReceiptGuard` -- spec SS5.1's own explicit
+// instruction to reuse Start/End's single-subject receipt pattern, not a
+// new one -- passed in here as `receiptGuardResult`, with the subject
+// comparison keyed on the COMBINED planRunId+planRuleId pair, since this
+// operation's real subject is one Rule within one Run, not the whole Run).
+// `p`:
+//   { stateExists, stateValid, stateIdentityOk,
+//     stateSchemaVersion, stateKindIsTrainingMax, stateStatus,
+//     stateCurrentlyUnresolved, resolvedAmount, resolvedUnit,
+//     requestedAmount, requestedUnit,
+//     receiptGuardResult: result of planRunClassifyOperationReceiptGuard,
+//     runStatus (only meaningful/read when the guard result is 'absent') }
+function planRunClassifyTrainingMaxEstablishRequest(p) {
+  if (!p.stateExists) return { outcome: 'requiredDocumentMissing', reason: 'stateMissing' };
+  if (!p.stateValid || !p.stateIdentityOk) return { outcome: 'documentMalformed', reason: !p.stateValid ? 'stateMalformed' : 'stateForeign' };
+  if (p.stateSchemaVersion !== 2) return { outcome: 'rejected', reason: 'legacySchemaNotEligible' };
+  if (!p.stateKindIsTrainingMax) return { outcome: 'rejected', reason: 'wrongKind' };
+  if (p.stateStatus === 'needsManualReview') return { outcome: 'rejected', reason: 'ruleNeedsManualReview' };
+
+  var guard = p.receiptGuardResult;
+  if (guard.result === 'integrityConflict') return { outcome: 'integrityConflict', reason: guard.reason };
+  if (guard.result === 'recognizedMatchingPackage') return { outcome: 'alreadyEstablished', reason: null };
+  if (guard.result === 'recognizedIdentityOnly') return { outcome: 'recognizedIdentityOnly', reason: null };
+  // guard.result === 'absent' -- no receipt exists yet for this operationId.
+  // Either a genuinely new attempt, or this exact state was already
+  // resolved by a DIFFERENT operationId (spec Round 2 SS5.7's two new
+  // rows).
+  if (!p.stateCurrentlyUnresolved) {
+    if (p.resolvedAmount === p.requestedAmount && p.resolvedUnit === p.requestedUnit) {
+      return { outcome: 'alreadyEstablishedMatchingValue', reason: null };
+    }
+    return { outcome: 'rejected', reason: 'alreadyEstablishedDifferingValue' };
+  }
+  // Still unresolved, no receipt yet for this operationId -- a genuine new
+  // attempt. This is the ONLY branch that ever consults runStatus.
+  //
+  // ROUND 7 CORRECTION (ended-Run training-max establishment): Round 3 SS5.5
+  // originally locked initiation to an active Run only, producing an honest
+  // but PERMANENT dead end for a Rule left unresolved on a Run that later
+  // ends -- directly contradicting this feature's own accepted design.
+  // Round 7 widened this branch to accept 'active' and 'ended'.
+  //
+  // ROUND 8 CORRECTION (naturally-completed-Run training-max establishment,
+  // independent-review finding): Round 7's own two-status allow-list left
+  // the identical defect shape intact for the ORDINARY completion path --
+  // `PLAN_RUN_STATUSES` has three recognized values
+  // (`['active', 'complete', 'ended']`), and Round 7 never named 'complete'
+  // (the status Finish itself writes, firebase-plan-run.js, when the last
+  // occurrence finishes naturally -- see `runBecomesComplete`), so a Rule
+  // left unresolved on a Run that completes normally -- never ended early --
+  // was still rejected forever with 'runNoLongerActive'. The accepted
+  // product requirement (restated by this round's own controlling
+  // instruction) is that an unresolved training max remains manually
+  // resolvable regardless of which of the three canonical terminal/non-
+  // terminal states the verified owning Run is actually in: active,
+  // complete, or ended. This correction widens the SAME one branch a third
+  // time to accept all three recognized PLAN_RUN_STATUSES values. Any value
+  // OUTSIDE that recognized vocabulary still falls through to the identical
+  // 'rejected'/'runNoLongerActive' outcome as before -- but that remaining
+  // fallthrough is now PURELY DEFENSIVE: every real caller
+  // (`fsPlanRunEstablishTrainingMax`, firebase-plan-run.js) already runs the
+  // real Run document through `planRunDocValid` -- itself unchanged, still
+  // requiring `PLAN_RUN_STATUSES.includes(v.status)` -- before this function
+  // is ever invoked, and a malformed/unrecognized status is rejected there
+  // instead, as `documentMalformed`/`runMalformed`, without this function
+  // ever seeing it. Because this function's own allow-list now covers every
+  // value `planRunDocValid` can ever let through, the
+  // 'rejected'/'runNoLongerActive' outcome can no longer be produced by ANY
+  // genuine new attempt through the real call path -- it exists here only as
+  // a defensive fallthrough for a value outside the recognized vocabulary,
+  // reachable only by calling this pure function directly (as this file's
+  // own unit tests still do, deliberately, to prove the fallthrough itself
+  // behaves safely).
+  //
+  // 'complete' is a genuinely TERMINAL status in the real lifecycle --
+  // `planRunClassifyEndRequest` (this file, above) explicitly rejects ending
+  // an already-complete Run with `rejectedTerminalComplete`, so no
+  // complete->ended transition is invented or assumed anywhere by this
+  // correction; the real code already forecloses it. Training-max
+  // establishment itself never reads or writes the Run document at all (it
+  // only ever READS the Run document's own `status` field, passed in as
+  // `runStatus`, to decide eligibility) -- it cannot create, race, or
+  // interact with that Finish-owned complete-transition write in any way.
+  // No other branch in this function, no other function in this file, and
+  // neither candidate Firestore-rules copy reads or depends on runStatus at
+  // all (confirmed by direct trace both rounds, see the Round 7 and Round 8
+  // correction reports) -- this one line, now naming all three canonical
+  // statuses, remains the complete, narrowest possible fix.
+  if (p.runStatus !== 'active' && p.runStatus !== 'complete' && p.runStatus !== 'ended') return { outcome: 'rejected', reason: 'runNoLongerActive' };
+  return { outcome: 'proceed', reason: null };
+}
+
+// Pure working-load evidence selection, spec Round 3 SS4.1/SS4.3 (the
+// deterministic rule replacing Round 1's fictional gateway-weight rule;
+// Round 2 SS4.4's option B, maximum qualifying weight, locked Round 3 SS1).
+// `workout` is an already-validated `planRunWorkoutDocValid` document;
+// `assignment` is the enabled Rule's own occurrence-snapshot assignment
+// object (`planAssignmentId` is the only field this function reads from
+// it). Returns `{ qualifies: true, amount }` or `{ qualifies: false }` --
+// never throws, never guesses when identity is ambiguous (spec SS4.3 step
+// 2: zero or two-or-more matching `exercises[]` entries both mean "not
+// qualifying", exactly alike).
+function planRunSelectQualifyingWorkingLoadWeight(workout, assignment) {
+  var matches = workout.exercises.filter(function (ex) { return ex.planAssignmentId === assignment.planAssignmentId; });
+  if (matches.length !== 1) return { qualifies: false };
+  var qualifyingWeights = matches[0].sets
+    .filter(function (st) { return st.completed === true && typeof st.weight === 'number' && Number.isFinite(st.weight); })
+    .map(function (st) { return st.weight; });
+  if (qualifyingWeights.length === 0) return { qualifies: false };
+  return { qualifies: true, amount: Math.max.apply(null, qualifyingWeights) };
 }
 
 // ROUND 13 IMPLEMENTATION ADDITION -- Begin's own package
@@ -1743,7 +2259,19 @@ var PLAN_RUN_SAFETY_CAPS = Object.freeze({
   // field here (up to `maxEnabledRulesPerOccurrence` id strings each, at
   // most 200 bytes per id per `planRunIsId`), comfortably inside this cap.
   maxProgressionStateDocumentBytes: 16 * 1024,
-  maxGenericDocumentBytes: 64 * 1024
+  maxGenericDocumentBytes: 64 * 1024,
+  // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS5.9 (unchanged
+  // through Round 6): the explicit training-max establishment operation's
+  // own budget -- up to 3 reads (progressionState, this operation's own
+  // receipt, the Run document -- the last one only for a genuine new
+  // attempt, spec Round 3 SS5.3), exactly 2 writes (progressionState
+  // update, receipt create -- no third write, since Round 4 SS6.2 removed
+  // the pending-discovery-collection delete this operation would otherwise
+  // have needed). Both caps carry headroom above actual usage, matching
+  // this file's own established margin philosophy for every other
+  // operation's caps.
+  maxTrainingMaxEstablishTransactionReads: 4,
+  maxTrainingMaxEstablishTransactionWrites: 2
 });
 
 function planRunPreflightStart(pkg) {
@@ -2177,6 +2705,22 @@ if (typeof module !== 'undefined' && module.exports) {
     planRunUtf8EncodeToBytes: planRunUtf8EncodeToBytes,
     planRunUtf8DecodeFromBytes: planRunUtf8DecodeFromBytes,
     planRunBase64EncodeBytes: planRunBase64EncodeBytes,
-    planRunBase64DecodeToBytes: planRunBase64DecodeToBytes
+    planRunBase64DecodeToBytes: planRunBase64DecodeToBytes,
+    // OPTIONAL PROGRESSION STARTING VALUES -- implementation round exports
+    // (canonical-program-run-optional-progression-values-specification,
+    // Round 6 controlling).
+    PLAN_RUN_STATE_KEYS_V2: PLAN_RUN_STATE_KEYS_V2,
+    PLAN_RUN_VALUE_INITIALIZATION_SOURCES: PLAN_RUN_VALUE_INITIALIZATION_SOURCES,
+    planRunProgressionStateDocValidV2: planRunProgressionStateDocValidV2,
+    planRunProgressionStateDocValidAnyVersion: planRunProgressionStateDocValidAnyVersion,
+    PLAN_RUN_UNRESOLVED_TM_CURSOR_VERSION: PLAN_RUN_UNRESOLVED_TM_CURSOR_VERSION,
+    PLAN_RUN_UNRESOLVED_TM_CURSOR_KEYS: PLAN_RUN_UNRESOLVED_TM_CURSOR_KEYS,
+    planRunEncodeUnresolvedTrainingMaxCursor: planRunEncodeUnresolvedTrainingMaxCursor,
+    planRunDecodeUnresolvedTrainingMaxCursor: planRunDecodeUnresolvedTrainingMaxCursor,
+    PLAN_RUN_TRAINING_MAX_ESTABLISH_KEYS: PLAN_RUN_TRAINING_MAX_ESTABLISH_KEYS,
+    planRunValidateTrainingMaxEstablishPackage: planRunValidateTrainingMaxEstablishPackage,
+    planRunValidateCheckTrainingMaxEstablishStatusInput: planRunValidateCheckTrainingMaxEstablishStatusInput,
+    planRunClassifyTrainingMaxEstablishRequest: planRunClassifyTrainingMaxEstablishRequest,
+    planRunSelectQualifyingWorkingLoadWeight: planRunSelectQualifyingWorkingLoadWeight
   };
 }

@@ -35,7 +35,10 @@
 //      automatically. The person must explicitly click "Use suggested value"
 //      (-> initializationSource 'confirmedFromSuggestion') or type a value
 //      themselves (-> initializationSource 'manual'). A Rule with no valid
-//      suggestion requires a typed value; none is ever invented.
+//      suggestion requires EITHER a typed value OR an explicit "Leave
+//      blank" choice (-> initializationSource 'deferred', ROUND 6
+//      CORRECTION below) before it counts as confirmed; none is ever
+//      invented.
 //   4. "Start Program" is disabled until every enabled Rule's row is
 //      confirmed with a finite Amount and a Unit. Submitting reuses the
 //      EXISTING, already-accepted fsPlanRunPreflightStart/fsPlanRunStart/
@@ -53,6 +56,28 @@
 //      Status (fsPlanRunCheckStartStatus, read-only) controls, plus an
 //      Abandon control that only stops THIS session tracking the attempt --
 //      it never deletes or falsifies anything already persisted.
+//
+// OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION (independent-
+// review Finding 1): before this correction, every row still required a
+// typed, finite Amount -- `planRunStartAllRowsReady`/`planRunStartSubmit`
+// rejected a blank value outright, even though the persistence and model
+// layers (plan-run-model.js's `planRunValidateStartPackage`,
+// firebase-plan-run.js's `fsPlanRunStart`) had already accepted a paired-
+// null `{amount:null, unit:null, initializationSource:'deferred'}` entry
+// since Round 6 itself. This left the accepted product requirement
+// ("Start accepts blank values") unreachable from the real UI. Fixed by
+// adding an explicit, per-row "Leave blank" choice
+// (`row.deferred`/`planRunStartHandleLeaveBlankToggle`, further down):
+// checking it marks that one row confirmed with the exact paired-null
+// shape the package already requires, UNCHECKING it returns the row to
+// needing a typed value or the suggestion, exactly like any other not-yet-
+// confirmed row. A row is NEVER treated as blank merely because its Amount
+// field happens to be empty -- only this explicit toggle produces a
+// paired-null package entry, so a genuinely incomplete row (e.g. a typed
+// Amount with no Unit, not reachable through this file's own controls but
+// defended against anyway) is never silently reinterpreted as a deliberate
+// blank. See `planRunStartAllRowsReady`/`planRunStartSubmit` below for the
+// corresponding readiness/package-construction changes.
 //
 // DELIBERATE SIMPLIFICATIONS THIS ROUND (see the implementation report for
 // the full rationale):
@@ -317,8 +342,13 @@ function planRunStartHandleInput(event) {
 }
 function planRunStartHandleChange(event) {
   var el = event.target;
-  if (!el || !el.matches || !el.matches('[data-planrun-start-unit]')) return;
-  planRunStartHandleUnitChange(el.getAttribute('data-planrun-start-rule-id'), el.value);
+  if (!el || !el.matches) return;
+  if (el.matches('[data-planrun-start-unit]')) {
+    planRunStartHandleUnitChange(el.getAttribute('data-planrun-start-rule-id'), el.value);
+  } else if (el.matches('[data-planrun-start-leave-blank]')) {
+    // ROUND 6 CORRECTION ADDITION.
+    planRunStartHandleLeaveBlankToggle(el.getAttribute('data-planrun-start-rule-id'), !!el.checked);
+  }
 }
 function planRunStartWireEvents(el) {
   if (!el || el.__planRunStartWired) return;
@@ -400,7 +430,7 @@ function planRunStartOpen(templateId, ctxOverride) {
       return Object.assign({}, r, {
         exerciseName: planCanonicalGetExerciseName(r.exerciseId),
         suggestionState: progressionAvailable ? 'loading' : 'unavailable',
-        suggestion: null, amount: '', unit: 'lb', confirmed: false, initializationSource: null
+        suggestion: null, amount: '', unit: 'lb', confirmed: false, initializationSource: null, deferred: false
       });
     });
     planRunStartState = {
@@ -478,8 +508,32 @@ function planRunStartHandleUseSuggestion(planRuleId) {
   row.unit = row.suggestion.unit;
   row.initializationSource = 'confirmedFromSuggestion';
   row.confirmed = true;
+  row.deferred = false; // accepting a suggestion is an explicit real value -- never still "leave blank"
   planRunStartRender();
 }
+// USABILITY CORRECTION (independent-review finding, this round): both
+// handlers below previously ended with a full planRunStartRender() -- the
+// SAME full-container innerHTML rebuild every phase transition uses. A
+// browser (and jsdom identically) destroys and recreates every descendant
+// node on an innerHTML replacement, including whichever <input> currently
+// holds focus, so every single keystroke in the real Amount field lost
+// focus the instant this ran -- typing "365" left only the "3" entered
+// before the field had to be reselected for "6", then again for "5". That
+// is a render/state-identity defect, not a timing issue, so the fix is not
+// a timing trick or a forced refocus call -- it is to stop rebuilding the
+// input's own DOM subtree for this path at all. A bare keystroke or unit
+// change only ever affects two small, derived things: this one row's own
+// "Needs a confirmed value"/"Confirmed" indicator, and the submit button's
+// disabled state -- see planRunStartUpdateRowStatusInPlace/
+// planRunStartUpdateSubmitButtonInPlace below, which update exactly those
+// two nodes directly and never touch the amount/unit controls themselves.
+// Since the input/select nodes are never replaced, the browser has no
+// reason to move focus, so continuous typing, deletion, text selection,
+// paste, decimal entry, and keyboard navigation all behave normally. Every
+// OTHER phase transition (submit, retry, check-status, abandon, close,
+// suggestion-fetch resolving, etc.) still goes through the real, full
+// planRunStartRender() exactly as before -- this change is scoped strictly
+// to the per-keystroke/per-selection path, nothing else.
 function planRunStartHandleAmountInput(planRuleId, raw) {
   var st = planRunStartState;
   if (!st || st.phase !== 'confirmingValues' || st.submitting) return;
@@ -488,7 +542,9 @@ function planRunStartHandleAmountInput(planRuleId, raw) {
   row.amount = raw;
   row.initializationSource = 'manual';
   row.confirmed = true;
-  planRunStartRender();
+  row.deferred = false; // typing a value is an explicit override of any prior "leave blank" choice
+  planRunStartUpdateRowStatusInPlace(planRuleId);
+  planRunStartUpdateSubmitButtonInPlace();
 }
 function planRunStartHandleUnitChange(planRuleId, unit) {
   var st = planRunStartState;
@@ -499,15 +555,94 @@ function planRunStartHandleUnitChange(planRuleId, unit) {
   row.unit = unit;
   row.initializationSource = 'manual';
   row.confirmed = true;
+  row.deferred = false; // choosing a unit is an explicit override of any prior "leave blank" choice
+  planRunStartUpdateRowStatusInPlace(planRuleId);
+  planRunStartUpdateSubmitButtonInPlace();
+}
+// ROUND 6 CORRECTION ADDITION -- the explicit "Leave blank" toggle. This is
+// a deliberate, separate user action, never inferred from an empty Amount
+// field: checking it marks the row confirmed with the exact paired-null
+// shape `planRunValidateStartPackage` requires for a deferred entry
+// (amount:null, unit:null, initializationSource:'deferred'); unchecking it
+// returns the row to needing a typed value or an accepted suggestion,
+// exactly like any other not-yet-confirmed row (never silently restoring a
+// stale typed amount as if it had been re-confirmed). A full render is
+// used here (not the in-place keystroke-path update above) because this is
+// a discrete checkbox toggle, not a per-keystroke event -- the existing
+// disabled Amount/Unit controls this produces are never mid-typing, so
+// there is no focus to preserve.
+function planRunStartHandleLeaveBlankToggle(planRuleId, checked) {
+  var st = planRunStartState;
+  if (!st || st.phase !== 'confirmingValues' || st.submitting) return;
+  var row = st.rules.filter(function (r) { return r.planRuleId === planRuleId; })[0];
+  if (!row) return;
+  if (checked) {
+    row.deferred = true;
+    row.confirmed = true;
+    row.initializationSource = 'deferred';
+  } else {
+    row.deferred = false;
+    row.confirmed = false;
+    row.initializationSource = null;
+  }
   planRunStartRender();
 }
+// Finds one rule row's own rendered container without any selector-string
+// interpolation of planRuleId (defensive: even though planRunIsId already
+// constrains the real shape, this avoids ever building a CSS attribute
+// selector out of untrusted/variable text).
+function planRunStartFindRuleRowEl(container, planRuleId) {
+  if (!container || !container.querySelectorAll) return null;
+  var rows = container.querySelectorAll('[data-testid="start-rule-row"]');
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].getAttribute('data-planrun-start-rule-id') === planRuleId) return rows[i];
+  }
+  return null;
+}
+// In-place update of one row's own status indicator -- same two possible
+// strings/colors planRunStartRenderRuleRow already renders, just applied to
+// the existing node instead of rebuilding it. Never touches the row's own
+// amount <input> or unit <select>.
+function planRunStartUpdateRowStatusInPlace(planRuleId) {
+  var st = planRunStartState;
+  if (!st || st.phase !== 'confirmingValues') return;
+  var row = st.rules.filter(function (r) { return r.planRuleId === planRuleId; })[0];
+  if (!row) return;
+  var rowEl = planRunStartFindRuleRowEl(planRunStartContainer(), planRuleId);
+  if (!rowEl || !rowEl.querySelector) return;
+  var statusEl = rowEl.querySelector('[data-testid="start-rule-needs-action"],[data-testid="start-rule-confirmed"]');
+  if (!statusEl) return;
+  var needsAction = !(row.deferred || (row.confirmed && row.amount !== '' && isFinite(Number(row.amount))));
+  statusEl.setAttribute('data-testid', needsAction ? 'start-rule-needs-action' : 'start-rule-confirmed');
+  statusEl.style.color = needsAction ? '#b00' : '#080';
+  statusEl.textContent = needsAction ? 'Needs a confirmed value' : (row.deferred ? 'Will be set later' : 'Confirmed');
+}
+// In-place update of the submit button's disabled state only -- same
+// planRunStartAllRowsReady gate planRunStartRender already applies, just
+// applied directly to the existing button node.
+function planRunStartUpdateSubmitButtonInPlace() {
+  var st = planRunStartState;
+  if (!st || st.phase !== 'confirmingValues') return;
+  var container = planRunStartContainer();
+  if (!container || !container.querySelector) return;
+  var btn = container.querySelector('[data-testid="start-submit-btn"]');
+  if (!btn) return;
+  btn.disabled = !planRunStartAllRowsReady(st.rules) || st.submitting;
+}
 
-// Every enabled Rule's row must be explicitly confirmed with a finite Amount
-// before Start is allowed -- the one gate this entire flow exists to
-// enforce. A row is never considered confirmed merely because a suggestion
-// happened to be displayed.
+// Every enabled Rule's row must be explicitly confirmed with EITHER a finite
+// Amount and a legal Unit, OR the explicit "Leave blank" choice (ROUND 6
+// CORRECTION), before Start is allowed -- the one gate this entire flow
+// exists to enforce. A row is never considered confirmed merely because a
+// suggestion happened to be displayed, and a row is never treated as
+// deliberately blank merely because its Amount field happens to be empty --
+// `row.deferred` is set ONLY by the explicit toggle
+// (planRunStartHandleLeaveBlankToggle), never inferred here.
 function planRunStartAllRowsReady(rules) {
-  return rules.every(function (r) { return r.confirmed && r.amount !== '' && isFinite(Number(r.amount)) && (r.unit === 'lb' || r.unit === 'kg'); });
+  return rules.every(function (r) {
+    if (r.deferred) return true;
+    return r.confirmed && r.amount !== '' && isFinite(Number(r.amount)) && (r.unit === 'lb' || r.unit === 'kg');
+  });
 }
 
 function planRunStartSubmit() {
@@ -517,11 +652,16 @@ function planRunStartSubmit() {
   st.submitting = true;
   st.submitError = null;
   planRunStartRender();
+  // ROUND 6 CORRECTION -- a deferred row emits the exact paired-null shape
+  // `planRunValidateStartPackage` requires (amount:null, unit:null,
+  // initializationSource:'deferred'), never `''`/`NaN`/a stale suggestion/
+  // an invented default. A non-deferred row is unchanged from before this
+  // correction. Key order matches PLAN_RUN_PROGRESSION_INITIAL_KEYS
+  // (plan-run-model.js) in both branches.
   var progressionInitialValues = st.rules.map(function (r) {
-    return {
-      planRuleId: r.planRuleId, planAssignmentId: r.planAssignmentId, ruleRevisionId: r.ruleRevisionId,
-      exerciseId: r.exerciseId, kind: r.kind, amount: Number(r.amount), unit: r.unit, initializationSource: r.initializationSource
-    };
+    return r.deferred
+      ? { planRuleId: r.planRuleId, planAssignmentId: r.planAssignmentId, ruleRevisionId: r.ruleRevisionId, exerciseId: r.exerciseId, kind: r.kind, amount: null, unit: null, initializationSource: 'deferred' }
+      : { planRuleId: r.planRuleId, planAssignmentId: r.planAssignmentId, ruleRevisionId: r.ruleRevisionId, exerciseId: r.exerciseId, kind: r.kind, amount: Number(r.amount), unit: r.unit, initializationSource: r.initializationSource };
   });
   var planRunId = uid();
   var operationId = uid();
@@ -742,17 +882,30 @@ function planRunStartRenderRuleRow(row, disabled) {
   } else if (row.suggestionState === 'unavailable') {
     suggestionHtml = '<div class="planrun-start-suggestion" style="color:var(--text2);font-size:12px">Could not check for an existing value — enter one below.</div>';
   }
-  var needsAction = !(row.confirmed && row.amount !== '' && isFinite(Number(row.amount)));
+  var needsAction = !(row.deferred || (row.confirmed && row.amount !== '' && isFinite(Number(row.amount))));
   var typeLabel = row.adjustmentType === 'addLoad' ? 'Add Load' : 'Increase Training Max';
+  // ROUND 6 CORRECTION -- explanatory copy for the "Leave blank" choice,
+  // worded per-kind so the person knows what happens next without needing
+  // to understand "workingLoad"/"trainingMax" as terms: a blank working
+  // weight resolves itself automatically the first time a qualifying set is
+  // logged; a blank training max must be entered later, by hand, from the
+  // Needs Attention list (app-plan-run-training-max-ui.js).
+  var deferredExplainer = row.kind === 'trainingMax'
+    ? 'You can set this later from the Needs Attention list once the Program is running.'
+    : 'This will be filled in automatically the first time you log a qualifying set.';
+  var amountUnitDisabled = disabled || row.deferred;
+  var ad = amountUnitDisabled ? 'disabled' : '';
   return '<div class="planrun-start-rule-row" data-testid="start-rule-row" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" style="border:1px solid var(--border,#ccc);border-radius:6px;padding:8px;margin:6px 0">'
     + '<div style="font-weight:600">' + escapeHtml(row.exerciseName) + '<span style="font-weight:400;color:var(--text2);font-size:12px"> — ' + escapeHtml(typeLabel) + '</span></div>'
     + suggestionHtml
-    + '<label style="display:inline-block;margin-top:4px">Starting Amount<input type="number" step="any" ' + d + ' data-testid="start-amount-input" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-amount value="' + escapeHtml(row.amount) + '"></label> '
-    + '<label>Unit<select ' + d + ' data-testid="start-unit-select" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-unit>'
+    + '<label style="display:inline-block;margin-top:4px">Starting Amount<input type="number" step="any" ' + ad + ' data-testid="start-amount-input" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-amount value="' + escapeHtml(row.amount) + '"></label> '
+    + '<label>Unit<select ' + ad + ' data-testid="start-unit-select" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-unit>'
     + '<option value="lb" ' + (row.unit === 'lb' ? 'selected' : '') + '>lb</option>'
     + '<option value="kg" ' + (row.unit === 'kg' ? 'selected' : '') + '>kg</option>'
     + '</select></label>'
-    + (needsAction ? '<div data-testid="start-rule-needs-action" style="color:#b00;font-size:12px;margin-top:2px">Needs a confirmed value</div>' : '<div data-testid="start-rule-confirmed" style="color:#080;font-size:12px;margin-top:2px">Confirmed</div>')
+    + '<div style="margin-top:4px"><label style="font-size:13px"><input type="checkbox" ' + d + ' data-testid="start-leave-blank-checkbox" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-leave-blank ' + (row.deferred ? 'checked' : '') + '> Leave blank — I’ll set this later</label></div>'
+    + (row.deferred ? '<div data-testid="start-deferred-explainer" style="color:var(--text2);font-size:12px;margin-top:2px">' + escapeHtml(deferredExplainer) + '</div>' : '')
+    + (needsAction ? '<div data-testid="start-rule-needs-action" style="color:#b00;font-size:12px;margin-top:2px">Needs a confirmed value</div>' : '<div data-testid="start-rule-confirmed" style="color:#080;font-size:12px;margin-top:2px">' + (row.deferred ? 'Will be set later' : 'Confirmed') + '</div>')
     + '</div>';
 }
 
@@ -790,7 +943,7 @@ function planRunStartRender() {
       html += '<button type="button" class="btn-secondary" data-testid="start-close-btn" data-planrun-start-action="close">Cancel</button>';
       html += '</div>';
       if (st.submitError === 'incomplete') {
-        html += '<div data-testid="start-incomplete-error" style="color:#b00;margin-top:6px">Confirm a starting value for every Rule above before starting.</div>';
+        html += '<div data-testid="start-incomplete-error" style="color:#b00;margin-top:6px">Confirm a starting value — or choose to leave it blank — for every Rule above before starting.</div>';
       }
     } else if (st.phase === 'rejected') {
       html += '<div data-testid="start-rejected" style="padding:8px;border-radius:6px;background:#fee;color:#900;margin-top:8px">' + escapeHtml(planRunStartOutcomeMessage(st.rejection && st.rejection.outcome)) + '</div>';

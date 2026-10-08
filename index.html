@@ -94,7 +94,15 @@
     <div class="page active" id="page-home">
 
       <!-- ACTIVE PROGRAM CAROUSEL -->
-      <div id="home-program-section" style="padding:12px 16px 0">
+      <!-- DUPLICATE-PRESENTATION USABILITY CORRECTION (Round 2, Approach 4) --
+           static section label only, matching the existing "Recent Workouts"
+           home-section-label pattern below. No markup, handler, or action in
+           this section changes; see app-plan.js/app-core.js for the
+           corresponding legacy-card logic, untouched by this round. -->
+      <div style="padding:12px 16px 0 20px">
+        <div class="home-section-label" style="margin-bottom:4px">Active Programs</div>
+      </div>
+      <div id="home-program-section" style="padding:4px 16px 0">
         <div id="home-program-carousel-wrap" style="position:relative;overflow:hidden;touch-action:pan-y">
           <div id="home-program-carousel" style="display:flex;transition:transform 0.3s ease"></div>
         </div>
@@ -109,6 +117,16 @@
            pattern to page-db/page-programs below, which are also filled
            entirely by their own script. -->
       <div id="planrun-home-section"></div>
+
+      <!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
+           "Needs Attention" section (unresolved training-max Rules). Empty
+           container, additive: filled only by app-plan-run-training-max-
+           ui.js's own capability-gated renderer
+           (planRunTmRenderHomeSection), which leaves this empty and issues
+           zero Run I/O whenever the canonical Run capability is disabled
+           (its real, hardcoded-false state today) -- identical pattern to
+           planrun-home-section immediately above. -->
+      <div id="planrun-needs-attention-section"></div>
 
       <!-- START BLANK WORKOUT -->
       <div style="padding:10px 16px 4px">
@@ -611,6 +629,12 @@
 <script src="firebase-plan-run.js"></script>
 <script src="app-plan-run-ui.js"></script>
 <script src="app-plan-run-start-ui.js"></script>
+<!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION -- the
+     "Needs Attention" (unresolved training-max) surface (see this file's
+     own header). Same capability gate as the scripts above; loading it
+     changes nothing a real user sees until CANONICAL_PLAN_RUN_CAPABILITY_
+     ENABLED is separately, explicitly activated. -->
+<script src="app-plan-run-training-max-ui.js"></script>
 <!-- LOGGER-FINISH SLICE ADDITION -- Run-aware real logger launch + Finish
      (see this file's own header). Same capability gate as the three
      scripts above; loading it changes nothing a real user sees until
