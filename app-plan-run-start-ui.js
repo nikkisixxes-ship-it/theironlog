@@ -314,6 +314,33 @@ var planRunStartEpoch = 0; // bumped on every new attempt/close -- any async
                             // dropped silently, never rendered, and never
                             // used to navigate anywhere on its own.
 
+// STAGE 6 CORRECTION ROUND 2 (unresolved-async read): bound on how long
+// planRunStartOpen will wait on ctx.readCanonicalTemplate()'s returned
+// promise before giving up and offering Retry, instead of leaving the
+// screen on "Checking this Program..." with no terminal state at all if
+// that promise never settles (or settles only after an unreasonable delay).
+//
+// 45 seconds was chosen, not guessed, from the real shape of the read this
+// guards: assembleTemplateReadDocs (firebase.js) issues its
+// transaction.get() calls in a SEQUENTIAL loop (never Promise.all-batched)
+// -- a fixed ~6 upfront reads (schema authority, Template subject, Template
+// revision, operation, gateway, manifest root) plus up to 2 further
+// sequential reads (childRevision, childSubject) per manifest-graph entry.
+// A real PPL-style strength Program -- the Stage 6 reproduction's own
+// "PPL on a Cut" -- has on the order of a few dozen Rules/assignments, not
+// thousands: at a generous 300-500ms per round trip on a poor mobile
+// connection, that is comfortably inside 45 seconds. (READER_SAFETY_CAPS
+// above this bounds the absolute worst case at 64 chunks / 6,400 entries --
+// deliberately a defensive ceiling against a corrupt/adversarial manifest,
+// not a realistic Template size; a read that pathological would need more
+// than one Retry even at a much longer timeout, so this value is not
+// chosen to cover that ceiling.) 45 seconds is long enough that an ordinary
+// slow connection finishing a normal-sized Template is never falsely
+// timed out, and short enough that a genuinely stuck read -- the
+// mechanism this correction exists for -- does not leave the person
+// waiting indefinitely.
+var PLAN_RUN_START_READ_TIMEOUT_MS = 45000;
+
 function planRunStartIsResponseCurrent(epoch, expectedUid) {
   return planRunStartState !== null && epoch === planRunStartEpoch && planRunStartCurrentUid() === expectedUid;
 }
@@ -331,6 +358,7 @@ function planRunStartHandleClick(event) {
   else if (action === 'use-suggestion') planRunStartHandleUseSuggestion(ruleId);
   else if (action === 'submit') planRunStartSubmit();
   else if (action === 'retry') planRunStartRetry();
+  else if (action === 'retry-read') planRunStartRetryRead();
   else if (action === 'check-status') planRunStartCheckStatus();
   else if (action === 'abandon') planRunStartAbandon();
   else if (action === 'go-to-active-run') planRunStartGoToActiveRun();
@@ -412,7 +440,46 @@ function planRunStartOpen(templateId, ctxOverride) {
     if (planRunStartIsResponseCurrent(epoch, expectedUid)) { planRunStartState = { phase: 'readError', epoch: epoch, detail: null }; planRunStartRender(); }
     return Promise.resolve({ outcome: 'readError' });
   }
+
+  // STAGE 6 CORRECTION ROUND 2 (unresolved-async read): `p` is the exact
+  // promise the screen is awaiting while showing "Checking this Program...".
+  // The round-1 correction below only runs once `p` settles -- it cannot
+  // help if `p` never settles, or settles only after an unreasonable delay
+  // (the renewed production hang this round investigates). This timer is
+  // the bounded terminal outcome for that case: if it fires while this
+  // attempt is still the one on screen, it bumps the epoch itself (the SAME
+  // invalidation planRunStartClose() already uses for navigation/auth
+  // changes) and moves to a new, distinct 'readTimedOut' phase -- never
+  // reusing 'readError', since a timeout is genuine uncertainty, not a
+  // conclusively bad result. Bumping the epoch here means `p`'s eventual
+  // late settlement -- whenever it arrives, if ever -- is automatically
+  // caught by the SAME staleness check (planRunStartIsResponseCurrent)
+  // already at the top of both handlers below and dropped as 'stale',
+  // exactly like any other superseded response; no new per-attempt
+  // cancellation bookkeeping was introduced to get that guarantee.
+  //
+  // If `p` settles first (the ordinary case), the handler that runs clears
+  // this timer as its very first action, below -- so a slow-but-eventually-
+  // successful or slow-but-eventually-rejected read is never later
+  // reclassified as timed out, and the timer never fires at all against a
+  // screen that has already moved on to a newer, legitimate state.
+  var planRunStartReadTimeoutHandle = setTimeout(function () {
+    if (!planRunStartIsResponseCurrent(epoch, expectedUid)) return; // already closed/navigated/superseded -- nothing to do
+    planRunStartEpoch++;
+    planRunStartState = { phase: 'readTimedOut', epoch: planRunStartEpoch, ctx: ctx, templateId: templateId, ownerUid: ctx.ownerUid };
+    planRunStartRender();
+  }, PLAN_RUN_START_READ_TIMEOUT_MS);
+  // Recorded on the in-progress loadingProfile state (if it is still the
+  // current one) so planRunStartClose() can cancel this timer outright on
+  // navigation/auth-change/Cancel, rather than merely relying on the
+  // staleness check above to make its late firing a no-op -- an actually
+  // cancelled timer, not just a harmlessly ignored one.
+  if (planRunStartState && planRunStartState.phase === 'loadingProfile' && planRunStartState.epoch === epoch) {
+    planRunStartState.readTimeoutHandle = planRunStartReadTimeoutHandle;
+  }
+
   return p.then(function (result) {
+    clearTimeout(planRunStartReadTimeoutHandle);
     if (!planRunStartIsResponseCurrent(epoch, expectedUid)) return { outcome: 'stale' }; // navigated away / superseded -- drop silently
     // STAGE 6 CORRECTION (hang fix): everything from here through the
     // 'confirmingValues' transition below used to run with no safety net.
@@ -470,6 +537,7 @@ function planRunStartOpen(templateId, ctxOverride) {
       return { outcome: 'readError', detail: null, processingError: (processingErr && processingErr.message) || String(processingErr) };
     }
   }, function (err) {
+    clearTimeout(planRunStartReadTimeoutHandle);
     if (!planRunStartIsResponseCurrent(epoch, expectedUid)) return { outcome: 'stale' };
     if (planRunStartIsCanonicalReadDisabledError(err)) { planRunStartState = { phase: 'disabled', epoch: epoch }; planRunStartRender(); return { outcome: 'disabled' }; }
     planRunStartState = { phase: 'readError', epoch: epoch, detail: null };
@@ -776,6 +844,21 @@ function planRunStartRetry() {
   planRunStartAttempt(st, st.pending.pkg, st.pending.planRunId, st.pending.operationId, st.epoch, st.ownerUid);
 }
 
+// STAGE 6 CORRECTION ROUND 2: Retry for the new 'readTimedOut' phase only --
+// a distinct, deliberately simple function rather than overloading
+// planRunStartRetry() above (which is specific to the 'uncertain'/pending-
+// package case and has nothing in common with a timed-out READ). Starts a
+// genuinely clean new attempt by calling the SAME real entry point used for
+// the very first open, with the SAME ctx/templateId, which on its own
+// already allocates a brand-new epoch -- there is no older attempt left to
+// collide with, since the timed-out attempt's epoch was already invalidated
+// the moment the timeout fired.
+function planRunStartRetryRead() {
+  var st = planRunStartState;
+  if (!st || st.phase !== 'readTimedOut') return;
+  planRunStartOpen(st.templateId, st.ctx);
+}
+
 function planRunStartCheckStatus() {
   var st = planRunStartState;
   if (!st || st.phase !== 'uncertain' || !st.pending || st.submitting) return;
@@ -878,6 +961,15 @@ function planRunStartGoToTrainAndRefresh() {
 // planRunStartRetry/planRunStartCheckStatus/planRunStartBuildPackage
 // completely untouched.
 function planRunStartClose() {
+  // STAGE 6 CORRECTION ROUND 2: an in-progress read's bounded timeout
+  // (planRunStartOpen) is actually cancelled here, not merely left to fire
+  // later and no-op against a state the staleness check would already
+  // reject -- so Cancel/navigation/auth-change stops that timer outright,
+  // consistent with the round-2 requirement not to leave an unsafe late
+  // callback merely inert.
+  if (planRunStartState && planRunStartState.readTimeoutHandle) {
+    clearTimeout(planRunStartState.readTimeoutHandle);
+  }
   planRunStartEpoch++;
   planRunStartState = null;
   var el = planRunStartContainer();
@@ -956,6 +1048,13 @@ function planRunStartRender() {
     html += '<div data-testid="start-loading" style="color:var(--text2)">Checking this Program…</div>';
   } else if (st.phase === 'readError') {
     html += '<div data-testid="start-read-error" style="padding:8px;border-radius:6px;background:#fee;color:#900">This Program could not be verified. Nothing was started.</div>';
+  } else if (st.phase === 'readTimedOut') {
+    // STAGE 6 CORRECTION ROUND 2: distinct from readError's message/color on
+    // purpose -- this is "we gave up waiting," not "we got back something
+    // wrong," and offers its own Retry control rather than only the nav-away-
+    // and-reopen recovery readError relies on.
+    html += '<div data-testid="start-read-timed-out" style="padding:8px;border-radius:6px;background:#ffe;color:#740">This is taking longer than expected. We couldn’t confirm this Program’s details. Nothing was started.</div>';
+    html += '<div style="margin-top:8px"><button type="button" class="btn-primary" data-testid="start-retry-read-btn" data-planrun-start-action="retry-read">Retry</button></div>';
   } else if (st.phase === 'ineligible') {
     html += '<div data-testid="start-ineligible" style="color:var(--text2)">This Program has no Sessions to start yet.</div>';
   } else if (st.phase === 'confirmingValues' || st.phase === 'rejected' || st.phase === 'uncertain' || st.phase === 'alreadyRunning') {
