@@ -414,32 +414,61 @@ function planRunStartOpen(templateId, ctxOverride) {
   }
   return p.then(function (result) {
     if (!planRunStartIsResponseCurrent(epoch, expectedUid)) return { outcome: 'stale' }; // navigated away / superseded -- drop silently
-    if (!result || result.outcome !== 'verifiedCurrent') {
-      planRunStartState = { phase: 'readError', epoch: epoch, detail: result || null };
-      planRunStartRender();
-      return { outcome: 'readError', detail: result };
-    }
-    var profile = { verificationReceipt: result.canonicalBase.verificationReceipt, profileView: result.canonicalBase.profileView };
-    var runnableSessions = planRunStartCountRunnableSessions(profile.profileView);
-    if (runnableSessions === 0) {
-      planRunStartState = { phase: 'ineligible', epoch: epoch, reason: 'noRunnableSessions' };
-      planRunStartRender();
-      return { outcome: 'ineligible' };
-    }
-    var enabledRules = planRunStartEnumerateEnabledRules(profile.profileView).map(function (r) {
-      return Object.assign({}, r, {
-        exerciseName: planCanonicalGetExerciseName(r.exerciseId),
-        suggestionState: progressionAvailable ? 'loading' : 'unavailable',
-        suggestion: null, amount: '', unit: 'lb', confirmed: false, initializationSource: null, deferred: false
+    // STAGE 6 CORRECTION (hang fix): everything from here through the
+    // 'confirmingValues' transition below used to run with no safety net.
+    // A successful (`outcome: 'verifiedCurrent'`) read whose own shape later
+    // turned out to be unusable -- a missing/malformed canonicalBase,
+    // profileView, or rules list -- made planRunStartCountRunnableSessions/
+    // planRunStartEnumerateEnabledRules/Object.assign throw SYNCHRONOUSLY
+    // inside this handler. That throw rejected the promise this function
+    // returns, but nothing downstream (including the real production call
+    // site, index.html's own onclick="planRunStartOpen(...)") ever attaches
+    // a .catch to it -- so the rejection went unhandled, planRunStartState
+    // was never reassigned past 'loadingProfile', and the screen stayed on
+    // "Checking this Program..." permanently, with zero error shown and zero
+    // retry affordance. This is the confirmed, reproduced Stage 6 defect
+    // mechanism (see the correction report's reproduction evidence).
+    // Fix: wrap this entire branch in try/catch so ANY exception while
+    // processing a successful read result -- not just an explicit
+    // non-'verifiedCurrent' outcome -- lands on the SAME already-existing,
+    // already-reviewed 'readError' terminal state the malformed-outcome
+    // branch immediately below already uses. No new terminal state is
+    // introduced; every currently-working path (verifiedCurrent with a
+    // well-formed shape, any non-'verifiedCurrent' outcome, a rejected read)
+    // is completely unchanged.
+    try {
+      if (!result || result.outcome !== 'verifiedCurrent') {
+        planRunStartState = { phase: 'readError', epoch: epoch, detail: result || null };
+        planRunStartRender();
+        return { outcome: 'readError', detail: result };
+      }
+      var profile = { verificationReceipt: result.canonicalBase.verificationReceipt, profileView: result.canonicalBase.profileView };
+      var runnableSessions = planRunStartCountRunnableSessions(profile.profileView);
+      if (runnableSessions === 0) {
+        planRunStartState = { phase: 'ineligible', epoch: epoch, reason: 'noRunnableSessions' };
+        planRunStartRender();
+        return { outcome: 'ineligible' };
+      }
+      var enabledRules = planRunStartEnumerateEnabledRules(profile.profileView).map(function (r) {
+        return Object.assign({}, r, {
+          exerciseName: planCanonicalGetExerciseName(r.exerciseId),
+          suggestionState: progressionAvailable ? 'loading' : 'unavailable',
+          suggestion: null, amount: '', unit: 'lb', confirmed: false, initializationSource: null, deferred: false
+        });
       });
-    });
-    planRunStartState = {
-      phase: 'confirmingValues', epoch: epoch, ctx: ctx, templateId: templateId, ownerUid: ctx.ownerUid,
-      profile: profile, rules: enabledRules, submitting: false, submitError: null
-    };
-    planRunStartRender();
-    if (progressionAvailable) planRunStartFetchSuggestions(epoch, expectedUid);
-    return { outcome: 'confirmingValues', ruleCount: enabledRules.length };
+      planRunStartState = {
+        phase: 'confirmingValues', epoch: epoch, ctx: ctx, templateId: templateId, ownerUid: ctx.ownerUid,
+        profile: profile, rules: enabledRules, submitting: false, submitError: null
+      };
+      planRunStartRender();
+      if (progressionAvailable) planRunStartFetchSuggestions(epoch, expectedUid);
+      return { outcome: 'confirmingValues', ruleCount: enabledRules.length };
+    } catch (processingErr) {
+      if (!planRunStartIsResponseCurrent(epoch, expectedUid)) return { outcome: 'stale' }; // superseded while this handler itself was running
+      planRunStartState = { phase: 'readError', epoch: epoch, detail: null, processingError: (processingErr && processingErr.message) || String(processingErr) };
+      planRunStartRender();
+      return { outcome: 'readError', detail: null, processingError: (processingErr && processingErr.message) || String(processingErr) };
+    }
   }, function (err) {
     if (!planRunStartIsResponseCurrent(epoch, expectedUid)) return { outcome: 'stale' };
     if (planRunStartIsCanonicalReadDisabledError(err)) { planRunStartState = { phase: 'disabled', epoch: epoch }; planRunStartRender(); return { outcome: 'disabled' }; }
