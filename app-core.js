@@ -1558,7 +1558,13 @@ function onSetChecked(exIdx, si, checked) {
   }
   const badgesEl = document.getElementById(`set-badges-${exIdx}-${si}`);
   if (badgesEl) {
-    const html = buildSetBadgesHtml(s);
+    // SUPPLEMENTAL-SET CORRECTION: this partial re-render (badges only, not
+    // the whole row) must preserve the real EXTRA tag exactly like the full
+    // buildSetsHTML render does -- otherwise checking/unchecking a
+    // supplemental Set would visually (and misleadingly) wipe its own EXTRA
+    // tag even though the underlying Set is still genuinely supplemental.
+    const extraTagHtml = s.isSupplemental === true ? `<span class="set-badge-extra">EXTRA</span>` : '';
+    const html = buildSetBadgesHtml(s) + extraTagHtml;
     badgesEl.innerHTML = html;
     const rowEl = document.getElementById(`set-row-${exIdx}-${si}`);
     if (rowEl && html && !rowEl.style.gridTemplateColumns.includes('auto')) {
@@ -2194,7 +2200,12 @@ function buildSetsHTML(ex, exIdx, isTime, rpe) {
     const inputCls = s.autoFilled ? 'set-input auto-filled' : 'set-input';
     const repCls   = (s.autoFilled && s.autoType === 'rep_goal') ? 'set-input auto-filled' : 'set-input';
     const wrapCls  = s.completed ? 'set-row-wrap completed' : 'set-row-wrap';
-    const badgesHtml = buildSetBadgesHtml(s);
+    // SUPPLEMENTAL-SET CORRECTION: a small, purely visual "EXTRA" tag marks
+    // a Set the person added beyond the Program Run's own prescription
+    // (isSupplemental:true) -- shown regardless of completed/PR state.
+    // Purely additive: a prescribed Set's own badges are never touched.
+    const extraTagHtml = s.isSupplemental === true ? `<span class="set-badge-extra">EXTRA</span>` : '';
+    const badgesHtml = buildSetBadgesHtml(s) + extraTagHtml;
     const gridCols = rpe ? `40px 1fr 1fr 64px${badgesHtml ? ' auto' : ''}` : `40px 1fr 1fr${badgesHtml ? ' auto' : ''}`;
     return `<div class="${wrapCls}" id="set-wrap-${exIdx}-${si}">
       <div class="${rowCls}" id="set-row-${exIdx}-${si}" style="grid-template-columns:${gridCols}">
@@ -2256,32 +2267,66 @@ function checkSetPR(exIdx, setIdx) {
   const s = currentWorkout.exercises[exIdx].sets[setIdx];
   if (s.weight && s.reps) { s.isNew1RM = calc1RM(+s.weight, +s.reps) > getBest1RM(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id); s.isPR = +s.weight > getBestWeight(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id); }
 }
-// LOGGER-FINISH SLICE ADDITION (all three functions below): a Run-linked
-// Session's own persisted canonical shape requires EVERY Set to resolve to
-// a real, already-verified prescribed planSetId (plan-run-model.js's
-// planRunWorkoutContextMatchesOccurrence, not reopened by this slice) --
-// an ad-hoc added Set has no such identity, and this already-accepted,
-// already-reviewed model has no mechanism to invent or waive one. Rather
-// than either fabricate an id (a lie about what was actually prescribed)
-// or silently drop the Set at Finish time (a silent, undisclosed data
-// loss), a Run-linked Session declines the action outright, honestly, at
-// the moment it's attempted -- logging exactly its prescribed Sets,
-// matching what the read-only preview already showed before Finish
-// existed. This is a direct, disclosed consequence of the addendum's own
-// decision 1 ("preserve every required... Set identity"), not a new
-// design decision, and does not change this function's own behavior for
-// any ordinary (non-Program-Run) workout.
+// LOGGER-FINISH SLICE ADDITION, AS AMENDED BY THE SUPPLEMENTAL-SET
+// CORRECTION BELOW: a Run-linked Session's own persisted canonical shape
+// originally required EVERY Set to resolve to a real, already-verified
+// prescribed planSetId (plan-run-model.js's
+// planRunWorkoutContextMatchesOccurrence). That requirement still holds
+// for every PRESCRIBED Set -- it is never relaxed, fabricated, or waived.
+// What changes below is that a Run-linked Session may now also carry
+// SUPPLEMENTAL Sets: Sets the person adds beyond the prescription, each
+// honestly marked isSupplemental:true and planSetId:null (never a
+// fabricated or reused prescribed id). This is a disclosed, additive
+// capability, not a loosening of the original identity requirement --
+// see plan-run-model.js's own comments for the full Set-shape contract,
+// and app-plan-run-logger-ui.js's planRunLoggerBuildPersistedSet /
+// planRunLoggerBuildWorkoutDoc for how a supplemental Set is persisted.
+//
+// SUPPLEMENTAL-SET CORRECTION -- the owner's own explicit decision: a
+// supplemental Set stays part of the workout record only. It never
+// silently influences Program completion, progression results, or
+// automatic working-weight establishment -- those all remain scoped to
+// prescribed Sets exactly as before (plan-run-model.js's
+// planRunOccurrenceEligibleForCompletion, planRunBuildProgressionTriple,
+// and planRunSelectQualifyingWorkingLoadWeight are unchanged in that
+// respect, or explicitly filter supplemental Sets out). If a supplemental
+// Set reveals that a working weight should change, that happens through
+// an explicit adjustment the person makes themselves -- never as an
+// unnoticed side effect of adding an extra Set.
+//
+// None of this changes this function's own behavior for any ordinary
+// (non-Program-Run) workout.
 function planRunLoggerIsCanonicalRunSession() { return !!(currentWorkout && currentWorkout.canonicalRun); }
 function addSet(idx) {
-  if (planRunLoggerIsCanonicalRunSession()) { showToast('This Program Run Session logs exactly its prescribed sets.', 'error'); return; }
   const sets = currentWorkout.exercises[idx].sets; const last = sets.length > 0 ? sets[sets.length-1] : null;
-  sets.push({ weight: last ? last.weight : '', reps: '', time: '', rpe: '', completed: false });
+  if (planRunLoggerIsCanonicalRunSession()) {
+    // A Run-linked Session may add a Set beyond its prescription, but that
+    // Set can never claim a prescribed identity it doesn't have -- it is
+    // stamped isSupplemental:true / planSetId:null here, at creation, so
+    // every downstream consumer can tell it apart without guessing.
+    sets.push({ planSetId: null, isSupplemental: true, weight: last ? last.weight : '', reps: '', time: '', rpe: '', completed: false, isPR: false, isNew1RM: false });
+  } else {
+    sets.push({ weight: last ? last.weight : '', reps: '', time: '', rpe: '', completed: false });
+  }
   const container = document.getElementById(`sets-container-${idx}`); const exData = getExercise(currentWorkout.exercises[idx].exerciseId);
   const isTime = exData && (exData.tracking === 'time' || exData.tracking === 'weight_time');
   if (container) { container.innerHTML = buildSetsHTML(currentWorkout.exercises[idx], idx, isTime, currentWorkout.rpeEnabled); currentWorkout.exercises[idx].sets.forEach((s, si) => attachSwipeToSet(idx, si)); } else renderWorkoutExercises();
 }
 function removeSet(exIdx, si) {
-  if (planRunLoggerIsCanonicalRunSession()) { showToast('This Program Run Session logs exactly its prescribed sets.', 'error'); return; }
+  if (planRunLoggerIsCanonicalRunSession()) {
+    // Prescribed Sets stay fixed for a Run-linked Session -- removing one
+    // would mean the Session no longer matches its own prescription
+    // (plan-run-model.js's planRunWorkoutContextMatchesOccurrence), which
+    // this correction does not change. Only a Set the person added
+    // themselves (isSupplemental:true) may be removed; the check is on the
+    // actual Set, not a blanket block, so this stays correct however many
+    // supplemental Sets are present.
+    const target = currentWorkout.exercises[exIdx].sets[si];
+    if (!target || target.isSupplemental !== true) {
+      showToast("This Program Run Session's prescribed sets can't be removed. Only extra sets you've added can be.", 'error');
+      return;
+    }
+  }
   currentWorkout.exercises[exIdx].sets.splice(si, 1);
   const container = document.getElementById(`sets-container-${exIdx}`); const exData = getExercise(currentWorkout.exercises[exIdx].exerciseId);
   const isTime = exData && (exData.tracking === 'time' || exData.tracking === 'weight_time');
@@ -2291,7 +2336,13 @@ function removeSet(exIdx, si) {
 // ==================== PR SET ====================
 function addPRSet(idx) {
   if (!currentWorkout) return;
-  if (planRunLoggerIsCanonicalRunSession()) { showToast('This Program Run Session logs exactly its prescribed sets.', 'error'); return; }
+  // SUPPLEMENTAL-SET CORRECTION: + PR Set remains out of scope for this
+  // correction (it targets + Set only, per the task's own required
+  // behavior) -- a Run-linked Session still declines it here, unchanged
+  // in substance. Only the message is updated: the old copy ("logs
+  // exactly its prescribed sets") would now be inaccurate, since + Set can
+  // add a Set, and it pointed the person nowhere useful.
+  if (planRunLoggerIsCanonicalRunSession()) { showToast('Program Run Sessions don\'t support + PR Set. Use + Set to add an extra set instead.', 'error'); return; }
   const ex = currentWorkout.exercises[idx]; const exData = getExercise(ex.exerciseId); if (!exData) return;
   const isTime = exData.tracking === 'time' || exData.tracking === 'weight_time'; const isBW = exData.tracking === 'bodyweight_reps';
   const inc = appDb.unit === 'kg' ? 1.25 : 2.5;

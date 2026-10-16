@@ -156,7 +156,33 @@ var PLAN_RUN_WORKOUT_KEYS = Object.freeze([
   'duration', 'bodyweight', 'exercises', 'createdAt'
 ]);
 var PLAN_RUN_WORKOUT_EXERCISE_KEYS = Object.freeze(['exerciseId', 'planAssignmentId', 'planPrescriptionId', 'sets', 'perfVideos']);
-var PLAN_RUN_WORKOUT_SET_KEYS = Object.freeze(['planSetId', 'weight', 'reps', 'time', 'rpe', 'completed', 'isPR', 'isNew1RM']);
+// SUPPLEMENTAL-SET CORRECTION (Stage 7 production finding -- Program Run
+// Sessions could not log any Set beyond their prescription at all). One new
+// field, `isSupplemental`, is added to the Set shape -- CURRENT (nine keys)
+// below. A prescribed Set is unchanged in every respect: isSupplemental is
+// `false` and planSetId is still a real, verified id resolving to the
+// occurrence's own prescription, exactly as before this correction. A
+// SUPPLEMENTAL Set (one the person adds beyond the prescription) carries
+// isSupplemental:true and planSetId:null -- never a fabricated id, never a
+// reused prescribed id -- it has no prescribed identity by design, which is
+// exactly what lets planRunOccurrenceEligibleForCompletion/
+// planRunBuildProgressionTriple (both unchanged by this correction) continue
+// to only ever see performed evidence keyed by a REAL prescribed planSetId:
+// a supplemental Set's own planSetId:null is never a key either of those
+// functions looks up, so it is structurally invisible to completion and
+// progression, not merely policy-excluded. See planRunSelectQualifyingWorkingLoadWeight
+// below for the one function that is NOT naturally scoped this way and was
+// therefore explicitly narrowed by this correction (owner-directed decision,
+// not inferred -- see the correction report).
+// LEGACY (eight keys, no `isSupplemental`) -- every Set this application has
+// ever been able to write before this correction. Read back and validated
+// exactly as before: isSupplemental is implied false, planSetId still must
+// be a real id. This branch exists so that an already-saved, pre-correction
+// workout document (including any produced during Stage 6's own production
+// testing) continues to validate and is never misclassified as malformed
+// merely because this new field did not exist when it was written.
+var PLAN_RUN_WORKOUT_SET_KEYS = Object.freeze(['planSetId', 'weight', 'reps', 'time', 'rpe', 'completed', 'isPR', 'isNew1RM', 'isSupplemental']);
+var PLAN_RUN_WORKOUT_SET_KEYS_LEGACY = Object.freeze(['planSetId', 'weight', 'reps', 'time', 'rpe', 'completed', 'isPR', 'isNew1RM']);
 
 // =============================================================================
 // SECTION 1 -- generic small predicates (mirrored, not re-derived, from the
@@ -1013,12 +1039,27 @@ function planRunDecodeUnresolvedTrainingMaxCursor(cursor, ownerUid) {
 // reads. `planRunWorkoutPerformedValid` itself is retired along with the
 // shape it validated.
 function planRunWorkoutSetValid(st) {
-  if (!planRunExactKeys(st, PLAN_RUN_WORKOUT_SET_KEYS)) return false;
-  if (!planRunIsId(st.planSetId)) return false;
+  var isCurrentShape = planRunExactKeys(st, PLAN_RUN_WORKOUT_SET_KEYS);
+  var isLegacyShape = !isCurrentShape && planRunExactKeys(st, PLAN_RUN_WORKOUT_SET_KEYS_LEGACY);
+  if (!isCurrentShape && !isLegacyShape) return false;
+  if (isCurrentShape) {
+    if (typeof st.isSupplemental !== 'boolean') return false;
+    if (st.isSupplemental) { if (st.planSetId !== null) return false; }
+    else { if (!planRunIsId(st.planSetId)) return false; }
+  } else {
+    // Legacy shape: isSupplemental did not exist, so it is implied false --
+    // every legacy Set is a prescribed Set, exactly as it always was.
+    if (!planRunIsId(st.planSetId)) return false;
+  }
   if (!planRunIsFiniteOrNull(st.weight) || !planRunIsFiniteOrNull(st.reps) || !planRunIsFiniteOrNull(st.time) || !planRunIsFiniteOrNull(st.rpe)) return false;
   if (typeof st.completed !== 'boolean' || typeof st.isPR !== 'boolean' || typeof st.isNew1RM !== 'boolean') return false;
   return true;
 }
+// True only for a CURRENT-shape Set explicitly stamped isSupplemental:true.
+// A legacy-shape Set (no such field at all) always returns false here --
+// every legacy Set is, and remains, a prescribed Set. Callers rely on this
+// to decide whether a Set's planSetId carries real prescribed identity.
+function planRunWorkoutSetIsSupplemental(st) { return st.isSupplemental === true; }
 function planRunWorkoutDocValid(v) {
   if (!planRunExactKeys(v, PLAN_RUN_WORKOUT_KEYS)) return false;
   if (!planRunIsId(v.id) || !planRunIsId(v.ownerUid)) return false;
@@ -1058,8 +1099,16 @@ function planRunWorkoutDocValid(v) {
     for (var s = 0; s < ex.sets.length; s++) {
       var st = ex.sets[s];
       if (!planRunWorkoutSetValid(st)) return false;
-      if (Object.prototype.hasOwnProperty.call(seenSetIds, st.planSetId)) return false;
-      seenSetIds[st.planSetId] = true;
+      // SUPPLEMENTAL-SET CORRECTION: uniqueness is only meaningful for a
+      // real prescribed planSetId. Every supplemental Set carries planSetId:
+      // null by design (never a fabricated or reused id), so any number of
+      // supplemental Sets may coexist on one exercise without tripping this
+      // check -- it is not disabled, merely scoped to the identity it was
+      // always protecting.
+      if (!planRunWorkoutSetIsSupplemental(st)) {
+        if (Object.prototype.hasOwnProperty.call(seenSetIds, st.planSetId)) return false;
+        seenSetIds[st.planSetId] = true;
+      }
     }
   }
   if (!planRunIsTimestamp(v.createdAt)) return false;
@@ -1114,6 +1163,13 @@ function planRunWorkoutContextMatchesOccurrence(workoutDoc, occurrenceDoc) {
     var bySetId = {};
     a.orderedSets.forEach(function (os) { bySetId[os.planSetId] = os; });
     for (var s = 0; s < ex.sets.length; s++) {
+      // SUPPLEMENTAL-SET CORRECTION: a supplemental Set has no prescribed
+      // identity by design (planSetId:null) -- it still had to belong to a
+      // real, matched Assignment (the exerciseId/planPrescriptionId check
+      // just above, unchanged), but there is no prescribed Set for it to
+      // resolve to, and none is required. Every non-supplemental Set must
+      // still resolve exactly as before this correction.
+      if (planRunWorkoutSetIsSupplemental(ex.sets[s])) continue;
       if (!bySetId[ex.sets[s].planSetId]) return false;
     }
   }
@@ -2137,11 +2193,24 @@ function planRunClassifyTrainingMaxEstablishRequest(p) {
 // never throws, never guesses when identity is ambiguous (spec SS4.3 step
 // 2: zero or two-or-more matching `exercises[]` entries both mean "not
 // qualifying", exactly alike).
+// SUPPLEMENTAL-SET CORRECTION (owner-directed decision, not inferred -- see
+// the correction report): unlike planRunOccurrenceEligibleForCompletion and
+// planRunBuildProgressionTriple (both of which are already, and remain,
+// naturally scoped to prescribed planSetId lookups with zero change here),
+// this function previously scanned EVERY completed, weighted Set in the
+// matching exercise with no identity check at all -- harmless before this
+// correction, since no other kind of Set could ever exist. A supplemental
+// Set must never silently influence this automatically-established,
+// permanent progression value, even if it happens to carry the heaviest
+// completed weight that session -- so it is now explicitly excluded here,
+// the one place this codebase's existing "never let un-prescribed evidence
+// influence an automatic outcome" principle had not yet been applied,
+// because the opportunity for it to matter did not exist until now.
 function planRunSelectQualifyingWorkingLoadWeight(workout, assignment) {
   var matches = workout.exercises.filter(function (ex) { return ex.planAssignmentId === assignment.planAssignmentId; });
   if (matches.length !== 1) return { qualifies: false };
   var qualifyingWeights = matches[0].sets
-    .filter(function (st) { return st.completed === true && typeof st.weight === 'number' && Number.isFinite(st.weight); })
+    .filter(function (st) { return !planRunWorkoutSetIsSupplemental(st) && st.completed === true && typeof st.weight === 'number' && Number.isFinite(st.weight); })
     .map(function (st) { return st.weight; });
   if (qualifyingWeights.length === 0) return { qualifies: false };
   return { qualifies: true, amount: Math.max.apply(null, qualifyingWeights) };
@@ -2635,6 +2704,8 @@ if (typeof module !== 'undefined' && module.exports) {
     // retired along with the nested `performed` shape it validated;
     // planRunWorkoutSetValid is its amended, flat-shape replacement.
     planRunWorkoutSetValid: planRunWorkoutSetValid,
+    // SUPPLEMENTAL-SET CORRECTION addition.
+    planRunWorkoutSetIsSupplemental: planRunWorkoutSetIsSupplemental,
     planRunWorkoutDocValid: planRunWorkoutDocValid,
     planRunClassifyWorkoutDiscriminator: planRunClassifyWorkoutDiscriminator,
     planRunWorkoutContextMatchesOccurrence: planRunWorkoutContextMatchesOccurrence,

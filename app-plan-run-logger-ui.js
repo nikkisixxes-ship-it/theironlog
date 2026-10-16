@@ -230,21 +230,30 @@ function planRunLoggerCoerceNumOrNull(v) {
 function planRunLoggerCoerceBool(v) { return v === true; }
 
 // Builds one canonical flat Set (PLAN_RUN_WORKOUT_SET_KEYS order/shape) from
-// one in-memory logger set. `planSetId` is never derived or guessed here --
-// it must already have been stamped onto the in-memory set at launch
-// (planRunLoggerBuildCurrentWorkout below); a set missing one is dropped by
-// the caller (planRunLoggerBuildWorkoutDoc), never persisted with a
-// fabricated id.
+// one in-memory logger set. `planSetId` is never derived or guessed here for
+// a prescribed Set -- it must already have been stamped onto the in-memory
+// set at launch (planRunLoggerBuildCurrentWorkout below); a prescribed set
+// missing one is dropped by the caller (planRunLoggerBuildWorkoutDoc), never
+// persisted with a fabricated id.
+//
+// SUPPLEMENTAL-SET CORRECTION: a Set the person added beyond the
+// prescription (app-core.js's addSet, stamped isSupplemental:true there) is
+// persisted with planSetId:null -- never a fabricated id, never a reused
+// prescribed id -- and isSupplemental:true, exactly matching the amended
+// PLAN_RUN_WORKOUT_SET_KEYS shape (plan-run-model.js). Every other field is
+// built identically regardless of supplemental/prescribed.
 function planRunLoggerBuildPersistedSet(s) {
+  var supplemental = s.isSupplemental === true;
   return {
-    planSetId: s.planSetId,
+    planSetId: supplemental ? null : s.planSetId,
     weight: planRunLoggerCoerceNumOrNull(s.weight),
     reps: planRunLoggerCoerceNumOrNull(s.reps),
     time: planRunLoggerCoerceNumOrNull(s.time),
     rpe: planRunLoggerCoerceNumOrNull(s.rpe),
     completed: planRunLoggerCoerceBool(s.completed),
     isPR: planRunLoggerCoerceBool(s.isPR),
-    isNew1RM: planRunLoggerCoerceBool(s.isNew1RM)
+    isNew1RM: planRunLoggerCoerceBool(s.isNew1RM),
+    isSupplemental: supplemental
   };
 }
 
@@ -270,8 +279,15 @@ function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
     }
     var sets = [];
     for (var s = 0; s < ex.sets.length; s++) {
-      if (typeof ex.sets[s].planSetId !== 'string') return { ok: false, reason: 'missingSetIdentity' };
-      sets.push(planRunLoggerBuildPersistedSet(ex.sets[s]));
+      var loggerSet = ex.sets[s];
+      // SUPPLEMENTAL-SET CORRECTION: a Set the person added beyond the
+      // prescription (isSupplemental:true, stamped by app-core.js's addSet)
+      // never carries a planSetId -- that is correct, not an error, so it
+      // is exempted from this identity check. A non-supplemental (prescribed)
+      // Set missing its planSetId stamp is still rejected exactly as before.
+      var supplemental = loggerSet.isSupplemental === true;
+      if (!supplemental && typeof loggerSet.planSetId !== 'string') return { ok: false, reason: 'missingSetIdentity' };
+      sets.push(planRunLoggerBuildPersistedSet(loggerSet));
     }
     var perfVideos = Array.isArray(ex.perfVideos) ? ex.perfVideos.filter(function (v) { return typeof v === 'string' && v.length > 0; }) : [];
     exercises.push({ exerciseId: ex.exerciseId, planAssignmentId: ex.planAssignmentId, planPrescriptionId: ex.planPrescriptionId, sets: sets, perfVideos: perfVideos });
@@ -363,6 +379,12 @@ function planRunLoggerLaunch(run, occurrence) {
       loggerSet.planSetId = os.planSetId;
       loggerSet.isPR = false;
       loggerSet.isNew1RM = false;
+      // SUPPLEMENTAL-SET CORRECTION: every prescribed Set is explicitly
+      // stamped isSupplemental:false at launch (never left undefined), per
+      // this codebase's exact-keys/no-implicit-fields convention. Sets
+      // added later via app-core.js's addSet are stamped isSupplemental:true
+      // there, at creation -- never guessed or inferred here.
+      loggerSet.isSupplemental = false;
       return loggerSet;
     });
     return { exerciseId: a.exerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, sets: sets, perfVideos: [] };
