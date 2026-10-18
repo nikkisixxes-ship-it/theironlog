@@ -20,8 +20,16 @@
 // status transition on an occurrence already belonging to the caller's own
 // active Run; never a resource-creating write, never Start, Finish, or
 // End). Every one of these three begins with disabledGate()
-// (firebase-plan-run.js) and therefore issues zero Firestore I/O whenever
-// the capability is disabled, which is its real, hardcoded state today.
+// (firebase-plan-run.js) and would issue zero Firestore I/O if the
+// capability were disabled -- but it is not. ROUND 5 CORRECTION: this
+// comment previously said the capability "is disabled, which is its real,
+// hardcoded state today." That was stale/wrong. The real, current value of
+// CANONICAL_PLAN_RUN_CAPABILITY_ENABLED (firebase-plan-run.js) is hardcoded
+// `true` -- deliberately reactivated during Stage 6 and still enabled
+// through the supplemental-set deployment, an independently confirmed
+// baseline fact for this round, not a new finding. disabledGate() does not
+// throw while the flag is true, so this file's one write DOES issue real
+// Firestore I/O in production today.
 //
 // LOGGER-FINISH SLICE UPDATE (this round): the read-only Session preview
 // below (#page-run-session-preview) now offers one additional control,

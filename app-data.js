@@ -293,15 +293,79 @@ function getPreviousPerf(exId) {
   const prev = appDb.workouts.filter(w => w.exercises.some(e => e.exerciseId === exId)).sort((a,b) => b.date-a.date)[0];
   if (!prev) return null;
   const ex = prev.exercises.find(e => e.exerciseId === exId);
-  const s = ex?.sets?.[0];
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1, secondary gap -- not one
+  // of the four numbered findings, but the same root issue: a canonical
+  // Program Run workout can have a blank/untouched sets[0] placeholder with
+  // the real performed data on a later set). Previously looked only at
+  // sets[0]; now finds the first set carrying genuine recorded performance
+  // (shared predicate, plan-run-model.js), so a blank prescribed placeholder
+  // ahead of a real supplemental set no longer hides the real last
+  // performance.
+  const s = (ex?.sets || []).find(x => planRunSetHasRecordedPerformance(x));
   return s?.weight ? `${s.weight}${appDb.unit} × ${s.reps||s.time}` : null;
 }
+
+// BEST-PERFORMANCE FILTERING CORRECTION (ROUND 6) -- these seven functions
+// (getBest1RM, getBestWeight, getBestTime, getBestReps,
+// getBestE1RMForExercise, getBestNRM, getE1RMHistory) are the only real
+// best-performance/PR/E1RM consumers that still scanned every stored
+// exercises[].sets[] entry directly, independent of the shared
+// planRunSetHasRecordedPerformance predicate that getPreviousPerf and
+// getExerciseStats (above) and the History/search/export consumers
+// (app-core.js) already use. Round 5 fixed the predicate itself (requiring
+// completed===true, not merely a truthy prefilled value) and fixed every
+// consumer Round 5's own integration test actually exercised, but Round 5's
+// claim that this covered every PR/E1RM consumer was inaccurate -- these
+// seven were missed. As a direct result, an untouched prescribed row saved
+// with prefilled targets (e.g. "135 x 5") but completed:false could still
+// establish an imaginary best weight, inflate estimated 1RM, pollute the
+// E1RM history graph, or become a false 1-/5-/10-rep PR, and could affect
+// later PR comparisons and weight suggestions (addPRSet, checkSetPR,
+// onSetChecked, the Active-1RM prompt, the exercise-profile stats, all in
+// app-core.js/app-library.js -- see the Round 6 traceability document for
+// the full caller list).
+//
+// The fix adds `planRunSetHasRecordedPerformance(s) &&` as an additional
+// gate in front of each function's own existing metric-specific numeric
+// check. It does not replace or loosen any of those existing checks:
+// - a completed weighted set with valid weight and reps still contributes
+//   to weight/1RM calculations exactly as before;
+// - a completed bodyweight set with zero/blank external weight and genuine
+//   reps still contributes wherever that function's own bodyweight
+//   calculation already supported it (getBestE1RMForExercise's second
+//   branch, unchanged);
+// - a completed timed set still contributes to time records;
+// - an unchecked set now never contributes, even with prefilled weight,
+//   reps, or time left untouched;
+// - a checked-but-blank set still never contributes (no weight/reps/time
+//   survives planRunSetHasRecordedPerformance's own evidence check);
+// - malformed/non-finite values still never contribute (same reason);
+// - supplemental and prescribed sets are treated identically here, exactly
+//   as before -- planRunSetHasRecordedPerformance does not distinguish
+//   them, and neither did any of these seven functions previously.
+// No progression, Finish, rules, persistence, or logger behavior is
+// touched by this correction -- it is confined to these seven read-only
+// aggregation functions.
+//
+// Compatibility note (traced, not assumed -- see the Round 6 rollback/
+// compatibility analysis for the full citation trail): every real
+// set-creation path in this codebase (addSet, addExToWorkout, addPRSet,
+// startNewWorkout, and the Program-Run planSetToLoggerSet/
+// planRunLoggerBuildWorkoutDoc pair) always initializes `completed` as an
+// explicit boolean -- it is never left undefined. No defensive "missing
+// completed" fallback exists anywhere in the ordinary (non-canonical)
+// workout code, unlike the explicit legacy-string fallbacks this same file
+// has for categories/movementStructure/executionStyle (above) -- meaning
+// nothing in this codebase's own history indicates `completed` was ever
+// optional on an ordinary logged set. No live Firestore data was inspected
+// this round (not permitted); this conclusion rests entirely on tracing
+// every real save/import code path, not on direct inspection.
 
 function getBest1RM(exId, excludeId) {
   let best = 0;
   appDb.workouts.filter(w => excludeId ? w.id !== excludeId : true)
     .forEach(w => w.exercises.filter(e => e.exerciseId===exId)
-      .forEach(e => e.sets.forEach(s => { if(s.weight&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>best)best=v;} })));
+      .forEach(e => e.sets.forEach(s => { if(planRunSetHasRecordedPerformance(s)&&s.weight&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>best)best=v;} })));
   return best;
 }
 
@@ -309,27 +373,28 @@ function getBestWeight(exId, excludeId) {
   let best = 0;
   appDb.workouts.filter(w => excludeId ? w.id !== excludeId : true)
     .forEach(w => w.exercises.filter(e => e.exerciseId===exId)
-      .forEach(e => e.sets.forEach(s => { if(+s.weight>best)best=+s.weight; })));
+      .forEach(e => e.sets.forEach(s => { if(planRunSetHasRecordedPerformance(s)&&+s.weight>best)best=+s.weight; })));
   return best;
 }
 
 function getBestTime(exId) {
   let best = 0;
   appDb.workouts.forEach(w => w.exercises.filter(e=>e.exerciseId===exId)
-    .forEach(e => e.sets.forEach(s=>{if(+s.time>best)best=+s.time;})));
+    .forEach(e => e.sets.forEach(s=>{if(planRunSetHasRecordedPerformance(s)&&+s.time>best)best=+s.time;})));
   return best || null;
 }
 
 function getBestReps(exId) {
   let best = 0;
   appDb.workouts.forEach(w => w.exercises.filter(e=>e.exerciseId===exId)
-    .forEach(e => e.sets.forEach(s=>{if(+s.reps>best)best=+s.reps;})));
+    .forEach(e => e.sets.forEach(s=>{if(planRunSetHasRecordedPerformance(s)&&+s.reps>best)best=+s.reps;})));
   return best || null;
 }
 
 function getBestE1RMForExercise(exId, bw) {
   let best = 0;
   appDb.workouts.forEach(w => w.exercises.filter(e=>e.exerciseId===exId).forEach(e => e.sets.forEach(s=>{
+    if(!planRunSetHasRecordedPerformance(s)) return;
     if(s.weight&&+s.weight>0&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>best)best=v;}
     if((!s.weight||+s.weight===0)&&s.reps&&bw){const v=calc1RM(bw,+s.reps);if(v>best)best=v;}
   })));
@@ -340,7 +405,7 @@ function getBestE1RMForExercise(exId, bw) {
 function getBestNRM(exId, targetReps) {
   let best = 0;
   appDb.workouts.forEach(w => w.exercises.filter(e => e.exerciseId === exId).forEach(e => e.sets.forEach(s => {
-    if (s.weight && s.reps && +s.reps === targetReps && +s.weight > best) best = +s.weight;
+    if (planRunSetHasRecordedPerformance(s) && s.weight && s.reps && +s.reps === targetReps && +s.weight > best) best = +s.weight;
   })));
   return best || null;
 }
@@ -354,7 +419,7 @@ function getE1RMHistory(exId) {
     if (!ex) return;
     let best = 0;
     ex.sets.forEach(s => {
-      if (s.weight && s.reps) {
+      if (planRunSetHasRecordedPerformance(s) && s.weight && s.reps) {
         const v = calc1RM(+s.weight, +s.reps);
         if (v > best) best = v;
       }
@@ -364,11 +429,18 @@ function getE1RMHistory(exId) {
   return points;
 }
 
+// PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- this function is not
+// currently called anywhere in the app (confirmed by search); fixed anyway
+// for consistency with every other exercises[].sets[] consumer, at zero
+// behavioral risk since nothing depends on it today. `all` previously
+// pushed every stored set unconditionally, including a blank/untouched
+// canonical placeholder, which would have inflated totalSets and polluted
+// recentSets with ghost entries if this were ever wired up.
 function getExerciseStats(exId) {
   const all = [];
   appDb.workouts.forEach(w => {
     const ex = w.exercises.find(e => e.exerciseId === exId);
-    if (ex) ex.sets.forEach(s => all.push(s));
+    if (ex) ex.sets.forEach(s => { if (planRunSetHasRecordedPerformance(s)) all.push(s); });
   });
   appDb.importedSets.filter(s => s.exerciseId === exId).forEach(s => all.push(s));
   if (!all.length) return null;

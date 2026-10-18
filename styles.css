@@ -400,8 +400,6 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 .set-badges { display: flex; flex-direction: column; gap: 3px; align-items: center; justify-content: center; flex-shrink: 0; }
 .set-badge-pr { background: transparent; border: 1px solid var(--green); border-radius: 2px; font-family: var(--font-display); font-size: 11px; font-weight: 700; color: var(--green); text-align: center; padding: 3px 5px; white-space: nowrap; letter-spacing: 0.04em; line-height: 1.2; }
 .set-badge-1rm { background: transparent; border: 1px solid #3F91DE; border-radius: 2px; font-family: var(--font-display); font-size: 11px; font-weight: 700; color: #3F91DE; text-align: center; padding: 3px 5px; white-space: nowrap; letter-spacing: 0.04em; line-height: 1.2; }
-/* SUPPLEMENTAL-SET CORRECTION: purely visual tag for a Set added beyond a Program Run's prescription; mirrors the existing PR/1RM badge styling, neutral gray so it is never confused with a PR or 1RM result. */
-.set-badge-extra { background: transparent; border: 1px solid var(--text3); border-radius: 2px; font-family: var(--font-display); font-size: 11px; font-weight: 700; color: var(--text3); text-align: center; padding: 3px 5px; white-space: nowrap; letter-spacing: 0.04em; line-height: 1.2; }
 .pr-target-line { font-size: 12px; color: var(--accent2); font-family: var(--font-display); font-weight: 600; letter-spacing: 0.03em; padding: 2px 0 4px 48px; display: none; }
 .pr-target-line.visible { display: block; }
 .plan-target-line { font-size: 12px; color: var(--text3); font-family: var(--font-display); font-weight: 600; letter-spacing: 0.02em; padding: 2px 0 4px 48px; }

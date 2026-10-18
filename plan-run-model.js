@@ -102,9 +102,14 @@ var PLAN_RUN_STATE_KEYS = Object.freeze([
 // 1-5 wherever they differ). IMPLEMENTATION ROUND, submitted for independent
 // review only -- see firebase-plan-run.js's header for the full
 // non-authorization notice, which applies equally here.
-// `CANONICAL_PLAN_RUN_CAPABILITY_ENABLED` (firebase-plan-run.js) remains
-// hardcoded `false`; nothing added by this feature is reachable from any
-// real browser load path.
+// ROUND 5 CORRECTION: this line previously said CANONICAL_PLAN_RUN_
+// CAPABILITY_ENABLED (firebase-plan-run.js) "remains hardcoded `false`;
+// nothing added by this feature is reachable from any real browser load
+// path." That was stale/wrong. The real, current value is hardcoded
+// `true` -- deliberately reactivated during Stage 6 and still enabled
+// through the supplemental-set deployment, an independently confirmed
+// baseline fact for this round, not a new finding -- and this feature IS
+// reachable from the real browser load path today.
 //
 // `PLAN_RUN_STATE_KEYS`/`planRunProgressionStateDocValid` immediately above
 // are the ORIGINAL, schema-version-1 shape and validator -- ZERO EDITS, per
@@ -506,9 +511,12 @@ function planRunProgressionStateDocValidV2(v) {
 // boundary check, firebase-plan-run.js) previously called the v1 validator
 // alone and must now accept either version's documents, since a single
 // occurrence's enabled Rules can legitimately be a mix of pre-existing v1
-// Rules and newly-created v2 Rules (a live Run from the brief
-// production-enabled window, Round 4 SS0, could in principle still be
-// active when this feature is ever turned on).
+// Rules and newly-created v2 Rules (a live Run from the production-enabled
+// window that began at Stage 6 and has continued since -- ROUND 5
+// CORRECTION: the words "could in principle still be active when this
+// feature is ever turned on" previously implied the feature was not yet
+// on; it has been on since Stage 6, so such a Run is not merely possible
+// in principle, it is the ordinary real case).
 function planRunProgressionStateDocValidAnyVersion(v) {
   return planRunProgressionStateDocValid(v) || planRunProgressionStateDocValidV2(v);
 }
@@ -527,7 +535,16 @@ function planRunProgressionStateDocValidAnyVersion(v) {
 function planRunApplicationDocValid(v) {
   if (!planRunExactKeys(v, PLAN_RUN_APPLICATION_KEYS)) return false;
   if (!planRunIsId(v.ownerUid) || !planRunIsId(v.planRunId) || !planRunIsId(v.planRuleId) || !planRunIsId(v.workoutId)) return false;
-  if (!['applied', 'reviewed', 'established'].includes(v.outcome)) return false;
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- 'notAttempted' is a
+  // new, fifth sibling outcome, added by the exact same mechanism this file
+  // already used to add 'established' (see that branch's own comment): no
+  // `decision` (an unattempted prescribed Set was never evaluated pass/fail
+  // -- that is the whole point of this outcome) and no `reviewReason` (this
+  // is explicitly NOT a review/attention case -- the owner's own
+  // instruction: an intentionally-partial workout must never read as
+  // "needs manual review"). Deliberately NOT added to PLAN_RUN_REVIEW_REASONS
+  // -- that list is reserved for genuine 'reviewed'-outcome reasons only.
+  if (!['applied', 'reviewed', 'established', 'notAttempted'].includes(v.outcome)) return false;
   if (v.outcome === 'applied') {
     if (!['passed', 'failed'].includes(v.decision)) return false;
     if (v.reviewReason !== null) return false;
@@ -535,7 +552,8 @@ function planRunApplicationDocValid(v) {
     if (v.decision !== null) return false;
     if (!PLAN_RUN_REVIEW_REASONS.includes(v.reviewReason)) return false;
   } else {
-    // 'established'
+    // 'established' or 'notAttempted' -- both carry neither a decision nor
+    // a review reason.
     if (v.decision !== null || v.reviewReason !== null) return false;
   }
   if (!planRunIsTimestamp(v.recordedAt)) return false;
@@ -589,27 +607,57 @@ function planRunOperationResultRefsValid(operationType, refs) {
     //   been able to WRITE since the four-bucket partition was introduced.
     //
     //   LEGACY (five keys) -- the original two-bucket shape this
-    //   application wrote before the four-bucket partition existed. No
-    //   deployment of any rules version that could accept this shape has
-    //   ever occurred (CANONICAL_PLAN_RUN_CAPABILITY_ENABLED has been
-    //   hardcoded false throughout this engagement, and
-    //   program-run-deployment-and-rollback-procedure-PROPOSED.md records
-    //   that no rules deployment has ever been executed) -- so no REAL
-    //   stored receipt in this shape exists today. This branch exists so
-    //   that IF this feature is deployed and later receives a genuine
-    //   legacy receipt from before this widening, reading it back does not
-    //   misclassify it as corrupted (receiptMalformed) merely because the
-    //   two new buckets did not exist when it was written -- not because
-    //   any such receipt has been proven to exist.
-    var finishCurrentKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds'];
-    var finishLegacyKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds'];
+    //   application wrote before the four-bucket partition existed.
+    //   ROUND 5 CORRECTION: this comment previously claimed "no deployment
+    //   of any rules version that could accept this shape has ever
+    //   occurred," citing CANONICAL_PLAN_RUN_CAPABILITY_ENABLED as
+    //   "hardcoded false throughout this engagement" and program-run-
+    //   deployment-and-rollback-procedure-PROPOSED.md as recording "no
+    //   rules deployment has ever been executed." Those claims were
+    //   stale/wrong: the capability has been hardcoded `true` and enabled
+    //   since Stage 6, and rules deployments have since occurred as part
+    //   of the staged rollout (confirmed baseline facts for this round,
+    //   not new findings). Whether any currently-stored receipt actually
+    //   uses this five-key legacy shape is a question about real stored
+    //   data this round does not inspect. This branch exists so that a
+    //   genuine legacy receipt from before this widening, if one is ever
+    //   read back, is not misclassified as corrupted (receiptMalformed)
+    //   merely because the two newer buckets did not exist when it was
+    //   written.
+    // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- widened AGAIN, by
+    // the exact same mechanism as the Round 2 four-bucket widening
+    // documented just above: the five-bucket partition adds
+    // notAttemptedRuleIds (a Rule whose evaluation this Finish genuinely
+    // recorded no attempt for -- see planEvaluateCanonicalProgression's own
+    // 'notAttempted' decision and firebase-plan-run.js's dispatch of it).
+    // The prior four-bucket shape becomes a second READ-tolerated legacy
+    // tier. ROUND 5 CORRECTION: the parenthetical that used to follow here
+    // gave the wrong reason for why no real stored receipt in this
+    // five-bucket (notAttemptedRuleIds-carrying) shape exists yet -- it
+    // said this capability "remains behind CANONICAL_PLAN_RUN_CAPABILITY_
+    // ENABLED=false and no rules deployment has ever been executed," which
+    // is stale/wrong on both counts (the capability is hardcoded `true`
+    // and has been enabled since Stage 6; rules deployments have occurred
+    // since). The actual, correct reason this five-bucket shape has no
+    // real stored receipt yet is narrower and still true: THIS field
+    // (notAttemptedRuleIds, the Round 4 widening) has never itself been
+    // included in any rules version that was actually deployed -- that is
+    // a fact about this one still-undeployed candidate change, not about
+    // whether the Program Run capability as a whole is enabled. The
+    // two-bucket shape remains the oldest tolerated tier, unchanged.
+    var finishCurrentKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds', 'notAttemptedRuleIds'];
+    var finishLegacyKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds'];
+    var finishOldestLegacyKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds'];
     var isCurrentShape = planRunExactKeys(refs, finishCurrentKeys);
     var isLegacyShape = !isCurrentShape && planRunExactKeys(refs, finishLegacyKeys);
-    if (!isCurrentShape && !isLegacyShape) return false;
+    var isOldestLegacyShape = !isCurrentShape && !isLegacyShape && planRunExactKeys(refs, finishOldestLegacyKeys);
+    if (!isCurrentShape && !isLegacyShape && !isOldestLegacyShape) return false;
     if (!planRunIsId(refs.workoutId) || !planRunIsId(refs.occurrenceId) || !planRunIsId(refs.planRunId)) return false;
     var finishBuckets = isCurrentShape
-      ? ['appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds']
-      : ['appliedRuleIds', 'needsManualReviewRuleIds'];
+      ? ['appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds', 'notAttemptedRuleIds']
+      : isLegacyShape
+        ? ['appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds']
+        : ['appliedRuleIds', 'needsManualReviewRuleIds'];
     var allFinishIds = [];
     for (var fb = 0; fb < finishBuckets.length; fb++) {
       var arr = refs[finishBuckets[fb]];
@@ -1268,6 +1316,64 @@ function planRunSetHasValidCompletionEvidence(prescribed, performed) {
   if (timePrescribed && !planRunIsFiniteNumber(performed.seconds)) return false;
   return true;
 }
+// PARTIAL-WORKOUT CORRECTION ROUND 5 (controlling finding -- a correction to
+// Round 4's own predicate, found by independent review, not by this
+// engagement's own testing): Round 4's version of this function (see git
+// history / the Round 4 diff) deliberately checked ONLY whether a Set
+// carries real weight/reps/time -- "independent of whether the Set is also
+// marked `completed`", by Round 4's own explicit design comment. That was
+// wrong. A real canonical Program Run logger row is PREFILLED with its own
+// prescribed target (a fixed-weight prescription initializes the row's own
+// `weight`; a fixed-reps prescription initializes `reps`; a percent-of-TM/
+// percent-of-1RM/working-load prescription resolves to a real numeric
+// `weight` the moment the occurrence is launched, before the person has
+// touched anything) -- completely independently of whether the person has
+// ever checked that row's own checkbox. Round 4's predicate therefore
+// returned `true` for `{reps:'8', completed:false}` and for
+// `{weight:'135', completed:false}` -- an untouched, unchecked, merely
+// PREFILLED prescribed row -- while correctly returning `false` only for a
+// row with no prefilled target at all. Every History/stats/search/export/PR
+// consumer calls this function ALONE (never ANDing it with a separate
+// `completed` check -- that was only ever done at one, single call site,
+// this function's own supplemental-Set eligibility branch below), so a
+// genuinely untouched, unperformed prescribed row with a real prescribed
+// target was counted as performed work everywhere else. Reproduced and
+// confirmed directly against the Round 4 delivered code before this fix.
+//
+// FIX: `completed === true` is now THIS function's own, single, explicit
+// first gate -- not a separately-remembered second check callers must
+// independently remember to AND in. "Was this marked done" and "does it
+// carry real data" are no longer two independently-required facts spread
+// across caller and callee; they are now both checked in exactly one place.
+// The eligibility branch below no longer needs its own separate
+// `completed === true` conjunct (kept anyway, harmless and explicit, since
+// removing it changes nothing now that this function enforces it first).
+//
+// Everything else about the ORIGINAL Round 4 numeric-evidence rule is
+// UNCHANGED, and remains the exact weight-then-reps-then-time truthy-OR
+// chain this codebase's own History/export rendering already applied in
+// four places before Round 4 (getWorkoutHighlights, formatSetStr,
+// buildRecentExpandedHtml's row renderer, openExHistoryModal's row
+// renderer): a real weight strictly greater than zero, OR a real reps
+// count, OR a real time/duration count. A zero or null weight is never, by
+// itself, "blank" -- a genuine, COMPLETED bodyweight Set with real reps or
+// real time still counts; a `completed:false` row is now excluded
+// regardless of what numeric values happen to be prefilled on it. `+value`
+// still tolerates a numeric STRING (real accumulated workout history may
+// predate this correction and may still store numbers as strings), and
+// `Number.isFinite` still rejects NaN/+-Infinity uniformly. Used directly
+// by every History/stats/search/export/PR/E1RM consumer of
+// `exercises[].sets[]` (app-core.js, app-data.js), and by this function's
+// own supplemental-Set eligibility branch below (plan-run-model.js), and
+// nowhere else -- one function, one definition, every consumer.
+function planRunSetHasRecordedPerformance(set) {
+  if (!planRunIsPlainObject(set)) return false;
+  if (set.completed !== true) return false;
+  if (set.weight && Number.isFinite(+set.weight) && +set.weight > 0) return true;
+  if (set.reps && Number.isFinite(+set.reps)) return true;
+  if (set.time && Number.isFinite(+set.time)) return true;
+  return false;
+}
 function planRunOccurrenceEligibleForCompletion(occurrenceDoc, workoutDoc) {
   if (!planRunOccurrenceDocValid(occurrenceDoc) || !planRunWorkoutDocValid(workoutDoc)) return false;
   var performedBySetId = {};
@@ -1285,6 +1391,59 @@ function planRunOccurrenceEligibleForCompletion(occurrenceDoc, workoutDoc) {
     for (var s2 = 0; s2 < a.orderedSets.length; s2++) {
       var os = a.orderedSets[s2];
       if (planRunSetHasValidCompletionEvidence(os.prescribed, performedBySetId[os.planSetId])) return true;
+    }
+  }
+  // PARTIAL-WORKOUT CORRECTION (production finding: Finish Workout wrongly
+  // blocked with "insufficient... evidence" even though the person
+  // genuinely did real work in this occurrence): a Set the person added
+  // beyond the prescription (isSupplemental:true) never counts as
+  // PRESCRIBED evidence above, and this does not change that -- it still
+  // never matches any real planSetId, so it can never satisfy the loop
+  // above, and it still never reaches planRunBuildProgressionTriple/the
+  // progression evaluator (those stay planSetId-keyed only, unchanged) --
+  // a supplemental Set still never influences progression or deferred
+  // working-weight/training-max establishment, exactly as the owner
+  // decided in the supplemental-set correction. But THIS function's own
+  // job is only to decide whether there is ANYTHING in this occurrence
+  // worth letting Finish save -- not whether a PRESCRIBED Set specifically
+  // was completed. A genuinely completed supplemental Set is real, honest
+  // evidence that the person did something real here; without this, a
+  // person who logs their actual work exclusively through added Sets
+  // (for instance because every prescribed Set in this occurrence was
+  // still an untouched blank placeholder they never happened to fill in
+  // themselves) is wrongly told there is not enough evidence to save work
+  // that genuinely exists. Requires completed:true on the Set itself -- a
+  // supplemental Set carries no prescription of its own to validate
+  // reps/time against, so the person's own explicit "done" mark is the
+  // only, and sufficient, signal available here.
+  //
+  // ROUND 4 CORRECTION (finding 2) -- "the only, and sufficient, signal"
+  // above was wrong: `completed:true` alone, with no requirement that the
+  // Set actually carry any recorded weight/reps/time, let a checked-but-
+  // entirely-blank added row qualify an otherwise-empty workout -- real,
+  // reproduced evidence, not a hypothetical. completed:true is still
+  // REQUIRED; it is no longer SUFFICIENT on its own --
+  // planRunSetHasRecordedPerformance (above) must also find genuine
+  // recorded weight, reps, or time on the Set. A legitimate zero-weight/
+  // bodyweight added Set (real reps or real time, weight legitimately 0 or
+  // null) still qualifies, unchanged; a checked-but-blank added Set no
+  // longer does.
+  //
+  // ROUND 5 NOTE: `planRunSetHasRecordedPerformance` itself now ALSO
+  // enforces `completed === true` as its own first gate (the Round 5
+  // controlling-finding fix, above) -- so the explicit
+  // `sets2[s3].completed === true &&` conjunct immediately below is, as of
+  // this round, logically redundant with what the predicate it is ANDed
+  // with already checks. It is kept here anyway, unchanged and explicit,
+  // for two reasons: (1) it costs nothing (`true && X` is exactly `X`), and
+  // (2) it keeps this call site self-documenting on its own -- a reader
+  // does not have to go verify the predicate's own internals to know this
+  // branch requires an explicit "done" mark, which remains true and
+  // remains the right thing to say here.
+  for (var e2 = 0; e2 < workoutDoc.exercises.length; e2++) {
+    var sets2 = workoutDoc.exercises[e2].sets;
+    for (var s3 = 0; s3 < sets2.length; s3++) {
+      if (sets2[s3].isSupplemental === true && sets2[s3].completed === true && planRunSetHasRecordedPerformance(sets2[s3])) return true;
     }
   }
   return false;
@@ -1559,27 +1718,45 @@ function planRunClassifyFinishOccurrence(p) {
     for (var i = 0; i < expected.length; i++) if (!perRuleFullyValid(map, expected[i])) return false;
     return true;
   }
-  // Returns one of 'applied' | 'reviewed' | 'established' | 'stillUnresolved'
-  // for an expected Rule id already confirmed accounted-for by
-  // `perRuleFullyValid` above -- never called otherwise.
+  // Returns one of 'applied' | 'reviewed' | 'established' | 'notAttempted' |
+  // 'stillUnresolved' for an expected Rule id already confirmed
+  // accounted-for by `perRuleFullyValid` above -- never called otherwise.
+  //
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- 'notAttempted' added
+  // as its own explicit, named bucket. Before this fix, an application
+  // record's genuine outcome:'notAttempted' fell through this function's
+  // own `return 'stillUnresolved'` default (the only prior fallback,
+  // written when only four outcomes existed) -- silently MISCLASSIFYING a
+  // genuinely-recorded neutral result as "no record was ever written for
+  // this Rule" on every Retry/Check-Status reconciliation path that calls
+  // reconstructResultRefs (branches (a) and (b) below). This is a real,
+  // reproduced defect (caught by this round's own new transaction-level
+  // Retry idempotency test, not a hypothetical): the ORIGINAL commit (step
+  // 11 of fsPlanRunFinish, in firebase-plan-run.js) already reports
+  // notAttemptedRuleIds correctly, but every reconciled Retry/Check-Status
+  // call afterward silently relabeled that same Rule as stillUnresolved
+  // instead. Fixed by checking for a genuinely-existing record explicitly
+  // (any of the five named outcomes) before ever falling back to the
+  // "no record exists at all" default.
   function ruleOutcomeBucket(map, key) {
     var r = map && map[key];
-    if (r && r.exists) return r.outcome; // 'applied' | 'reviewed' | 'established'
+    if (r && r.exists) return r.outcome; // 'applied' | 'reviewed' | 'established' | 'notAttempted'
     return 'stillUnresolved';
   }
   function reconstructResultRefs(map, workoutId) {
-    var applied = [], reviewed = [], established = [], stillUnresolved = [];
+    var applied = [], reviewed = [], established = [], notAttempted = [], stillUnresolved = [];
     expected.forEach(function (rid) {
       var bucket = ruleOutcomeBucket(map, rid);
       if (bucket === 'applied') applied.push(rid);
       else if (bucket === 'reviewed') reviewed.push(rid);
       else if (bucket === 'established') established.push(rid);
+      else if (bucket === 'notAttempted') notAttempted.push(rid);
       else stillUnresolved.push(rid);
     });
     return {
       workoutId: workoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId,
       appliedRuleIds: applied, needsManualReviewRuleIds: reviewed,
-      establishedRuleIds: established, stillUnresolvedRuleIds: stillUnresolved
+      establishedRuleIds: established, notAttemptedRuleIds: notAttempted, stillUnresolvedRuleIds: stillUnresolved
     };
   }
   // FOUNDATION SLICE ADDITION (spec §3A.6.9.2/§3A.6.9.3) -- the slot
@@ -1640,25 +1817,32 @@ function planRunClassifyFinishOccurrence(p) {
       // reconciled exactly like 'applied'/'reviewed' always were, via the
       // same actual-vs-claimed sorted-array comparison, generalized rather
       // than duplicated.
+      // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- widened from four
+      // buckets to five, exactly like every prior widening of this same
+      // comparison (two -> four, Round 2 SS8.2). notAttemptedRuleIds is
+      // compared and round-tripped identically to the other four buckets.
       var actualRefs = reconstructResultRefs(p.perRuleAtRequested, p.requestedWorkoutId);
       var actualApplied = actualRefs.appliedRuleIds.slice().sort();
       var actualReviewed = actualRefs.needsManualReviewRuleIds.slice().sort();
       var actualEstablished = actualRefs.establishedRuleIds.slice().sort();
+      var actualNotAttempted = actualRefs.notAttemptedRuleIds.slice().sort();
       var actualStillUnresolved = actualRefs.stillUnresolvedRuleIds.slice().sort();
       var claimedApplied = (p.receipt.appliedRuleIds || []).slice().sort();
       var claimedReviewed = (p.receipt.needsManualReviewRuleIds || []).slice().sort();
       var claimedEstablished = (p.receipt.establishedRuleIds || []).slice().sort();
+      var claimedNotAttempted = (p.receipt.notAttemptedRuleIds || []).slice().sort();
       var claimedStillUnresolved = (p.receipt.stillUnresolvedRuleIds || []).slice().sort();
       if (JSON.stringify(actualApplied) === JSON.stringify(claimedApplied) &&
           JSON.stringify(actualReviewed) === JSON.stringify(claimedReviewed) &&
           JSON.stringify(actualEstablished) === JSON.stringify(claimedEstablished) &&
+          JSON.stringify(actualNotAttempted) === JSON.stringify(claimedNotAttempted) &&
           JSON.stringify(actualStillUnresolved) === JSON.stringify(claimedStillUnresolved)) {
         return {
           branch: 'a', outcome: 'alreadyCommitted', packageHashVerified: !!p.haveFullPackage,
           resultRefs: {
             workoutId: p.requestedWorkoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId,
             appliedRuleIds: claimedApplied, needsManualReviewRuleIds: claimedReviewed,
-            establishedRuleIds: claimedEstablished, stillUnresolvedRuleIds: claimedStillUnresolved
+            establishedRuleIds: claimedEstablished, notAttemptedRuleIds: claimedNotAttempted, stillUnresolvedRuleIds: claimedStillUnresolved
           }
         };
       }
@@ -2710,6 +2894,7 @@ if (typeof module !== 'undefined' && module.exports) {
     planRunClassifyWorkoutDiscriminator: planRunClassifyWorkoutDiscriminator,
     planRunWorkoutContextMatchesOccurrence: planRunWorkoutContextMatchesOccurrence,
     planRunSetHasValidCompletionEvidence: planRunSetHasValidCompletionEvidence,
+    planRunSetHasRecordedPerformance: planRunSetHasRecordedPerformance,
     planRunOccurrenceEligibleForCompletion: planRunOccurrenceEligibleForCompletion,
     planRunBuildProgressionTriple: planRunBuildProgressionTriple,
     planRunFinishStructuralBoundaryOk: planRunFinishStructuralBoundaryOk,

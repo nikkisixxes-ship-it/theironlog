@@ -6,10 +6,16 @@
 // own open design question." This file IS that answer.
 //
 // STATUS / NON-AUTHORIZATION NOTICE: submitted for INDEPENDENT REVIEW ONLY.
-// CANONICAL_PLAN_RUN_CAPABILITY_ENABLED (firebase-plan-run.js) remains
-// hardcoded false -- every real persistence call this file makes begins with
-// that file's own disabledGate() and therefore issues zero Firestore I/O in
-// production today. This file never calls, and never wires a control to,
+// ROUND 5 CORRECTION: this comment previously said CANONICAL_PLAN_RUN_
+// CAPABILITY_ENABLED (firebase-plan-run.js) "remains hardcoded false" and
+// that this file's persistence calls therefore "issue zero Firestore I/O in
+// production today." That was stale/wrong. The real, current value is
+// hardcoded `true` -- deliberately reactivated during Stage 6 and still
+// enabled through the supplemental-set deployment, an independently
+// confirmed baseline fact for this round, not a new finding. With the flag
+// true, disabledGate() does NOT throw, so every real persistence call this
+// file makes DOES issue real Firestore I/O in production today. This file
+// never calls, and never wires a control to,
 // fsPlanRunFinish / fsPlanRunPreflightFinish / fsPlanRunCheckFinishStatus /
 // fsPlanRunEnd / fsPlanRunPreflightEnd / fsPlanRunCheckEndStatus, any
 // progression-EVALUATION function, any workout-history function, or the

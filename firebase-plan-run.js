@@ -3,18 +3,31 @@
 // specification (canonical-program-run-lifecycle-specification-round8.md).
 // FIRESTORE-FACING TRANSACTION LAYER.
 //
-// STATUS / NON-AUTHORIZATION NOTICE: this file implements a narrowly scoped
-// Run-persistence slice submitted for INDEPENDENT REVIEW ONLY. It does not
-// authorize, and has not been used for, deployment, Firestore-rule
-// publication, capability activation, migration, or any real-data change.
-// It is NOT referenced by index.html and carries no browser-reachable path
-// of any kind today -- every real exercise of this file in this delivery is
-// through Node (`require`) or a Node `vm` sandbox, exactly like this
-// codebase's own existing standalone test harnesses already load
-// firebase.js/app-plan.js. `CANONICAL_PLAN_RUN_CAPABILITY_ENABLED` below is
-// hardcoded `false` and is never read, referenced, or overridden by
-// anything outside this file's own dispatch gate -- there is no mutable
-// switch, query parameter, or global setter anywhere.
+// STATUS / NON-AUTHORIZATION NOTICE: this correction round is submitted for
+// INDEPENDENT REVIEW ONLY and does not itself authorize, and has not been
+// used for, any new deployment, Firestore-rule publication, capability
+// activation, migration, or real-data change.
+//
+// ROUND 5 CORRECTION: the paragraph that used to be here claimed this file
+// "is NOT referenced by index.html and carries no browser-reachable path of
+// any kind today," that every real exercise of it happens only "through
+// Node (`require`) or a Node `vm` sandbox," and that `CANONICAL_PLAN_RUN_
+// CAPABILITY_ENABLED` below "is hardcoded `false`." All three claims were
+// stale/wrong, independently re-verified this round:
+//   - index.html DOES load this file directly (`<script src="firebase-
+//     plan-run.js">`), in both the baseline and this candidate.
+//   - CANONICAL_PLAN_RUN_CAPABILITY_ENABLED below is hardcoded `true`, not
+//     `false`.
+//   - This is not a newly discovered production incident: the capability
+//     was deliberately reactivated during Stage 6 and has remained enabled
+//     through the subsequent controlled production tests and the
+//     supplemental-set deployment. That is an independently confirmed
+//     baseline fact for this round. This round does not change it, does
+//     not turn it off, and does not deploy anything.
+// `CANONICAL_PLAN_RUN_CAPABILITY_ENABLED` is never read, referenced, or
+// overridden by anything outside this file's own dispatch gate -- there is
+// no mutable switch, query parameter, or global setter anywhere; its one
+// and only value is the hardcoded `true` set once below.
 //
 // STYLE CONVENTION: this file mirrors firebase-plan-progression.js's own
 // IIFE-with-`root`-attachment shape (a private dependency-injected factory,
@@ -33,10 +46,18 @@
 (function (root) {
   'use strict';
 
-  // Per task instructions §2/§6: "Any new Run-specific capability must
-  // default to disabled, with isolated test-only access absent from real
-  // browser loads." This is the ONE such capability this slice introduces.
-  // It is never switched true anywhere in this file, in any real code path.
+  // Per task instructions §2/§6 (original slice): "Any new Run-specific
+  // capability must default to disabled, with isolated test-only access
+  // absent from real browser loads." This is the ONE such capability this
+  // slice introduced, defaulting to disabled when first built. ROUND 5
+  // CORRECTION: the sentence that used to follow here claimed the flag "is
+  // never switched true anywhere in this file, in any real code path" --
+  // stale/wrong. The flag below IS hardcoded `true`: it was deliberately
+  // switched on during Stage 6 and has remained enabled since, through the
+  // controlled production tests and the supplemental-set deployment. That
+  // is an independently confirmed baseline fact for this round, not a new
+  // finding, and this round preserves it as `true` -- it does not turn it
+  // off.
   var CANONICAL_PLAN_RUN_CAPABILITY_ENABLED = false;
 
   function M(name) {
@@ -727,7 +748,17 @@
           // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2: the two
           // new buckets, read out alongside the original two so branch (a)'s
           // receipt reconciliation (plan-run-model.js) can compare all four.
-          establishedRuleIds: receiptSnap.data.resultRefs.establishedRuleIds, stillUnresolvedRuleIds: receiptSnap.data.resultRefs.stillUnresolvedRuleIds
+          establishedRuleIds: receiptSnap.data.resultRefs.establishedRuleIds, stillUnresolvedRuleIds: receiptSnap.data.resultRefs.stillUnresolvedRuleIds,
+          // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- the fifth
+          // bucket, read out identically to the other four so branch (a)'s
+          // receipt reconciliation can compare all five (plan-run-model.js's
+          // own planRunClassifyFinishOccurrence/reconstructResultRefs,
+          // widened alongside this). Without this, a Retry for a Rule whose
+          // ORIGINAL commit genuinely recorded notAttemptedRuleIds would
+          // compare the stored receipt's notAttemptedRuleIds as always-empty
+          // against the correctly-reconstructed actual bucket, and never
+          // match -- a real, caught defect, not a hypothetical.
+          notAttemptedRuleIds: receiptSnap.data.resultRefs.notAttemptedRuleIds
         };
       }
 
@@ -977,7 +1008,7 @@
 
           // Step 11 -- pure computation only; nothing is written to `tx` yet.
           var now = deps.timestamp();
-          var appliedIds = [], reviewedIds = [], establishedIds = [], stillUnresolvedIds = [], stagedStateWrites = [], stagedRecordWrites = [];
+          var appliedIds = [], reviewedIds = [], establishedIds = [], stillUnresolvedIds = [], notAttemptedIds = [], stagedStateWrites = [], stagedRecordWrites = [];
           for (var k = 0; k < r.enabledRules.length; k++) {
             var ruleEntry = r.enabledRules[k].ruleEntry, assignment = r.enabledRules[k].assignment;
             var rid = ruleEntry.planRuleId;
@@ -1056,6 +1087,28 @@
               stagedStateWrites.push({ path: statePath, ruleId: rid, data: { status: 'needsManualReview', needsManualReviewReason: reviewReason, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
               stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'reviewed', decision: null, reviewReason: reviewReason, recordedAt: now } });
               reviewedIds.push(rid);
+            } else if (!isUnresolved && evaluatedDecision.decision === 'notAttempted') {
+              // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- a genuinely
+              // neutral result (no attempt recorded for this Rule's basis
+              // this Finish): the progressionState document itself writes
+              // through the EXACT SAME "active, needsManualReviewReason
+              // null, currentValue unchanged" shape the ordinary
+              // resolved-and-evaluated write already uses (nextValue is
+              // currentValue verbatim for 'notAttempted' -- see
+              // planEvaluateCanonicalProgression) -- no new status value,
+              // no rules change needed for this document. The DISTINCTION
+              // from an ordinary applied/failed result is carried entirely
+              // by the per-workout application record's own new
+              // 'notAttempted' outcome (decision:null, reviewReason:null --
+              // plan-run-model.js's planRunApplicationDocValid, widened by
+              // this same correction) and by this receipt's own new
+              // notAttemptedRuleIds bucket below -- never by
+              // 'needsManualReview'/'failed', per the owner's explicit
+              // instruction not to force this into an existing category
+              // with a different meaning.
+              stagedStateWrites.push({ path: statePath, ruleId: rid, data: { currentValue: evaluatedDecision.nextValue, status: 'active', needsManualReviewReason: null, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
+              stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'notAttempted', decision: null, reviewReason: null, recordedAt: now } });
+              notAttemptedIds.push(rid);
             } else if (!isUnresolved) {
               stagedStateWrites.push({ path: statePath, ruleId: rid, data: { currentValue: evaluatedDecision.nextValue, status: 'active', needsManualReviewReason: null, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
               stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'applied', decision: evaluatedDecision.decision, reviewReason: null, recordedAt: now } });
@@ -1119,7 +1172,13 @@
           var runUpdate = { remainingOccurrenceIds: removal.remainingOccurrenceIds, nextOccurrenceId: removal.nextOccurrenceId, updatedAt: now };
           if (runBecomesComplete) { runUpdate.status = 'complete'; runUpdate.completedAt = now; }
           var finalRunData = Object.assign({}, runDoc, runUpdate);
-          var resultRefs = { workoutId: pkg.workoutId, occurrenceId: pkg.occurrenceId, planRunId: pkg.planRunId, appliedRuleIds: appliedIds, needsManualReviewRuleIds: reviewedIds, establishedRuleIds: establishedIds, stillUnresolvedRuleIds: stillUnresolvedIds };
+          // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- fifth bucket,
+          // added by the exact same mechanism the four-bucket widening
+          // above already used. Every expected Rule id still appears in
+          // EXACTLY one of the now-five arrays (plan-run-model.js's own
+          // planRunOperationResultRefsValid duplicate check, widened
+          // alongside this).
+          var resultRefs = { workoutId: pkg.workoutId, occurrenceId: pkg.occurrenceId, planRunId: pkg.planRunId, appliedRuleIds: appliedIds, needsManualReviewRuleIds: reviewedIds, establishedRuleIds: establishedIds, stillUnresolvedRuleIds: stillUnresolvedIds, notAttemptedRuleIds: notAttemptedIds };
           var receiptData2 = { ownerUid: pkg.ownerUid, operationId: pkg.operationId, operationType: 'runFinish', preparedPackageHash: packageHash(pkg), outcome: 'committed', resultRefs: resultRefs, createdAt: now };
 
           // ROUND 3 CORRECTION (finding 3): the real, non-bypassable
@@ -2264,10 +2323,12 @@
 
   var surface = createRunPersistence(productionDeps(), CANONICAL_PLAN_RUN_CAPABILITY_ENABLED);
   root.fsPlanRunPersistence = surface;
-  // SLICE 1 ADDITION -- expose the (hardcoded-false) capability flag itself
-  // on the shared realm, read-only in effect (nothing outside this file
-  // ever assigns to it), so app-plan-run-ui.js can gate its own rendering
-  // without needing any write-capable access to this module's internals.
+  // SLICE 1 ADDITION -- expose the capability flag itself on the shared
+  // realm, read-only in effect (nothing outside this file ever assigns to
+  // it), so app-plan-run-ui.js can gate its own rendering without needing
+  // any write-capable access to this module's internals. ROUND 5
+  // CORRECTION: this previously called the flag "(hardcoded-false)" --
+  // stale/wrong, corrected above; the flag is hardcoded `true`.
   root.CANONICAL_PLAN_RUN_CAPABILITY_ENABLED = CANONICAL_PLAN_RUN_CAPABILITY_ENABLED;
 
   if (typeof module !== 'undefined' && module.exports) {

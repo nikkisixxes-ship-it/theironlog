@@ -935,6 +935,14 @@ function finalizeStartActiveWorkout(activeId, mi, si) {
   const sessName = sess.name || `Session ${si + 1}`;
   const name = `${mcName} · ${sessName}`;
 
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8):
+  // audited this function as a real ownership-transition site -- unlike
+  // planRunLoggerLaunch, nothing here previously refused to overwrite an
+  // already-open currentWorkout, so a pending debounce timer from
+  // whatever workout was open before this call could otherwise go on to
+  // mutate the NEW workout assigned just below if it happened to reuse the
+  // same exIdx/setIdx indices. Cleared here, before the replacement.
+  clearAllPRDebounceTimers();
   currentWorkout = {
     id: uid(), name, date: Date.now(), exercises: [], rpeEnabled: false, duration: 0, bodyweight: null,
     programId: null, microcycleIdx: null, sessionIdx: null,
@@ -1494,7 +1502,11 @@ function hasFutureWorkingLoadOccurrence(active, exerciseId) {
 // ==================== HISTORY STATS ====================
 function renderHistoryStats() {
   const total = appDb.workouts.length;
-  const totalSets = appDb.workouts.reduce((a,w) => a + w.exercises.reduce((b,e) => b + e.sets.length, 0), 0) + appDb.importedSets.length;
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- was e.sets.length
+  // (raw array length), counting every blank/untouched canonical placeholder
+  // as a performed set. Now counts only sets carrying genuine recorded
+  // performance (shared predicate, plan-run-model.js).
+  const totalSets = appDb.workouts.reduce((a,w) => a + w.exercises.reduce((b,e) => b + e.sets.filter(planRunSetHasRecordedPerformance).length, 0), 0) + appDb.importedSets.length;
   let totalVol = 0;
   appDb.workouts.forEach(w => w.exercises.forEach(e => e.sets.forEach(s => { if (s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); })));
   appDb.importedSets.forEach(s => { if (s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); });
@@ -1552,19 +1564,31 @@ function onSetChecked(exIdx, si, checked) {
   if (checked && workoutPaused) resumeWorkout();
   const wrap = document.getElementById(`set-wrap-${exIdx}-${si}`);
   if (wrap) wrap.classList.toggle('completed', checked);
-  if (checked && s.weight && s.reps) {
-    s.isNew1RM = calc1RM(+s.weight, +s.reps) > getBest1RM(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id);
-    s.isPR = +s.weight > getBestWeight(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id);
-  }
+  // ONE CONSISTENT RULE (this round, Round 8): routed through the single
+  // computeSetPRFlags helper (defined with updateSet/checkSetPR below) --
+  // this function no longer carries its own copy of the completed/weight/
+  // reps gate or the two comparison lines. Round 7's own fix (explicitly
+  // clearing both flags whenever this Set is not both checked and
+  // qualifying, so unchecking or checking-while-still-blank never leaves a
+  // stale true flag) is preserved exactly -- computeSetPRFlags itself
+  // always returns {isPR:false, isNew1RM:false} for anything not completed
+  // and valid, which is the same outcome, just no longer a second,
+  // independently-maintained copy of the rule. Round 8 additionally closes
+  // Finding 2 here too: computeSetPRFlags requires a genuine finite
+  // positive weight/reps, not merely a truthy value, so `Infinity` or a
+  // malformed numeric string can no longer earn a flag through this path
+  // either.
+  const checkFlags = computeSetPRFlags(s, currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id);
+  s.isPR = checkFlags.isPR;
+  s.isNew1RM = checkFlags.isNew1RM;
   const badgesEl = document.getElementById(`set-badges-${exIdx}-${si}`);
   if (badgesEl) {
-    // SUPPLEMENTAL-SET CORRECTION: this partial re-render (badges only, not
-    // the whole row) must preserve the real EXTRA tag exactly like the full
-    // buildSetsHTML render does -- otherwise checking/unchecking a
-    // supplemental Set would visually (and misleadingly) wipe its own EXTRA
-    // tag even though the underlying Set is still genuinely supplemental.
-    const extraTagHtml = s.isSupplemental === true ? `<span class="set-badge-extra">EXTRA</span>` : '';
-    const html = buildSetBadgesHtml(s) + extraTagHtml;
+    // EXTRA-LABEL REMOVAL CORRECTION: this partial re-render (badges only,
+    // not the whole row) now matches the full buildSetsHTML render above --
+    // neither renders the EXTRA tag anymore. A supplemental Set's PR/1RM
+    // badges (the only thing this function ever shows) still render
+    // identically to a prescribed Set's own.
+    const html = buildSetBadgesHtml(s);
     badgesEl.innerHTML = html;
     const rowEl = document.getElementById(`set-row-${exIdx}-${si}`);
     if (rowEl && html && !rowEl.style.gridTemplateColumns.includes('auto')) {
@@ -2080,6 +2104,10 @@ function evaluateWorkoutProgression(workout, activeProgram) {
 
 // ==================== START WORKOUT ====================
 function startNewWorkout(programId, microcycleIdx, sessionIdx) {
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8): see
+  // finalizeStartActiveWorkout's own comment above -- same real gap, same
+  // fix, cleared before the replacement just below.
+  clearAllPRDebounceTimers();
   const name = (programId != null) ? getProgramSessionName(programId, microcycleIdx, sessionIdx) : '';
   currentWorkout = { id: uid(), name, date: Date.now(), exercises: [], rpeEnabled: false, duration: 0, bodyweight: null, programId: programId||null, microcycleIdx: microcycleIdx!=null?microcycleIdx:null, sessionIdx: sessionIdx!=null?sessionIdx:null };
   if (programId != null) {
@@ -2200,12 +2228,18 @@ function buildSetsHTML(ex, exIdx, isTime, rpe) {
     const inputCls = s.autoFilled ? 'set-input auto-filled' : 'set-input';
     const repCls   = (s.autoFilled && s.autoType === 'rep_goal') ? 'set-input auto-filled' : 'set-input';
     const wrapCls  = s.completed ? 'set-row-wrap completed' : 'set-row-wrap';
-    // SUPPLEMENTAL-SET CORRECTION: a small, purely visual "EXTRA" tag marks
-    // a Set the person added beyond the Program Run's own prescription
-    // (isSupplemental:true) -- shown regardless of completed/PR state.
-    // Purely additive: a prescribed Set's own badges are never touched.
-    const extraTagHtml = s.isSupplemental === true ? `<span class="set-badge-extra">EXTRA</span>` : '';
-    const badgesHtml = buildSetBadgesHtml(s) + extraTagHtml;
+    // EXTRA-LABEL REMOVAL CORRECTION: the supplemental-set correction
+    // previously rendered a small, purely visual "EXTRA" tag on any Set
+    // the person added beyond the Program Run's own prescription
+    // (isSupplemental:true). Per the owner's explicit direction, that tag
+    // is removed from every user-facing presentation -- it added visual
+    // noise, told the person nothing useful, and competed with the real
+    // PR/estimated-1RM badges for the same small space. The underlying
+    // isSupplemental:true metadata is NOT removed (addSet in this same
+    // file still stamps it, exactly as before) -- only this visual tag is
+    // gone. A Set the person added now looks and behaves like an ordinary
+    // Set in every way the person can see.
+    const badgesHtml = buildSetBadgesHtml(s);
     const gridCols = rpe ? `40px 1fr 1fr 64px${badgesHtml ? ' auto' : ''}` : `40px 1fr 1fr${badgesHtml ? ' auto' : ''}`;
     return `<div class="${wrapCls}" id="set-wrap-${exIdx}-${si}">
       <div class="${rowCls}" id="set-row-${exIdx}-${si}" style="grid-template-columns:${gridCols}">
@@ -2254,18 +2288,167 @@ function attachSwipeToSet(exIdx, si) {
 }
 
 // ==================== SET OPERATIONS ====================
+// SYNCHRONOUS DERIVED-FLAG RECOMPUTATION (this round, Round 8). Finding 2
+// (malformed numeric gating): every prior round's own gate was plain
+// truthiness (`s.weight && s.reps`) -- truthy for `Infinity`, `"Infinity"`,
+// and any other non-empty-but-malformed value, which is not the same as
+// "a valid finite positive number". `coercePositiveFiniteNumber` is the
+// one place that decides whether a raw, possibly-string, possibly-garbage
+// input value counts as real evidence at all.
+function coercePositiveFiniteNumber(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'string' && v.trim() === '') return null;
+  const n = +v;
+  return (Number.isFinite(n) && n > 0) ? n : null;
+}
+// ONE CONSISTENT RULE (this round, Round 8): `onSetChecked` and
+// `checkSetPR` previously each carried their OWN copy of the same
+// "completed && weight && reps" truthiness gate and their own copy of the
+// same two comparison lines -- two subtly-independent places that could
+// drift. This is now the single synchronous source of truth both of them
+// (and every pre-save recompute -- see recomputeAllSetPRFlags below) route
+// through. It never touches the DOM and never schedules anything -- it is
+// a pure function of (set, exerciseId, excludeId) that always returns a
+// definite `{isPR, isNew1RM}` pair, explicitly false whenever the Set is
+// not genuinely completed and valid, exactly matching the required
+// invariant: isPR/isNew1RM may be true only when the set is completed, its
+// required values are valid finite positive numbers, and a synchronous
+// comparison against genuine historical performance currently shows the
+// flag is deserved. `excludeId` is passed straight through to
+// getBestWeight/getBest1RM, respecting the exact same self-exclusion
+// behavior those two already-corrected functions have always had.
+function computeSetPRFlags(s, exerciseId, excludeId) {
+  const completed = s && s.completed === true;
+  const weight = completed ? coercePositiveFiniteNumber(s.weight) : null;
+  const reps = completed ? coercePositiveFiniteNumber(s.reps) : null;
+  if (!completed || weight === null || reps === null) {
+    return { isPR: false, isNew1RM: false };
+  }
+  return {
+    isNew1RM: calc1RM(weight, reps) > getBest1RM(exerciseId, excludeId),
+    isPR: weight > getBestWeight(exerciseId, excludeId)
+  };
+}
+// SYNCHRONOUS PRE-SAVE RECOMPUTATION (this round, Round 8). Called
+// immediately before each real persistence path serializes or saves a
+// workout (see finishWorkout's two call sites and
+// finishCanonicalRunWorkout, app-plan-run-logger-ui.js) -- never merely
+// checks whether the flags already in memory look structurally plausible,
+// genuinely recalculates whether each one is currently deserved, using the
+// exact same computeSetPRFlags every live edit uses. This closes Finding 1
+// (the save-before-debounce race): whatever a pending 400ms timer has or
+// hasn't gotten around to yet, by the time any real save actually happens
+// every Set's own isPR/isNew1RM already reflects its CURRENT weight/reps/
+// completed state, not a value from before the most recent edit.
+function recomputeAllSetPRFlags(workout) {
+  if (!workout || !Array.isArray(workout.exercises)) return;
+  workout.exercises.forEach(ex => {
+    (ex.sets || []).forEach(s => {
+      const flags = computeSetPRFlags(s, ex.exerciseId, workout.id);
+      s.isPR = flags.isPR;
+      s.isNew1RM = flags.isNew1RM;
+    });
+  });
+}
+// STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8, Finding
+// 3). `prDebounceTimers` is keyed only by the string `${exIdx}-${setIdx}`
+// -- it always has been, and still is, because that key is still the
+// simplest way to debounce repeated edits to the SAME box. The problem
+// this round closes is what happens to an already-scheduled timer when
+// `currentWorkout` is replaced or nulled before it fires: audited every
+// real ownership-transition site in this file and in
+// app-plan-run-logger-ui.js (startNewWorkout, finalizeStartActiveWorkout,
+// editHistoricalWorkout, finishWorkout's two save branches, cancelWorkout,
+// planRunLoggerLaunch, the canonical Finish-commit path, and the
+// sign-out reset) -- none of them cleared a pending timer before this
+// round. This function is called at every one of those sites. It is a
+// genuine clear, not merely a best-effort hint: any timer still pending at
+// that moment is cancelled and its entry removed, so it can never fire at
+// all, on any workout. The SECOND, independent backstop -- binding each
+// still-scheduled timer to the exact workout id and exact Set object it
+// was scheduled for, so even a timer this function somehow failed to
+// reach is a safe no-op rather than a mutation of the wrong state -- lives
+// in updateSet/checkSetPR immediately below.
+function clearAllPRDebounceTimers() {
+  Object.keys(prDebounceTimers).forEach(key => {
+    const entry = prDebounceTimers[key];
+    if (entry && entry.timer) clearTimeout(entry.timer);
+    delete prDebounceTimers[key];
+  });
+}
 function updateSet(exIdx, setIdx, field, val) {
   if (!currentWorkout) return;
-  currentWorkout.exercises[exIdx].sets[setIdx][field] = val;
-  if (field === 'weight') currentWorkout.exercises[exIdx].sets[setIdx].autoFilled = false;
-  const key = `${exIdx}-${setIdx}`;
-  if (prDebounceTimers[key]) clearTimeout(prDebounceTimers[key]);
-  prDebounceTimers[key] = setTimeout(() => checkSetPR(exIdx, setIdx), 400);
-}
-function checkSetPR(exIdx, setIdx) {
-  if (!currentWorkout) return;
   const s = currentWorkout.exercises[exIdx].sets[setIdx];
-  if (s.weight && s.reps) { s.isNew1RM = calc1RM(+s.weight, +s.reps) > getBest1RM(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id); s.isPR = +s.weight > getBestWeight(currentWorkout.exercises[exIdx].exerciseId, currentWorkout.id); }
+  s[field] = val;
+  if (field === 'weight') s.autoFilled = false;
+  const key = `${exIdx}-${setIdx}`;
+  if (prDebounceTimers[key] && prDebounceTimers[key].timer) clearTimeout(prDebounceTimers[key].timer);
+  // TIMER-OWNERSHIP CORRECTION (this round, Round 8, Finding 3): this
+  // pending recompute is bound, at the moment it is scheduled, to the
+  // exact workout id and the exact Set OBJECT it was scheduled for --
+  // never merely to the `exIdx-setIdx` string these are still keyed by.
+  // If Finish/Cancel/navigation/a brand-new workout replaces
+  // `currentWorkout`, or this same index later holds a different Set
+  // object (e.g. a new workout happens to reuse the same position), the
+  // callback below detects the mismatch and does nothing at all -- it can
+  // never read or mutate a workout or Set it was not scheduled for, even
+  // though `clearAllPRDebounceTimers` (called at every real
+  // ownership-transition site) should already have cancelled it outright
+  // before that could happen. This is the second, independent layer, not
+  // a replacement for the first.
+  const scheduledWorkoutId = currentWorkout.id;
+  const scheduledSetRef = s;
+  const timerHandle = setTimeout(() => checkSetPR(exIdx, setIdx, scheduledWorkoutId, scheduledSetRef), 400);
+  prDebounceTimers[key] = { timer: timerHandle, workoutId: scheduledWorkoutId, setRef: scheduledSetRef };
+}
+function checkSetPR(exIdx, setIdx, scheduledWorkoutId, scheduledSetRef) {
+  if (!currentWorkout) return;
+  // Ownership check (see updateSet's own comment above). A direct call
+  // with no scheduledWorkoutId/scheduledSetRef (every existing direct call
+  // site in this codebase and its own test suite calls checkSetPR this
+  // way, 2-argument form) skips this check entirely and behaves exactly as
+  // before -- this guard exists only to protect the DEBOUNCED path against
+  // acting on a workout/Set it was not scheduled for.
+  if (scheduledWorkoutId !== undefined && currentWorkout.id !== scheduledWorkoutId) return;
+  const ex = currentWorkout.exercises[exIdx];
+  const s = ex && ex.sets[setIdx];
+  if (!s) return;
+  if (scheduledSetRef !== undefined && s !== scheduledSetRef) return;
+  // ONE CONSISTENT RULE (this round): routed through the single
+  // computeSetPRFlags helper -- see its own comment above. This function
+  // no longer carries its own copy of the completed/weight/reps gate or
+  // the two comparison lines; onSetChecked (below) uses the exact same
+  // helper, so the two can never again drift into subtly different rules.
+  const flags = computeSetPRFlags(s, ex.exerciseId, currentWorkout.id);
+  s.isPR = flags.isPR;
+  s.isNew1RM = flags.isNew1RM;
+  const badgesEl = document.getElementById(`set-badges-${exIdx}-${setIdx}`);
+  if (badgesEl) {
+    const html = buildSetBadgesHtml(s);
+    badgesEl.innerHTML = html;
+    const rowEl = document.getElementById(`set-row-${exIdx}-${setIdx}`);
+    if (rowEl && html && !rowEl.style.gridTemplateColumns.includes('auto')) {
+      rowEl.style.gridTemplateColumns = rowEl.style.gridTemplateColumns + ' auto';
+    }
+  }
+}
+// PERSISTENCE-BOUNDARY DEFENSE (this round): an independent backstop for
+// the ordinary (non-Program-Run) Finish/Edit-save path -- see
+// finishWorkout below for where this is applied, and
+// app-plan-run-logger-ui.js's planRunLoggerBuildPersistedSet for the
+// equivalent backstop on the canonical Program Run path. isPR/isNew1RM
+// must never be persisted true for a Set that is not completed and does
+// not genuinely carry the values its own calculation requires (isPR
+// needs a real positive weight; isNew1RM additionally needs real reps),
+// regardless of how an unanticipated code path or stale in-memory state
+// might otherwise have left them. This never alters any other field on
+// the Set -- entered weight/reps/time/rpe/completed and all identity
+// fields are left exactly as they are.
+function sanitizeSetPRFlags(s) {
+  if (!(s.completed === true && s.weight && s.reps)) {
+    s.isPR = false;
+    s.isNew1RM = false;
+  }
 }
 // LOGGER-FINISH SLICE ADDITION, AS AMENDED BY THE SUPPLEMENTAL-SET
 // CORRECTION BELOW: a Run-linked Session's own persisted canonical shape
@@ -2385,11 +2568,54 @@ function finishWorkout() {
   if (!currentWorkout) return;
   const nameDisplay = document.getElementById('log-session-name-display'); const nm = nameDisplay ? nameDisplay.textContent.trim() : '';
   currentWorkout.name = (nm && nm !== 'NEW WORKOUT') ? nm : `Workout ${new Date(currentWorkout.date).toLocaleDateString('en-US',{month:'short',day:'numeric'})}`;
-  currentWorkout.exercises.forEach(e => { e.sets = e.sets.filter(s => s.weight||s.reps||s.time); });
-  currentWorkout.exercises = currentWorkout.exercises.filter(e => e.sets.length);
-  if (!currentWorkout.exercises.length) { showToast('Add at least one set first','error'); return; }
+  // PARTIAL-WORKOUT CORRECTION (production finding: "+ Set did nothing for
+  // other exercises", and Finish wrongly blocking a genuinely partial
+  // Program Run Session): this filter -- dropping an empty Set, then
+  // dropping an exercise left with none -- was always meant for an
+  // ordinary, un-prescribed legacy workout, where an exercise added then
+  // abandoned with nothing ever entered really has nothing worth keeping.
+  // It must never run for a canonical Run Session (currentWorkout.
+  // canonicalRun): a Run Session's prescribed Sets carry real, already-
+  // verified identity (planSetId/planAssignmentId, stamped at launch by
+  // planRunLoggerLaunch) that this correction's own required behavior
+  // depends on staying present even when still blank -- that is the whole
+  // point of letting the person Finish with some prescribed Sets not yet
+  // performed (see finishCanonicalRunWorkout/planRunOccurrenceEligibleFor
+  // Completion). Running this filter here, before that function is even
+  // reached, previously (a) permanently mutated the still-open
+  // currentWorkout even when the resulting Finish attempt was then
+  // declined (nothing rolls this back), silently discarding real
+  // prescribed-Set identity for any exercise still blank at that moment,
+  // and (b) broke the index alignment every other exercise card's own
+  // rendered "+ Set"/"Delete"/checkbox controls depend on (addSet/
+  // removeSet/buildSetsHTML above all address currentWorkout.exercises by
+  // position) for the rest of that still-open session -- exactly the
+  // production finding this correction fixes. A legacy workout's own
+  // existing behavior (this exact filter, then the "Add at least one set
+  // first" decline) is completely unchanged below.
+  if (!currentWorkout.canonicalRun) {
+    currentWorkout.exercises.forEach(e => { e.sets = e.sets.filter(s => s.weight||s.reps||s.time); });
+    currentWorkout.exercises = currentWorkout.exercises.filter(e => e.sets.length);
+    if (!currentWorkout.exercises.length) { showToast('Add at least one set first','error'); return; }
+  }
   if (currentWorkout._isEdit) {
     const originalDuration = currentWorkout.duration; delete currentWorkout._isEdit; currentWorkout.duration = originalDuration;
+    // SYNCHRONOUS PRE-SAVE RECOMPUTATION (this round, Round 8, Finding 1):
+    // genuinely recalculates every Set's isPR/isNew1RM from its CURRENT
+    // weight/reps/completed state, closing the save-before-debounce race
+    // (a completed PR edited downward, then saved before the 400ms timer
+    // fires, no longer persists the stale true flags -- this recompute
+    // runs regardless of whether any timer was ever pending). Also clears
+    // any pending debounce timer for this workout outright, since it is
+    // about to be saved and (on success) currentWorkout replaced/cleared
+    // below.
+    recomputeAllSetPRFlags(currentWorkout);
+    clearAllPRDebounceTimers();
+    // PERSISTENCE-BOUNDARY DEFENSE (Round 7, preserved): a fail-closed
+    // normalization check, not a substitute for the genuine recomputation
+    // just above -- kept as a second, independent backstop exactly as
+    // Round 7 designed it.
+    currentWorkout.exercises.forEach(e => e.sets.forEach(sanitizeSetPRFlags));
     const idx = appDb.workouts.findIndex(w => w.id === currentWorkout.id);
     if (idx !== -1) appDb.workouts[idx] = currentWorkout;
     fsSaveWorkout(currentWorkout);
@@ -2458,6 +2684,22 @@ function finishWorkout() {
       fsSaveProgram(active);
     }
   }
+  // SYNCHRONOUS PRE-SAVE RECOMPUTATION (this round, Round 8, Finding 1):
+  // see the `_isEdit` branch's own comment above -- same fix, same reason,
+  // applied to this unconditional new-workout Finish tail. Placed before
+  // the progression-review branch below reads currentWorkout, though
+  // progression itself never consumes isPR/isNew1RM (confirmed by audit --
+  // see the implementation report).
+  recomputeAllSetPRFlags(currentWorkout);
+  clearAllPRDebounceTimers();
+  // PERSISTENCE-BOUNDARY DEFENSE (Round 7, preserved): see the `_isEdit`
+  // branch's own comment above. This is the ordinary (non-canonical-Run)
+  // Finish path's own unconditional save -- it has no separate serializer
+  // comparable to app-plan-run-logger-ui.js's
+  // planRunLoggerBuildPersistedSet, so this fail-closed backstop is
+  // applied directly to currentWorkout here too, immediately before it is
+  // pushed to storage.
+  currentWorkout.exercises.forEach(e => e.sets.forEach(sanitizeSetPRFlags));
   appDb.workouts.unshift(currentWorkout); fsSaveWorkout(currentWorkout); stopWorkoutTimer(); currentWorkout = null;
   if (reviewActive && reviewPending) {
     showProgressionReview(reviewActive, reviewPending);
@@ -2480,7 +2722,12 @@ function planRunLoggerFinishBlocksCancel() {
 }
 function cancelWorkout() {
   if (planRunLoggerFinishBlocksCancel()) { showToast('Resolve the current Finish attempt (Retry, Check Status, or Abandon) before canceling.', 'error'); return; }
-  confirm2('Cancel Workout','Discard this workout? All data will be lost.', () => { stopWorkoutTimer(); currentWorkout = null; showPage('page-home'); }, 'Discard');
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8): a
+  // Cancel discards currentWorkout entirely (nothing is saved) -- any
+  // pending debounce timer scheduled against it must be cancelled here too,
+  // never left to fire later against whatever workout (if any) is open by
+  // then.
+  confirm2('Cancel Workout','Discard this workout? All data will be lost.', () => { clearAllPRDebounceTimers(); stopWorkoutTimer(); currentWorkout = null; showPage('page-home'); }, 'Discard');
 }
 
 // ==================== PROGRESSION V1 — SUGGESTIONS REVIEW (Build 3) ====================
@@ -2902,12 +3149,22 @@ function closeProgressionReview() {
 // ==================== EXERCISE HISTORY MODAL ====================
 function openExHistoryModal(exId) {
   const exData = getExercise(exId); document.getElementById('ex-history-modal-title').textContent = exData ? exData.name : exId;
-  const workoutsWithEx = appDb.workouts.filter(w => w.exercises.some(e => e.exerciseId === exId)).slice(0, 3);
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- previously included
+  // ANY workout containing this exercise, even one where every Set for it
+  // was still an untouched canonical placeholder, and rendered every
+  // stored Set unconditionally (a blank one fell through to the literal
+  // "—" ghost line). Now only workouts where this exercise has at least
+  // one genuinely-performed Set are shown, and only genuinely-performed
+  // Sets (shared predicate) are rendered within each.
+  const workoutsWithEx = appDb.workouts
+    .filter(w => w.exercises.some(e => e.exerciseId === exId && e.sets.some(planRunSetHasRecordedPerformance)))
+    .slice(0, 3);
   const body = document.getElementById('ex-history-modal-body');
   if (!workoutsWithEx.length) { body.innerHTML = '<div class="empty-state" style="padding:30px 0"><h3>No History</h3><p>Not logged yet</p></div>'; openModal('modal-ex-history'); return; }
   body.innerHTML = workoutsWithEx.map(w => {
     const ex = w.exercises.find(e => e.exerciseId === exId); const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
-    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${ex.sets.map((s,i)=>{ let line=`Set ${i+1}: `; if(s.weight&&+s.weight>0)line+=`${s.weight}${appDb.unit} × ${s.reps||s.time||'—'}`; else if(s.reps)line+=`BW × ${s.reps}`; else if(s.time)line+=`${s.time}s`; else line+='—'; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
+    const performedSets = ex.sets.filter(planRunSetHasRecordedPerformance);
+    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${performedSets.map((s,i)=>{ let line=`Set ${i+1}: `; if(s.weight&&+s.weight>0)line+=`${s.weight}${appDb.unit} × ${s.reps||s.time||'—'}`; else if(s.reps)line+=`BW × ${s.reps}`; else if(s.time)line+=`${s.time}s`; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
   }).join('');
   openModal('modal-ex-history');
 }
@@ -3041,7 +3298,12 @@ function runHistorySearch() {
   });
   if (!matches.length) { resultsEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3);font-size:14px">No results found</div>'; return; }
   resultsEl.innerHTML = `<div style="font-size:11px;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--text3);margin-bottom:8px">${matches.length} Result${matches.length!==1?'s':''}</div>`
-    + matches.map(w => { const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'}); const sets = w.exercises.reduce((a,e)=>a+e.sets.length,0); return `<div onclick="goToSearchResult('${w.id}')" style="padding:12px;border-bottom:1px solid var(--border);cursor:pointer" onmouseenter="this.style.background='var(--surface2)'" onmouseleave="this.style.background=''"><div style="font-size:11px;color:var(--text3);margin-bottom:3px">${d}</div><div style="font-family:var(--font-display);font-size:16px;font-weight:800;text-transform:uppercase;color:var(--text)">${w.name}</div><div style="font-size:12px;color:var(--text3);margin-top:2px">${w.exercises.length} exercises · ${sets} sets</div></div>`; }).join('');
+    // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- both counts were
+    // previously raw (e.sets.length / w.exercises.length), counting every
+    // blank/untouched canonical placeholder set, and every exercise that
+    // had one, as performed. Now counts only genuinely-performed sets
+    // (shared predicate) and only exercises that have at least one.
+    + matches.map(w => { const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'}); const performedSetsByEx = w.exercises.map(e => e.sets.filter(planRunSetHasRecordedPerformance)); const sets = performedSetsByEx.reduce((a,ps) => a+ps.length, 0); const exercisesWithWork = performedSetsByEx.filter(ps => ps.length > 0).length; return `<div onclick="goToSearchResult('${w.id}')" style="padding:12px;border-bottom:1px solid var(--border);cursor:pointer" onmouseenter="this.style.background='var(--surface2)'" onmouseleave="this.style.background=''"><div style="font-size:11px;color:var(--text3);margin-bottom:3px">${d}</div><div style="font-family:var(--font-display);font-size:16px;font-weight:800;text-transform:uppercase;color:var(--text)">${w.name}</div><div style="font-size:12px;color:var(--text3);margin-top:2px">${exercisesWithWork} exercises · ${sets} sets</div></div>`; }).join('');
 }
 function goToSearchResult(wid) {
   const raw = document.getElementById('history-search-input').value.trim(); if (raw) saveRecentSearch(raw);
@@ -3071,13 +3333,32 @@ function browseByDate() {
 
 function workoutHistoryCard(w, compact=false) {
   const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
-  const sets = w.exercises.reduce((a,e)=>a+e.sets.length,0); const dur = w.duration ? fmtDuration(w.duration) : '';
-  const prs = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>s.isPR).length,0); const new1rms = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>s.isNew1RM).length,0);
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1 -- this is the exact
+  // reported "3 Exercises · 8 Sets" defect): `sets` and the exercise count
+  // below were previously raw (e.sets.length / w.exercises.length),
+  // counting every blank/untouched canonical placeholder set, and every
+  // exercise that had one, as performed. Now counts only genuinely-
+  // performed sets (shared predicate, plan-run-model.js) and only
+  // exercises that have at least one such set.
+  const performedSetsByEx = w.exercises.map(e => e.sets.filter(planRunSetHasRecordedPerformance));
+  const sets = performedSetsByEx.reduce((a,ps) => a+ps.length, 0);
+  const exercisesWithWork = performedSetsByEx.filter(ps => ps.length > 0).length;
+  const dur = w.duration ? fmtDuration(w.duration) : '';
+  // DERIVED-FLAG CORRECTION (this round): isPR/isNew1RM are stored flags
+  // on a Set, not independently trustworthy facts -- only a genuinely
+  // completed, qualifying Set (the same shared predicate used just above
+  // for `sets`/`exercisesWithWork`) should ever count toward this card's
+  // own PR/new-E1RM totals. This read-side filter is a defensive backstop
+  // behind the write-side correction above (checkSetPR/onSetChecked/
+  // sanitizeSetPRFlags/planRunLoggerBuildPersistedSet) -- it does not
+  // assume that correction alone is sufficient for every record this
+  // card might ever render, including older ones already in storage.
+  const prs = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>planRunSetHasRecordedPerformance(s) && s.isPR).length,0); const new1rms = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>planRunSetHasRecordedPerformance(s) && s.isNew1RM).length,0);
   const wid = w.id;
   const prBadge = prs > 0 ? `<span class="recent-badge recent-badge-pr">${prs} PR'S</span>` : '';
   const e1rmBadge = new1rms > 0 ? `<span class="recent-badge recent-badge-1rm">${new1rms} New E1RM${new1rms > 1 ? "'S" : ''}</span>` : '';
   const badges = prBadge || e1rmBadge ? `<div class="recent-card-badges">${prBadge}${e1rmBadge}</div>` : '';
-  const metaParts = [`${w.exercises.length} Exercises`, `${sets} Sets`]; if (dur) metaParts.push(dur);
+  const metaParts = [`${exercisesWithWork} Exercises`, `${sets} Sets`]; if (dur) metaParts.push(dur);
   const metaHtml = `<div class="recent-card-meta">${metaParts.join('<span class="recent-meta-dot">•</span>')}</div>`;
   if (compact) {
     return `<div class="recent-card" onclick="toggleRecentCard('${wid}')">
@@ -3114,13 +3395,29 @@ function buildRecentExpandedHtml(wid) {
     const perfVideos = e.perfVideos || []; const refVideos = getExVideos(e.exerciseId);
     const hasVideos = perfVideos.length > 0 || refVideos.length > 0;
     const videoIcon = hasVideos ? `<span class="recent-ex-video-btn" onclick="openExpandedVideosModal('${wid}',${ei});event.stopPropagation()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--text2)" stroke-width="2.5"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg></span>` : '';
-    const setsHtml = e.sets.map(s => {
+    // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- previously rendered
+    // EVERY stored Set unconditionally, so a blank/untouched canonical
+    // placeholder fell through to the empty-string defaults above and
+    // rendered as a ghost row (no weight, no reps, no "x"). Now rendered
+    // only for Sets carrying genuine recorded performance (shared
+    // predicate) -- a genuinely completed Set still renders exactly as
+    // logged (unchanged), an untouched one no longer renders at all.
+    const setsHtml = e.sets.filter(planRunSetHasRecordedPerformance).map(s => {
       let weightStr = '', xStr = '', repsStr = '';
       if (s.weight && +s.weight > 0) { weightStr = `${s.weight}`; xStr = '×'; repsStr = `${s.reps||s.time||'—'}`; }
       else if (s.reps) { weightStr = 'BW'; xStr = '×'; repsStr = `${s.reps}`; }
       else if (s.time) { weightStr = `${s.time}s`; }
-      const prBadge = s.isPR ? `<span class="recent-badge recent-badge-pr" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">PR: ${s.weight}</span>` : `<span style="display:inline-block;min-width:72px"></span>`;
-      const e1rmBadge = s.isNew1RM && s.weight && s.reps ? `<span class="recent-badge recent-badge-1rm" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">E1RM: ${Math.round(calc1RM(+s.weight,+s.reps))}</span>` : (s.isPR ? `<span style="display:inline-block;min-width:72px"></span>` : '');
+      // DERIVED-FLAG CORRECTION (this round): defensive backstop, same
+      // reasoning as workoutHistoryCard's own PR/new-E1RM counts above --
+      // the surrounding `setsHtml` filter already requires
+      // planRunSetHasRecordedPerformance(s) before a Set reaches this
+      // badge logic at all, but isPR/isNew1RM are re-checked against it
+      // again here directly, rather than assuming the upstream filter (or
+      // the write-side correction) is the only thing standing between a
+      // stale flag and a visible badge.
+      const qualifiesForBadge = planRunSetHasRecordedPerformance(s);
+      const prBadge = qualifiesForBadge && s.isPR ? `<span class="recent-badge recent-badge-pr" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">PR: ${s.weight}</span>` : `<span style="display:inline-block;min-width:72px"></span>`;
+      const e1rmBadge = qualifiesForBadge && s.isNew1RM && s.weight && s.reps ? `<span class="recent-badge recent-badge-1rm" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">E1RM: ${Math.round(calc1RM(+s.weight,+s.reps))}</span>` : (qualifiesForBadge && s.isPR ? `<span style="display:inline-block;min-width:72px"></span>` : '');
       return `<div class="recent-set-row"><span class="recent-set-weight">${weightStr}</span><span class="recent-set-x">${xStr}</span><span class="recent-set-reps">${repsStr}</span><span class="recent-set-badges">${prBadge}${e1rmBadge}</span></div>`;
     }).join('');
     return `<div class="recent-ex-block"><div class="recent-ex-name-row"><span class="recent-ex-num">${ei+1}</span><span class="recent-ex-name">${name}</span>${videoIcon}</div><div class="recent-ex-sets">${setsHtml}</div></div>`;
@@ -3165,6 +3462,10 @@ function openExpandedVideosModal(wid, exIdx) {
 function editHistoricalWorkout(wid) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return;
   if (w.recordKind === 'canonicalWorkout') { showToast('This session was completed through a Program Run and cannot be edited here.', 'error'); return; }
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8): see
+  // finalizeStartActiveWorkout's own comment above -- same real gap, same
+  // fix, cleared before the replacement just below.
+  clearAllPRDebounceTimers();
   currentWorkout = JSON.parse(JSON.stringify(w)); currentWorkout._isEdit = true;
   const nameDisplay = document.getElementById('log-session-name-display'); if (nameDisplay) nameDisplay.textContent = (w.name || 'WORKOUT').toUpperCase();
   const timerEl = document.getElementById('log-timer-display'); if (timerEl) { timerEl.textContent = w.duration ? fmtDuration(w.duration) : '0:00'; timerEl.style.opacity = '0.5'; timerEl.style.pointerEvents = 'none'; }
@@ -3286,17 +3587,35 @@ function renderCopyOutput(){
   const w=appDb.workouts.find(x=>x.id===copyWorkoutId);if(!w)return;
   const d=new Date(w.date).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
   let out='';
+  // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- both branches
+  // previously iterated e.sets unconditionally (formatSetStr's own
+  // '- —' fallback is the literal ghost line this produced for a
+  // blank/untouched canonical placeholder), and getBestPRAndE1RM's
+  // bestPRIdx/bestE1RMIdx were computed against that same unfiltered
+  // array. Both branches now filter to genuinely-performed Sets (shared
+  // predicate) FIRST, then compute the PR/E1RM indices against that same
+  // filtered array, so the si===bestPRIdx/si===bestE1RMIdx comparisons
+  // below stay correctly aligned -- a genuinely completed Set still
+  // exports exactly as logged (unchanged); an untouched one no longer
+  // appears at all (never a fabricated '- —' line).
   if(copyFormat==='txt'){
     out+=`${w.name.toUpperCase()}\n${d}\n`;if(w.duration)out+=`Duration: ${fmtDuration(w.duration)}\n`;out+='─'.repeat(40)+'\n\n';
-    w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM(e);e.sets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   } else {
     out+=`[u][size=200]${w.name}[/size][/u]\n[i]${d}[/i]\n`;if(w.duration)out+=`[i]Duration: ${fmtDuration(w.duration)}[/i]\n`;out+='\n';
-    w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM(e);e.sets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   }
   document.getElementById('copy-output').textContent=out;
 }
 function formatSetStr(s){if(s.weight&&+s.weight>0)return`- ${s.weight}${appDb.unit} x ${s.reps||s.time||'?'}`;if(s.reps)return`- BW x ${s.reps}`;if(s.time)return`- ${s.time}s`;return'- —';}
-function getBestPRAndE1RM(ex){let bestPRIdx=-1,bestPRWeight=0,bestE1RMIdx=-1,bestE1RM=0;ex.sets.forEach((s,si)=>{if(s.isPR&&+s.weight>bestPRWeight){bestPRWeight=+s.weight;bestPRIdx=si;}if(s.isNew1RM&&s.weight&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>bestE1RM){bestE1RM=v;bestE1RMIdx=si;}}});return{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM};}
+// DERIVED-FLAG CORRECTION (this round): hardened internally with the same
+// shared predicate, even though both of this function's current callers
+// (renderCopyOutput, below) already pre-filter their input to
+// performedSets before calling this -- an explicit internal gate here
+// means a future caller that forgets to pre-filter cannot silently count
+// a stale flag on an unchecked Set, rather than relying solely on every
+// caller remembering to filter first.
+function getBestPRAndE1RM(ex){let bestPRIdx=-1,bestPRWeight=0,bestE1RMIdx=-1,bestE1RM=0;ex.sets.forEach((s,si)=>{if(!planRunSetHasRecordedPerformance(s))return;if(s.isPR&&+s.weight>bestPRWeight){bestPRWeight=+s.weight;bestPRIdx=si;}if(s.isNew1RM&&s.weight&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>bestE1RM){bestE1RM=v;bestE1RMIdx=si;}}});return{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM};}
 function copyToClipboard(){navigator.clipboard.writeText(document.getElementById('copy-output').textContent).then(()=>showToast('Copied to clipboard','success')).catch(()=>showToast('Select text manually to copy','error'));}
 
 // ==================== MODALS ====================
@@ -3395,7 +3714,17 @@ async function runExport(){
   try {
     const importedSets = await ensureImportedSetsLoaded('export');
     const rows=['date,workout_name,exercise_name,set_number,weight,reps,rpe,duration_seconds,notes'];
-    appDb.workouts.forEach(w=>{const d=new Date(w.date);const dateStr=`${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;const dur=w.duration||'';w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);const exName=ex?ex.name:e.exerciseId;e.sets.forEach((s,si)=>{rows.push([dateStr,csvEscape(w.name),csvEscape(exName),si+1,s.weight||'',s.reps||s.time||'',s.rpe||'',si===0?dur:'',''].join(','));});});});
+    // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- previously exported
+    // EVERY stored Set unconditionally (set_number=si+1, with empty
+    // weight/reps for a blank/untouched canonical placeholder). Now
+    // exports only genuinely-performed Sets (shared predicate); an
+    // exercise with none produces zero rows for this workout, and
+    // set_number renumbers 1..N over the genuinely-performed Sets only, so
+    // the canonical round-trip identity of the STORED data is untouched
+    // (export is one-way/read-only -- confirmed no import path writes back
+    // into this same canonical workout) while nothing untouched is ever
+    // presented as performed work.
+    appDb.workouts.forEach(w=>{const d=new Date(w.date);const dateStr=`${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;const dur=w.duration||'';w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);const exName=ex?ex.name:e.exerciseId;e.sets.filter(planRunSetHasRecordedPerformance).forEach((s,si)=>{rows.push([dateStr,csvEscape(w.name),csvEscape(exName),si+1,s.weight||'',s.reps||s.time||'',s.rpe||'',si===0?dur:'',''].join(','));});});});
     importedSets.forEach(s=>{const d=new Date(s.date);const dateStr=`${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;const ex=getExercise(s.exerciseId);rows.push([dateStr,csvEscape(s.workoutName||''),csvEscape(ex?ex.name:s.exerciseId),s.setNumber||'',s.weight||'',s.reps||'','','',''].join(','));});
     const today=new Date();const datePart=`${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
     triggerDownload(rows.join('\n'),`ironlog-export-${datePart}.csv`,'text/csv');

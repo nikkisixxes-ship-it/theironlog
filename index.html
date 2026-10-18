@@ -110,22 +110,29 @@
       </div>
 
       <!-- SLICE 1 ADDITION -- canonical Program Run section. Empty container,
-           additive: filled only by app-plan-run-ui.js's own capability-gated
-           renderer (planRunUiRenderHomeSection), which leaves this empty and
-           issues zero Run I/O whenever the canonical Run capability is
-           disabled (its real, hardcoded-false state today) -- identical
-           pattern to page-db/page-programs below, which are also filled
-           entirely by their own script. -->
+           additive: filled by app-plan-run-ui.js's own capability-gated
+           renderer (planRunUiRenderHomeSection), which would leave this
+           empty and issue zero Run I/O if the canonical Run capability were
+           disabled -- it is not. ROUND 5 CORRECTION: this comment
+           previously called the disabled state "its real, hardcoded-false
+           state today" -- stale/wrong. The capability is hardcoded `true`
+           (deliberately reactivated during Stage 6 and still enabled
+           through the supplemental-set deployment, a confirmed baseline
+           fact for this round, not a new finding), so this container is
+           actively filled with real content for a real user today. -->
       <div id="planrun-home-section"></div>
 
       <!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
            "Needs Attention" section (unresolved training-max Rules). Empty
-           container, additive: filled only by app-plan-run-training-max-
+           container, additive: filled by app-plan-run-training-max-
            ui.js's own capability-gated renderer
-           (planRunTmRenderHomeSection), which leaves this empty and issues
-           zero Run I/O whenever the canonical Run capability is disabled
-           (its real, hardcoded-false state today) -- identical pattern to
-           planrun-home-section immediately above. -->
+           (planRunTmRenderHomeSection). ROUND 5 CORRECTION: this previously
+           said this container "issues zero Run I/O whenever the canonical
+           Run capability is disabled (its real, hardcoded-false state
+           today)" -- stale/wrong, same correction as planrun-home-section
+           immediately above: the capability is hardcoded `true` and has
+           been enabled since Stage 6, so this container is actively filled
+           today. -->
       <div id="planrun-needs-attention-section"></div>
 
       <!-- START BLANK WORKOUT -->
@@ -214,10 +221,17 @@
          static markup of its own, matching page-run-session-preview's own
          convention above. Reached only from the PLAN library's own new
          "Start on Train" button (planCanonicalLibraryRender, app-plan.js),
-         which calls planRunStartOpen(templateId). CANONICAL_PLAN_RUN_
-         CAPABILITY_ENABLED remains hardcoded false, so this page renders
-         only the "Starting a Program is currently disabled." message until
-         that capability is explicitly activated in a future round. -->
+         which calls planRunStartOpen(templateId). ROUND 5 CORRECTION: this
+         comment previously said CANONICAL_PLAN_RUN_CAPABILITY_ENABLED
+         "remains hardcoded false, so this page renders only the 'Starting
+         a Program is currently disabled.' message until that capability is
+         explicitly activated in a future round" -- stale/wrong. The
+         capability is hardcoded `true` (deliberately reactivated during
+         Stage 6 and still enabled through the supplemental-set deployment,
+         a confirmed baseline fact for this round, not a new finding), so
+         this page renders the real, interactive Start flow today; the
+         "currently disabled" message is dead code for the real production
+         state, reachable only if the flag were ever switched back off. -->
     <div class="page" id="page-run-start"></div>
 
   </div><!-- /#main -->
@@ -618,34 +632,43 @@
 <script src="app-collections.js"></script>
 <script src="app-plan.js"></script>
 <script src="firebase-plan-progression.js"></script>
-<!-- SLICE 1 ADDITION -- canonical Program-Run persistence + UI. Neither
-     file was referenced by this document before this slice; both are
-     submitted for independent review only (see each file's own header) --
-     CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is hardcoded false in
+<!-- SLICE 1 ADDITION -- canonical Program-Run persistence + UI.
+     ROUND 5 CORRECTION: this comment previously said
+     "CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is hardcoded false in
      firebase-plan-run.js, so loading these two scripts changes nothing a
      real user sees until that capability is separately, explicitly
-     activated. -->
+     activated" -- stale/wrong. The capability is hardcoded `true`
+     (deliberately reactivated during Stage 6 and still enabled through the
+     supplemental-set deployment, a confirmed baseline fact for this round,
+     not a new finding), so loading these scripts DOES change what a real
+     user sees today. -->
 <script src="plan-run-model.js"></script>
 <script src="firebase-plan-run.js"></script>
 <script src="app-plan-run-ui.js"></script>
 <script src="app-plan-run-start-ui.js"></script>
 <!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION -- the
      "Needs Attention" (unresolved training-max) surface (see this file's
-     own header). Same capability gate as the scripts above; loading it
-     changes nothing a real user sees until CANONICAL_PLAN_RUN_CAPABILITY_
-     ENABLED is separately, explicitly activated. -->
+     own header). ROUND 5 CORRECTION: this previously said loading it
+     "changes nothing a real user sees until CANONICAL_PLAN_RUN_CAPABILITY_
+     ENABLED is separately, explicitly activated" -- stale/wrong, same
+     correction as the SLICE 1 ADDITION comment above: the capability has
+     been enabled since Stage 6, so this DOES change what a real user sees
+     today. -->
 <script src="app-plan-run-training-max-ui.js"></script>
 <!-- LOGGER-FINISH SLICE ADDITION -- Run-aware real logger launch + Finish
-     (see this file's own header). Same capability gate as the three
-     scripts above; loading it changes nothing a real user sees until
-     CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is separately, explicitly
-     activated. -->
+     (see this file's own header). ROUND 5 CORRECTION: this previously said
+     loading it "changes nothing a real user sees until CANONICAL_PLAN_RUN_
+     CAPABILITY_ENABLED is separately, explicitly activated" -- stale/
+     wrong, same correction as above: the capability has been enabled since
+     Stage 6, so this DOES change what a real user sees today. -->
 <script src="app-plan-run-logger-ui.js"></script>
 <!-- END RUN SLICE ADDITION -- the End Run control on the active-Run card
-     (see this file's own header). Same capability gate as the scripts
-     above; loading it changes nothing a real user sees until
-     CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is separately, explicitly
-     activated. -->
+     (see this file's own header). ROUND 5 CORRECTION: this previously said
+     loading it "changes nothing a real user sees until CANONICAL_PLAN_RUN_
+     CAPABILITY_ENABLED is separately, explicitly activated" -- stale/
+     wrong, same correction as the script-tag comments above: the
+     capability has been enabled since Stage 6, so this DOES change what a
+     real user sees today. -->
 <script src="app-plan-run-end-ui.js"></script>
 <script src="app-core.js"></script>
 </body>

@@ -6,8 +6,15 @@
 // uses for app-plan-run-logger-ui.js.
 //
 // STATUS / NON-AUTHORIZATION NOTICE: submitted for INDEPENDENT REVIEW ONLY.
-// CANONICAL_PLAN_RUN_CAPABILITY_ENABLED (firebase-plan-run.js) remains
-// hardcoded false. This file calls exactly six persistence functions --
+// ROUND 5 CORRECTION: this comment previously said CANONICAL_PLAN_RUN_
+// CAPABILITY_ENABLED (firebase-plan-run.js) "remains hardcoded false." That
+// was stale/wrong and has been corrected everywhere it appeared in this
+// codebase. The real, current value is hardcoded `true` -- the capability
+// was deliberately reactivated during Stage 6 and has remained enabled
+// through the subsequent controlled production tests and the supplemental-
+// set deployment. That is an independently confirmed baseline fact for this
+// round, not a new finding, and this round does not change it. This file
+// calls exactly six persistence functions --
 // fsPlanRunPersistence.fsPlanRunPreflightEnd, .fsPlanRunBeginEnd,
 // .fsPlanRunEnd, .fsPlanRunCheckEndStatus, .fsPlanRunCancelEnd, and
 // .fsPlanRunAbandonOccurrence -- plus the already-existing, read-only

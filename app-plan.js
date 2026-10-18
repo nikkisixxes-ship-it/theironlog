@@ -13281,14 +13281,62 @@ function planValidateProgressionEvaluationInput(rule,evidence,basis) {
 }
 
 function planProgressionThreshold(p){if(p.repsType==='fixed'&&p.reps!=null)return {mode:'reps',value:p.reps};if(p.repsType==='range'&&p.minReps!=null)return {mode:'reps',value:p.minReps};if(p.timeType==='fixed'&&p.seconds!=null)return {mode:'seconds',value:p.seconds};if(p.timeType==='range'&&p.minSeconds!=null)return {mode:'seconds',value:p.minSeconds};return null;}
+// PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 3) -- an intentionally-
+// unperformed prescribed Set (no attempt recorded -- performed.completed
+// is not true) must be NEUTRAL: never a false pass, never a false "failed"
+// (the owner's own reproduced defect: an untouched Set previously fell
+// through to `passed(x)===false` exactly like a genuinely-attempted-but-
+// missed Set, recording a real semantic failure for work never attempted).
+// `attempted(x)` is the one new per-Set fact this correction adds --
+// completed===true, the person's own explicit "I did this" mark, already
+// required and already present on every Set by this schema's existing
+// contract, never a new field. Per evaluation type:
+//   strict/default (every evaluable Set must pass) -- a genuinely
+//     attempted-but-missed Set still fails the WHOLE evaluation
+//     immediately (existing behavior, unchanged -- checked first, so it
+//     can never be masked by a neutral result elsewhere in the same Rule);
+//     only once no attempted Set has failed does an unattempted evaluable
+//     Set make the whole evaluation neutral; only once every evaluable Set
+//     was both attempted and passed does it pass.
+//   gateway -- neutral exactly when the single gate Set itself was never
+//     attempted; otherwise unchanged.
+//   volume -- a real pass (actual, summing only attempted Sets, already
+//     >= target) is still a real pass regardless of any other unattempted
+//     Set in the basis (surplus recorded evidence is never fabrication);
+//     only once the summed evidence falls short AND at least one evaluable
+//     Set was never attempted is the result neutral (the shortfall cannot
+//     be confirmed genuine); a genuine, fully-attempted shortfall still
+//     fails, unchanged.
+// A neutral result never touches nextValue (kind/amount/unit all pass
+// through currentValue verbatim, identical to the existing "failed, no
+// change" shape) -- see firebase-plan-run.js's own dispatch of this
+// decision and plan-run-model.js's planRunApplicationDocValid for how the
+// distinction is actually preserved in the stored audit trail without it.
 function planEvaluateCanonicalProgression(rule,currentValue,evidence,basis){
   var ordered=basis.orderedSets.map(function(s){var e=evidence.setPairs.find(function(x){return x.planSetId===s.planSetId;});return {p:s.prescribed,a:e.performed};});
+  function attempted(x){return x.a.completed===true;}
   function passed(x){var t=planProgressionThreshold(x.p);return t&&x.a.completed&&x.a[t.mode]!=null&&x.a[t.mode]>=t.value;}
   var evaluable=ordered.filter(function(x){return !!planProgressionThreshold(x.p);}); if(!evaluable.length)return {decision:'notEvaluable'};
-  var ok;
-  if(rule.evaluationType==='gateway'){var x=ordered[rule.gatewaySetIndex];if(!x||!planProgressionThreshold(x.p))return {decision:'notEvaluable'};ok=!!passed(x);}
-  else if(rule.evaluationType==='volume'){var mode=planProgressionThreshold(evaluable[0].p).mode;if(evaluable.some(function(x){return planProgressionThreshold(x.p).mode!==mode;}))return {decision:'notEvaluable'};var target=evaluable.reduce(function(s,x){return s+planProgressionThreshold(x.p).value;},0);var actual=evaluable.reduce(function(s,x){return s+(x.a.completed&&x.a[mode]!=null?x.a[mode]:0);},0);ok=actual>=target;}
-  else ok=evaluable.every(passed);
+  var ok, neutral=false;
+  if(rule.evaluationType==='gateway'){
+    var x=ordered[rule.gatewaySetIndex];if(!x||!planProgressionThreshold(x.p))return {decision:'notEvaluable'};
+    if(!attempted(x)) neutral=true; else ok=!!passed(x);
+  }
+  else if(rule.evaluationType==='volume'){
+    var mode=planProgressionThreshold(evaluable[0].p).mode;if(evaluable.some(function(x){return planProgressionThreshold(x.p).mode!==mode;}))return {decision:'notEvaluable'};
+    var target=evaluable.reduce(function(s,x){return s+planProgressionThreshold(x.p).value;},0);
+    var actual=evaluable.reduce(function(s,x){return s+(x.a.completed&&x.a[mode]!=null?x.a[mode]:0);},0);
+    if(actual>=target) ok=true;
+    else if(!evaluable.every(attempted)) neutral=true;
+    else ok=false;
+  }
+  else {
+    var anyAttemptedFailed=evaluable.some(function(x){return attempted(x)&&!passed(x);});
+    if(anyAttemptedFailed) ok=false;
+    else if(!evaluable.every(attempted)) neutral=true;
+    else ok=true;
+  }
+  if(neutral) return {decision:'notAttempted',nextValue:{kind:currentValue.kind,amount:currentValue.amount,unit:currentValue.unit}};
   var amount=rule.adjustmentType==='increaseTM'?rule.tmIncrease:rule.loadIncrease;
   return {decision:ok?'passed':'failed',nextValue:{kind:currentValue.kind,amount:ok?Math.round((currentValue.amount+amount)*1000000)/1000000:currentValue.amount,unit:currentValue.unit}};
 }

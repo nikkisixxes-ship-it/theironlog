@@ -27,10 +27,16 @@
 //      'alreadyInProgress' path planRunUiStartSession already requires.
 //
 // STATUS / NON-AUTHORIZATION NOTICE: submitted for INDEPENDENT REVIEW ONLY.
-// CANONICAL_PLAN_RUN_CAPABILITY_ENABLED (firebase-plan-run.js) remains
-// hardcoded false -- fsPlanRunFinish/fsPlanRunCheckFinishStatus both begin
-// with that file's own disabledGate() and issue zero Firestore I/O in
-// production today. This file calls exactly two persistence functions --
+// ROUND 5 CORRECTION: this comment previously said CANONICAL_PLAN_RUN_
+// CAPABILITY_ENABLED (firebase-plan-run.js) "remains hardcoded false" and
+// that fsPlanRunFinish/fsPlanRunCheckFinishStatus therefore "issue zero
+// Firestore I/O in production today." That was stale/wrong. The real,
+// current value is hardcoded `true` -- deliberately reactivated during
+// Stage 6 and still enabled through the supplemental-set deployment, an
+// independently confirmed baseline fact for this round, not a new finding.
+// With the flag true, disabledGate() (firebase-plan-run.js) does NOT throw,
+// so fsPlanRunFinish/fsPlanRunCheckFinishStatus DO issue real Firestore I/O
+// in production today. This file calls exactly two persistence functions --
 // fsPlanRunPersistence.fsPlanRunFinish and
 // fsPlanRunPersistence.fsPlanRunCheckFinishStatus -- never Start, End, or
 // any progression-evaluation function directly (progression evaluation is
@@ -242,17 +248,33 @@ function planRunLoggerCoerceBool(v) { return v === true; }
 // prescribed id -- and isSupplemental:true, exactly matching the amended
 // PLAN_RUN_WORKOUT_SET_KEYS shape (plan-run-model.js). Every other field is
 // built identically regardless of supplemental/prescribed.
+// PERSISTENCE-BOUNDARY DEFENSE (this round): isPR/isNew1RM are DERIVED
+// display/history flags, never independent facts -- this boundary must
+// never persist either one true for a Set that is not completed and does
+// not genuinely carry the values its own calculation requires (isPR
+// needs a real positive weight; isNew1RM additionally needs real reps,
+// mirroring exactly which inputs app-core.js's own checkSetPR/
+// onSetChecked require before computing either flag at all). This holds
+// regardless of whatever value happened to be sitting in the in-memory
+// logger Set when Finish was pressed -- an independent second backstop
+// behind the source-level correction in app-core.js, not a replacement
+// for it. See app-core.js's own sanitizeSetPRFlags for the equivalent
+// backstop on the ordinary (non-Program-Run) Finish path.
 function planRunLoggerBuildPersistedSet(s) {
   var supplemental = s.isSupplemental === true;
+  var completed = planRunLoggerCoerceBool(s.completed);
+  var weight = planRunLoggerCoerceNumOrNull(s.weight);
+  var reps = planRunLoggerCoerceNumOrNull(s.reps);
+  var qualifiesForPRFlags = completed === true && weight !== null && weight > 0 && reps !== null;
   return {
     planSetId: supplemental ? null : s.planSetId,
-    weight: planRunLoggerCoerceNumOrNull(s.weight),
-    reps: planRunLoggerCoerceNumOrNull(s.reps),
+    weight: weight,
+    reps: reps,
     time: planRunLoggerCoerceNumOrNull(s.time),
     rpe: planRunLoggerCoerceNumOrNull(s.rpe),
-    completed: planRunLoggerCoerceBool(s.completed),
-    isPR: planRunLoggerCoerceBool(s.isPR),
-    isNew1RM: planRunLoggerCoerceBool(s.isNew1RM),
+    completed: completed,
+    isPR: qualifiesForPRFlags ? planRunLoggerCoerceBool(s.isPR) : false,
+    isNew1RM: qualifiesForPRFlags ? planRunLoggerCoerceBool(s.isNew1RM) : false,
     isSupplemental: supplemental
   };
 }
@@ -389,6 +411,15 @@ function planRunLoggerLaunch(run, occurrence) {
     });
     return { exerciseId: a.exerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, sets: sets, perfVideos: [] };
   });
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): this function
+  // already refuses above (`if (currentWorkout) { ... return false; }`)
+  // when a workout is already open, so currentWorkout is always null by
+  // this point and no live timer from a DIFFERENT workout can be pending
+  // against it right now -- cleared here anyway, defensively, so this
+  // launch never depends on that guard remaining the only thing standing
+  // between it and a stale timer, consistent with every other real
+  // ownership-transition site (app-core.js) clearing unconditionally.
+  if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
   currentWorkout = {
     id: uid(), name: (occurrence.nameSnapshot && occurrence.nameSnapshot.sessionName) || (occurrence.nameSnapshot && occurrence.nameSnapshot.microcycleName) || 'Program Run Session',
     date: Date.now(), exercises: exercises, rpeEnabled: false, duration: 0, bodyweight: null,
@@ -501,6 +532,23 @@ function finishCanonicalRunWorkout() {
   if (planRunLoggerFinishState && (planRunLoggerFinishState.phase === 'pending' || planRunLoggerFinishState.phase === 'uncertain')) return;
   var ownerUid = planRunLoggerCurrentUid();
   if (!ownerUid) { planRunLoggerFinishSetState({ phase: 'error', reason: 'noAuthenticatedUser' }); return; }
+  // SYNCHRONOUS PRE-SAVE RECOMPUTATION (Round 8, Finding 1 -- the
+  // save-before-debounce race): app-core.js's own updateSet schedules a
+  // 400ms debounced recompute of isPR/isNew1RM after every weight/reps
+  // edit. If Finish is pressed before that timer fires, the Set's stored
+  // flags could still reflect an earlier edit, not the current one --
+  // genuinely recalculated here, synchronously, for every Set of this
+  // exact currentWorkout, using the exact same computeSetPRFlags
+  // app-core.js's live checkSetPR/onSetChecked use, before
+  // planRunLoggerBuildWorkoutDoc below ever reads them. This runs on every
+  // Finish attempt (including a Retry, which resubmits the same already-
+  // prepared pkg and therefore does NOT re-reach this line -- its workout
+  // was already recomputed on the original attempt that built it).
+  // clearAllPRDebounceTimers() also cancels any timer still pending for
+  // this workout outright, consistent with the same ownership-transition
+  // defense applied at every other real transition site (app-core.js).
+  if (typeof recomputeAllSetPRFlags === 'function') recomputeAllSetPRFlags(currentWorkout);
+  if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
   var nowTs = (typeof firebase !== 'undefined' && firebase.firestore && firebase.firestore.Timestamp) ? firebase.firestore.Timestamp.now() : { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 };
   var built = planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTs);
   if (!built.ok) { planRunLoggerFinishSetState({ phase: 'error', reason: built.reason }); return; }
@@ -648,6 +696,13 @@ function planRunLoggerFinishCommit(pkg, result) {
   planRunLoggerFinishState = null;
   planRunLoggerFinishCurrentOperationId = null;
   stopWorkoutTimer();
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): currentWorkout
+  // is about to be cleared -- any pending debounce timer was already
+  // cancelled synchronously back in finishCanonicalRunWorkout, before this
+  // (necessarily later, asynchronous) commit even started; cleared again
+  // here too, defensively, in case a later edit somehow scheduled a new
+  // one in the interim.
+  if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
   currentWorkout = null;
   if (wasVisible) {
     var needsReview = resultRefs && Array.isArray(resultRefs.needsManualReviewRuleIds) ? resultRefs.needsManualReviewRuleIds.length : 0;
@@ -789,6 +844,11 @@ function planRunLoggerFinishResetForAuthChange() {
   planRunLoggerFinishCurrentOperationId = null;
   if (discardingRun) {
     stopWorkoutTimer();
+    // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): a sign-out
+    // discards this Run-linked currentWorkout entirely (nothing is saved)
+    // -- any pending debounce timer scheduled against it must be
+    // cancelled here too, never left to fire later.
+    if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
     currentWorkout = null;
     var exContainer = (typeof document !== 'undefined') ? document.getElementById('workout-exercises') : null;
     if (exContainer) exContainer.innerHTML = '';
