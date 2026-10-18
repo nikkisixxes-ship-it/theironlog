@@ -58,7 +58,7 @@
   // is an independently confirmed baseline fact for this round, not a new
   // finding, and this round preserves it as `true` -- it does not turn it
   // off.
-  var CANONICAL_PLAN_RUN_CAPABILITY_ENABLED = false;
+  var CANONICAL_PLAN_RUN_CAPABILITY_ENABLED = true;
 
   function M(name) {
     var f = root[name];
