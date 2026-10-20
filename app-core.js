@@ -1611,6 +1611,34 @@ function openLogHeaderMenu(e) {
 }
 function togglePauseWorkout() { if (!currentWorkout) return; if (workoutPaused) resumeWorkout(); else pauseWorkout(); }
 
+// PRODUCTION-DEFECT CORRECTION (exercise-substitution finding) -- "Change
+// Exercise" (confirmChangeExercise, below) only ever rewrote a workout
+// exercise row's own exerciseId; it never touched that row's
+// planAssignmentId/planPrescriptionId (stamped once, at Session launch,
+// from the real occurrence -- app-plan-run-logger-ui.js) or its Set's own
+// planSetId. For a canonical Program Run Session, those identifiers are
+// exactly what planRunWorkoutContextMatchesOccurrence (plan-run-model.js)
+// re-checks at Finish, for every exercise in the workout -- and it
+// correctly, and deliberately, fails the WHOLE Finish the instant any one
+// of them drifts (integrityConflict/workoutContextMismatch), discarding
+// every genuinely completed exercise in the same workout along with it.
+// Confirmed the exact, sole, reproducible cause of the reported "We found
+// a conflict..." failure (see this correction's own report). "Delete
+// Exercise" is a related, proactively-closed gap in the same unguarded-
+// identity class -- not itself the confirmed cause of the reported
+// failure, but the same kind of unsupported, un-gated mutation of a
+// canonical Run Session's own prescribed structure.
+//
+// This correction does not invent an exercise-substitution model, and
+// does not weaken planRunWorkoutContextMatchesOccurrence's own check --
+// that check is correct and caught a real, genuine corruption of the
+// prescribed/performed association exactly as it should. The fix is at
+// the one layer that actually needs it: neither action is offered, or
+// permitted, for a canonical Program Run Session at all. The already-
+// supported, non-alarming way to leave a prescribed exercise's work
+// undone remains exactly what it always was for an individual Set --
+// simply never completing it (notAttempted) -- which this correction
+// does not change.
 function openExerciseMenu(e, idx) {
   e.stopPropagation();
   const ex = currentWorkout?.exercises[idx];
@@ -1618,20 +1646,41 @@ function openExerciseMenu(e, idx) {
   const hasTM = ex ? hasActiveTMTarget(idx) : false;
   const has1RM = ex ? hasActive1RMTarget(idx) : false;
   const hasWL = ex ? hasWorkingLoadTarget(idx) : false;
+  // Neither "Change Exercise" nor "Delete Exercise" is offered for a
+  // canonical Run Session -- see the correction note above this
+  // function. An ordinary (non-Program-Run) workout is completely
+  // unaffected: planRunLoggerIsCanonicalRunSession() is false there, so
+  // both items appear exactly as they always have.
+  const isCanonicalRun = planRunLoggerIsCanonicalRunSession();
   const items = [
-    { label: 'Change Exercise', icon: '⇄', action: `openChangeExModal(${idx})` },
+    ...(isCanonicalRun ? [] : [{ label: 'Change Exercise', icon: '⇄', action: `openChangeExModal(${idx})` }]),
     ...(hasProg ? [{ label: 'Reset TM / Baseline', icon: '↺', action: `openSingleTMPrompt(${idx})` }] : []),
     ...(hasTM ? [{ label: 'Set / Edit Training Max', icon: '⚖', action: `openActiveTMEditModal(${idx})` }] : []),
     ...(has1RM ? [{ label: 'Set / Edit 1RM', icon: '◉', action: `openActive1RMEditModal(${idx})` }] : []),
     ...(hasWL ? [{ label: 'Set / Edit Working Load', icon: '➕', action: `openActiveWorkingLoadEditModal(${idx})` }] : []),
-    { divider: true },
-    { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true },
+    ...(isCanonicalRun ? [] : [{ divider: true }, { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true }]),
   ];
+  // If every item above was suppressed (a canonical Run Session exercise
+  // with none of the optional TM/1RM/working-load items either), there is
+  // nothing left to show -- declining to open an empty dropdown is a
+  // strict improvement over the prior behavior for that exact case
+  // (there was no such case before this correction, since "Change
+  // Exercise" and the divider+"Delete Exercise" were always present).
+  if (items.length === 0) return;
   showDropdown(e.currentTarget, items);
 }
 
 function deleteExercise(idx) {
   if (!currentWorkout) return;
+  // DEFENSIVE BACKSTOP (see the correction note above openExerciseMenu):
+  // the menu no longer offers this action for a canonical Run Session,
+  // but this guard means that remains true even if this handler is ever
+  // reached some other way. Zero mutation on this path -- the confirm
+  // dialog is never even opened.
+  if (planRunLoggerIsCanonicalRunSession()) {
+    showToast("Program Run Sessions don't support deleting a prescribed exercise.", 'error');
+    return;
+  }
   const exData = getExercise(currentWorkout.exercises[idx].exerciseId);
   const name = exData ? exData.name : 'this exercise';
   confirm2('Delete Exercise', `Remove ${name} from this workout?`, () => { currentWorkout.exercises.splice(idx, 1); renderWorkoutExercises(); }, 'Delete');
@@ -1720,6 +1769,16 @@ function removePerfVideo(viIdx) { if (!currentWorkout || videosExIdx === null) r
 // ==================== CHANGE EXERCISE ====================
 function confirmChangeExercise(newExId) {
   if (changeExTargetIdx === null || !currentWorkout) return;
+  // DEFENSIVE BACKSTOP (see the correction note above openExerciseMenu in
+  // this same file): the menu no longer offers "Change Exercise" for a
+  // canonical Run Session, but this guard means that remains true even
+  // if this handler is ever reached some other way. Zero mutation on
+  // this path -- currentWorkout.exercises is never written to.
+  if (planRunLoggerIsCanonicalRunSession()) {
+    showToast("Program Run Sessions don't support changing a prescribed exercise.", 'error');
+    closeModal('modal-ex-browser');
+    return;
+  }
   currentWorkout.exercises[changeExTargetIdx].exerciseId = newExId;
   currentWorkout.exercises[changeExTargetIdx].perfVideos = [];
   closeModal('modal-ex-browser'); renderWorkoutExercises(); showToast('Exercise changed', 'success');
@@ -2224,10 +2283,26 @@ function buildExerciseBlock(ex, idx) {
 }
 function buildSetsHTML(ex, exIdx, isTime, rpe) {
   const rowCls = rpe ? 'set-row with-rpe' : 'set-row';
+  // PRODUCTION-DEFECT CORRECTION (Finding 1 -- misleading removal
+  // affordance, no model/rules change): removeSet (below) has always
+  // refused to remove a canonical Run Session's own prescribed Set
+  // (isSupplemental !== true), showing a blocking error toast and
+  // mutating nothing. Rendering a Delete control that can only ever
+  // produce that toast is itself the misleading part the owner asked to
+  // correct. The supported, non-alarming way to leave a prescribed Set
+  // unattempted remains exactly what it already was -- simply never
+  // checking it (notAttempted) -- so no new control, label, or model
+  // field is introduced here; the misleading control is just not shown.
+  // An added (isSupplemental:true) Set keeps its fully working Delete
+  // control, and every Set in an ordinary (non-Program-Run) workout is
+  // completely unaffected (planRunLoggerIsCanonicalRunSession() is false
+  // there).
+  const isCanonicalRun = planRunLoggerIsCanonicalRunSession();
   return ex.sets.map((s, si) => {
     const inputCls = s.autoFilled ? 'set-input auto-filled' : 'set-input';
     const repCls   = (s.autoFilled && s.autoType === 'rep_goal') ? 'set-input auto-filled' : 'set-input';
     const wrapCls  = s.completed ? 'set-row-wrap completed' : 'set-row-wrap';
+    const canRemoveThisSet = !isCanonicalRun || s.isSupplemental === true;
     // EXTRA-LABEL REMOVAL CORRECTION: the supplemental-set correction
     // previously rendered a small, purely visual "EXTRA" tag on any Set
     // the person added beyond the Program Run's own prescription
@@ -2249,7 +2324,7 @@ function buildSetsHTML(ex, exIdx, isTime, rpe) {
         ${rpe ? `<input class="set-input" type="number" placeholder="RPE" value="${s.rpe||''}" oninput="updateSet(${exIdx},${si},'rpe',this.value)" min="1" max="10" step="0.5">` : ''}
         <div class="set-badges" id="set-badges-${exIdx}-${si}">${badgesHtml}</div>
       </div>
-      <div class="set-delete-btn" onclick="removeSet(${exIdx},${si})">Delete</div>
+      ${canRemoveThisSet ? `<div class="set-delete-btn" onclick="removeSet(${exIdx},${si})">Delete</div>` : ''}
     </div>
     ${s.targetSummary ? `<div class="plan-target-line">Target: ${s.targetSummary}${buildSetNoteTagHtml(s, exIdx, si)}</div>` : ''}
     ${buildSetNoteBodyHtml(s, exIdx, si)}
@@ -2281,6 +2356,13 @@ function buildSetBadgesHtml(s) {
 function attachSwipeToSet(exIdx, si) {
   const wrap = document.getElementById(`set-wrap-${exIdx}-${si}`); const row = document.getElementById(`set-row-${exIdx}-${si}`);
   if (!wrap || !row) return;
+  // Consistency with buildSetsHTML's own decision, above: no swipe-to-
+  // reveal-Delete for a prescribed Set in a canonical Run Session --
+  // there is no Delete control underneath it to reveal. An added
+  // (isSupplemental:true) Set, and every Set in an ordinary workout,
+  // keeps working swipe-to-delete exactly as before.
+  const s = currentWorkout && currentWorkout.exercises[exIdx] && currentWorkout.exercises[exIdx].sets[si];
+  if (planRunLoggerIsCanonicalRunSession() && !(s && s.isSupplemental === true)) return;
   let startX = 0, currentX = 0, swiping = false;
   wrap.addEventListener('touchstart', e => { startX = e.touches[0].clientX; currentX = startX; swiping = true; }, { passive: true });
   wrap.addEventListener('touchmove', e => { if (!swiping) return; currentX = e.touches[0].clientX; const diff = startX - currentX; row.style.transform = diff > 0 ? `translateX(${-Math.min(diff,70)}px)` : 'translateX(0)'; }, { passive: true });
