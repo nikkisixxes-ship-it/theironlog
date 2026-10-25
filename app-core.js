@@ -1611,34 +1611,25 @@ function openLogHeaderMenu(e) {
 }
 function togglePauseWorkout() { if (!currentWorkout) return; if (workoutPaused) resumeWorkout(); else pauseWorkout(); }
 
-// PRODUCTION-DEFECT CORRECTION (exercise-substitution finding) -- "Change
-// Exercise" (confirmChangeExercise, below) only ever rewrote a workout
-// exercise row's own exerciseId; it never touched that row's
-// planAssignmentId/planPrescriptionId (stamped once, at Session launch,
-// from the real occurrence -- app-plan-run-logger-ui.js) or its Set's own
-// planSetId. For a canonical Program Run Session, those identifiers are
-// exactly what planRunWorkoutContextMatchesOccurrence (plan-run-model.js)
-// re-checks at Finish, for every exercise in the workout -- and it
-// correctly, and deliberately, fails the WHOLE Finish the instant any one
-// of them drifts (integrityConflict/workoutContextMismatch), discarding
-// every genuinely completed exercise in the same workout along with it.
-// Confirmed the exact, sole, reproducible cause of the reported "We found
-// a conflict..." failure (see this correction's own report). "Delete
-// Exercise" is a related, proactively-closed gap in the same unguarded-
-// identity class -- not itself the confirmed cause of the reported
-// failure, but the same kind of unsupported, un-gated mutation of a
-// canonical Run Session's own prescribed structure.
+// WORKOUT-FLEXIBILITY CORRECTION (restores user authority over a
+// Program Run Session's planned exercises -- see the correction report
+// for the full root-cause trace and the Constitution basis). The PRIOR
+// correction (comment retained below, for history) found the real cause
+// of "We found a conflict..." at Finish: Change Exercise rewrote a row's
+// exerciseId without ever touching its planAssignmentId/planPrescriptionId/
+// Set planSetId identity, which plan-run-model.js's
+// planRunWorkoutContextMatchesOccurrence correctly, and strictly, re-checks
+// at Finish. Rather than leaving both actions withdrawn, this correction
+// makes both actions genuinely safe: every exercise row now carries an
+// honest `origin` label (plan-run-model.js), and Change Exercise/Delete
+// Exercise both now UPDATE that label (and, where needed, the Set
+// identities) instead of silently drifting out of agreement with it.
 //
-// This correction does not invent an exercise-substitution model, and
-// does not weaken planRunWorkoutContextMatchesOccurrence's own check --
-// that check is correct and caught a real, genuine corruption of the
-// prescribed/performed association exactly as it should. The fix is at
-// the one layer that actually needs it: neither action is offered, or
-// permitted, for a canonical Program Run Session at all. The already-
-// supported, non-alarming way to leave a prescribed exercise's work
-// undone remains exactly what it always was for an individual Set --
-// simply never completing it (notAttempted) -- which this correction
-// does not change.
+// PRIOR CORRECTION NOTE (historical, for context): "Change Exercise" and
+// "Delete Exercise" were withdrawn entirely for a canonical Run Session.
+// That was the safe, minimal fix available at the time; it is superseded
+// by this correction, which restores both actions without reopening the
+// original defect -- see confirmChangeExercise/deleteExercise below.
 function openExerciseMenu(e, idx) {
   e.stopPropagation();
   const ex = currentWorkout?.exercises[idx];
@@ -1646,43 +1637,65 @@ function openExerciseMenu(e, idx) {
   const hasTM = ex ? hasActiveTMTarget(idx) : false;
   const has1RM = ex ? hasActive1RMTarget(idx) : false;
   const hasWL = ex ? hasWorkingLoadTarget(idx) : false;
-  // Neither "Change Exercise" nor "Delete Exercise" is offered for a
-  // canonical Run Session -- see the correction note above this
-  // function. An ordinary (non-Program-Run) workout is completely
-  // unaffected: planRunLoggerIsCanonicalRunSession() is false there, so
-  // both items appear exactly as they always have.
-  const isCanonicalRun = planRunLoggerIsCanonicalRunSession();
+  // RESTORED (see the correction note above this function): both items
+  // are offered for a canonical Run Session now, exactly as for an
+  // ordinary workout -- confirmChangeExercise/deleteExercise below carry
+  // their own canonical-Run-specific, data-preserving behavior.
   const items = [
-    ...(isCanonicalRun ? [] : [{ label: 'Change Exercise', icon: '⇄', action: `openChangeExModal(${idx})` }]),
+    { label: 'Change Exercise', icon: '⇄', action: `openChangeExModal(${idx})` },
     ...(hasProg ? [{ label: 'Reset TM / Baseline', icon: '↺', action: `openSingleTMPrompt(${idx})` }] : []),
     ...(hasTM ? [{ label: 'Set / Edit Training Max', icon: '⚖', action: `openActiveTMEditModal(${idx})` }] : []),
     ...(has1RM ? [{ label: 'Set / Edit 1RM', icon: '◉', action: `openActive1RMEditModal(${idx})` }] : []),
     ...(hasWL ? [{ label: 'Set / Edit Working Load', icon: '➕', action: `openActiveWorkingLoadEditModal(${idx})` }] : []),
-    ...(isCanonicalRun ? [] : [{ divider: true }, { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true }]),
+    { divider: true }, { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true },
   ];
-  // If every item above was suppressed (a canonical Run Session exercise
-  // with none of the optional TM/1RM/working-load items either), there is
-  // nothing left to show -- declining to open an empty dropdown is a
-  // strict improvement over the prior behavior for that exact case
-  // (there was no such case before this correction, since "Change
-  // Exercise" and the divider+"Delete Exercise" were always present).
   if (items.length === 0) return;
   showDropdown(e.currentTarget, items);
 }
 
 function deleteExercise(idx) {
   if (!currentWorkout) return;
-  // DEFENSIVE BACKSTOP (see the correction note above openExerciseMenu):
-  // the menu no longer offers this action for a canonical Run Session,
-  // but this guard means that remains true even if this handler is ever
-  // reached some other way. Zero mutation on this path -- the confirm
-  // dialog is never even opened.
+  const ex = currentWorkout.exercises[idx];
+  const exData = getExercise(ex.exerciseId);
+  const name = exData ? exData.name : 'this exercise';
   if (planRunLoggerIsCanonicalRunSession()) {
-    showToast("Program Run Sessions don't support deleting a prescribed exercise.", 'error');
+    // WORKOUT-FLEXIBILITY CORRECTION. Three honest cases, chosen by what
+    // is actually true of this row -- never a blanket refusal:
+    //   1. An 'added' row has no prescribed identity to protect -- behaves
+    //      exactly like an ordinary workout's Delete Exercise (confirm,
+    //      then full removal).
+    //   2. A prescribed/substituted row with NO genuine recorded
+    //      performance anywhere on it -- nothing is at risk, so it is
+    //      removed immediately, with no confirmation needed (this is the
+    //      "deliberately omitted" case: the row's own absence from the
+    //      final persisted document, together with the occurrence's own
+    //      permanent prescription snapshot, already IS an honest, durable
+    //      record that it was planned but not performed this Session --
+    //      see the correction report's own note on why no separate
+    //      tombstone field is needed).
+    //   3. A prescribed/substituted row that DOES carry genuine recorded
+    //      performance somewhere on it -- that performance is never
+    //      destroyed. Only the still-unperformed remainder of its Sets is
+    //      dropped (exactly Delete Set's own effect, applied to every
+    //      remaining unperformed Set on the row at once); the row itself,
+    //      and every Set with real recorded work, stays exactly as
+    //      logged, and will Finish and appear in History untouched.
+    if (ex.origin === 'added') {
+      confirm2('Delete Exercise', `Remove ${name} from this workout?`, () => { currentWorkout.exercises.splice(idx, 1); renderWorkoutExercises(); }, 'Delete');
+      return;
+    }
+    const hasWork = ex.sets.some(planRunSetHasRecordedPerformance);
+    if (!hasWork) {
+      currentWorkout.exercises.splice(idx, 1);
+      renderWorkoutExercises();
+      showToast(`${name} removed for this Session.`, 'success');
+      return;
+    }
+    ex.sets = ex.sets.filter(planRunSetHasRecordedPerformance);
+    renderWorkoutExercises();
+    showToast('Remaining sets skipped. Your completed work is kept.', 'success');
     return;
   }
-  const exData = getExercise(currentWorkout.exercises[idx].exerciseId);
-  const name = exData ? exData.name : 'this exercise';
   confirm2('Delete Exercise', `Remove ${name} from this workout?`, () => { currentWorkout.exercises.splice(idx, 1); renderWorkoutExercises(); }, 'Delete');
 }
 
@@ -1767,20 +1780,149 @@ function addPerfVideoFromModal() { const input = document.getElementById('perf-v
 function removePerfVideo(viIdx) { if (!currentWorkout || videosExIdx === null) return; currentWorkout.exercises[videosExIdx].perfVideos.splice(viIdx, 1); renderVideosModalBody(); }
 
 // ==================== CHANGE EXERCISE ====================
+// WORKOUT-FLEXIBILITY CORRECTION ROUND 2 (Finding 1 remediation): decides
+// the honest `origin` for a prescribed/substituted row AFTER a Change
+// Exercise, by comparing the newly selected exercise against the
+// Assignment's own TRUE original prescribed exerciseId (from the
+// `prescribedExerciseByAssignmentId` map recorded once at launch --
+// app-plan-run-logger-ui.js's planRunLoggerLaunch, see that file's own
+// correction note) -- never against the row's CURRENT exerciseId, which
+// may already reflect an earlier substitution and would otherwise cause a
+// genuine "change back to the original" to be mislabeled 'substituted'
+// with an exerciseId that matches the prescription, which
+// plan-run-model.js's planRunWorkoutContextMatchesOccurrence correctly
+// rejects as a mislabeled non-substitution -- that exact rejection is
+// Finding 1. Falls back to 'substituted' (never 'prescribed') if the map
+// or this row's planAssignmentId is missing from it, which is the safe
+// direction: a wrongly-'substituted' row with a genuinely different
+// exerciseId is still Finish-valid, whereas a wrongly-'prescribed' row
+// would not be.
+function planRunResolveChangeExerciseOrigin(ex, newExId) {
+  const map = currentWorkout && currentWorkout.canonicalRun && currentWorkout.canonicalRun.prescribedExerciseByAssignmentId;
+  const trueExId = map ? map[ex.planAssignmentId] : undefined;
+  if (trueExId !== undefined && trueExId === newExId) return 'prescribed';
+  return 'substituted';
+}
+// WORKOUT-FLEXIBILITY CORRECTION ROUND 2: a single fresh, blank,
+// model-valid supplemental Set (plan-run-model.js's own
+// isSupplemental:true/planSetId:null shape -- never a fabricated or
+// reused prescribed identity, and exempt from the cross-row
+// claimedSetIds double-claim guard for exactly that reason) used as the
+// replacement row's starting Set whenever there is no never-performed
+// remainder left to carry over (Finding 3).
+function planRunFreshSupplementalSet() {
+  return { planSetId: null, weight: '', reps: '', time: '', rpe: '', completed: false, isPR: false, isNew1RM: false, isSupplemental: true };
+}
 function confirmChangeExercise(newExId) {
   if (changeExTargetIdx === null || !currentWorkout) return;
-  // DEFENSIVE BACKSTOP (see the correction note above openExerciseMenu in
-  // this same file): the menu no longer offers "Change Exercise" for a
-  // canonical Run Session, but this guard means that remains true even
-  // if this handler is ever reached some other way. Zero mutation on
-  // this path -- currentWorkout.exercises is never written to.
+  const idx = changeExTargetIdx;
+  const ex = currentWorkout.exercises[idx];
+  // WORKOUT-FLEXIBILITY CORRECTION, amended ROUND 2 per the independent
+  // review's Findings 1-3 (see implementation-report.md Round 2 section
+  // for the full trace). Change Exercise is restored for a canonical Run
+  // Session, using the honest `origin` label from plan-run-model.js
+  // instead of a blanket refusal. Four cases, by the row's current state:
+  //   1. origin === 'added', no genuine performance yet -- change freely
+  //      in place, exactly like an ordinary workout (unchanged from Round
+  //      1).
+  //   2. origin === 'added', WITH genuine recorded performance (Finding 2
+  //      remediation) -- that performed work is never reassigned to a
+  //      different exercise's identity. Split: the original row keeps
+  //      only the performed sets, under the exercise actually performed;
+  //      a fresh 'added' row is inserted for the newly selected exercise,
+  //      carrying the never-performed remainder (or one fresh blank
+  //      supplemental Set if none remain).
+  //   3. origin is 'prescribed'/'substituted', no genuine performance yet
+  //      -- relabel this SAME row in place, using
+  //      planRunResolveChangeExerciseOrigin (Finding 1 remediation) to
+  //      decide 'prescribed' vs. 'substituted' by comparing against the
+  //      Assignment's TRUE original prescription, never the row's own
+  //      prior exerciseId.
+  //   4. origin is 'prescribed'/'substituted', WITH genuine recorded
+  //      performance -- split exactly as in Round 1, except: (a) the new
+  //      row's origin is likewise resolved via
+  //      planRunResolveChangeExerciseOrigin rather than hardcoded
+  //      'substituted' (Finding 1), and (b) when every Set was already
+  //      performed and nothing remains to carry over, the new row still
+  //      gets one fresh blank supplemental Set instead of being refused
+  //      outright (Finding 3 remediation -- the prior "nothing left to
+  //      swap" refusal is removed).
   if (planRunLoggerIsCanonicalRunSession()) {
-    showToast("Program Run Sessions don't support changing a prescribed exercise.", 'error');
-    closeModal('modal-ex-browser');
+    // GUARD: plan-run-model.js's planRunWorkoutContextMatchesOccurrence
+    // requires a 'substituted' row's exerciseId to actually DIFFER from
+    // the plan's own prescribed exerciseId for that Assignment (that's
+    // how it tells a real swap apart from a mislabeled non-swap). Picking
+    // the same exercise again from the browser (a no-op) is not a real
+    // substitution, so for a prescribed/substituted row it's declined
+    // here rather than silently creating a row that would fail that
+    // check at Finish. An 'added' row has no such constraint.
+    if (ex.origin !== 'added' && newExId === ex.exerciseId) {
+      closeModal('modal-ex-browser');
+      return;
+    }
+    if (ex.origin === 'added') {
+      const performedSetsAdded = ex.sets.filter(planRunSetHasRecordedPerformance);
+      const remainingSetsAdded = ex.sets.filter(s => !planRunSetHasRecordedPerformance(s));
+      if (performedSetsAdded.length === 0) {
+        // Case 1: nothing performed yet on this added row -- change in
+        // place, unchanged from Round 1.
+        ex.exerciseId = newExId;
+        ex.perfVideos = [];
+        closeModal('modal-ex-browser'); renderWorkoutExercises(); showToast('Exercise changed', 'success');
+        return;
+      }
+      // Case 2 (Finding 2 remediation): genuine performed work exists on
+      // this added row. Never relabel it under the newly selected
+      // exercise's identity -- keep it, under the exercise it was
+      // actually performed as, and create a brand-new added row for the
+      // replacement.
+      ex.sets = performedSetsAdded;
+      const newAddedRow = {
+        exerciseId: newExId, planAssignmentId: null, planPrescriptionId: null, origin: 'added',
+        sets: remainingSetsAdded.length > 0
+          ? remainingSetsAdded.map(() => planRunFreshSupplementalSet())
+          : [planRunFreshSupplementalSet()],
+        perfVideos: []
+      };
+      currentWorkout.exercises.splice(idx + 1, 0, newAddedRow);
+      closeModal('modal-ex-browser'); renderWorkoutExercises(); showToast('Exercise changed. Completed sets were kept under the original exercise.', 'success');
+      return;
+    }
+    const performedSets = ex.sets.filter(planRunSetHasRecordedPerformance);
+    const remainingSets = ex.sets.filter(s => !planRunSetHasRecordedPerformance(s));
+    if (performedSets.length === 0) {
+      // Case 3: nothing performed yet on this row -- relabel in place,
+      // correctly identifying whether this is a genuine substitution or a
+      // return to the Assignment's own true prescribed exercise (Finding
+      // 1 remediation).
+      ex.exerciseId = newExId;
+      ex.origin = planRunResolveChangeExerciseOrigin(ex, newExId);
+      ex.perfVideos = [];
+      closeModal('modal-ex-browser'); renderWorkoutExercises(); showToast('Exercise changed', 'success');
+      return;
+    }
+    // Case 4: split. Original row keeps only the performed sets, under
+    // the exercise it was actually performed as. Finding 3 remediation:
+    // when nothing remains unperformed, the replacement row still gets
+    // one fresh blank supplemental Set (model-valid; see
+    // planRunFreshSupplementalSet's own note) rather than being refused.
+    ex.sets = performedSets;
+    const newRow = {
+      exerciseId: newExId,
+      planAssignmentId: ex.planAssignmentId,
+      planPrescriptionId: ex.planPrescriptionId,
+      origin: planRunResolveChangeExerciseOrigin(ex, newExId),
+      sets: remainingSets.length > 0
+        ? remainingSets.map(s => ({ planSetId: s.planSetId, weight: '', reps: '', time: '', rpe: '', completed: false, isPR: false, isNew1RM: false, isSupplemental: s.isSupplemental === true }))
+        : [planRunFreshSupplementalSet()],
+      perfVideos: []
+    };
+    currentWorkout.exercises.splice(idx + 1, 0, newRow);
+    closeModal('modal-ex-browser'); renderWorkoutExercises(); showToast('Exercise changed. Completed sets were kept under the original exercise.', 'success');
     return;
   }
-  currentWorkout.exercises[changeExTargetIdx].exerciseId = newExId;
-  currentWorkout.exercises[changeExTargetIdx].perfVideos = [];
+  ex.exerciseId = newExId;
+  ex.perfVideos = [];
   closeModal('modal-ex-browser'); renderWorkoutExercises(); showToast('Exercise changed', 'success');
 }
 
@@ -2283,26 +2425,17 @@ function buildExerciseBlock(ex, idx) {
 }
 function buildSetsHTML(ex, exIdx, isTime, rpe) {
   const rowCls = rpe ? 'set-row with-rpe' : 'set-row';
-  // PRODUCTION-DEFECT CORRECTION (Finding 1 -- misleading removal
-  // affordance, no model/rules change): removeSet (below) has always
-  // refused to remove a canonical Run Session's own prescribed Set
-  // (isSupplemental !== true), showing a blocking error toast and
-  // mutating nothing. Rendering a Delete control that can only ever
-  // produce that toast is itself the misleading part the owner asked to
-  // correct. The supported, non-alarming way to leave a prescribed Set
-  // unattempted remains exactly what it already was -- simply never
-  // checking it (notAttempted) -- so no new control, label, or model
-  // field is introduced here; the misleading control is just not shown.
-  // An added (isSupplemental:true) Set keeps its fully working Delete
-  // control, and every Set in an ordinary (non-Program-Run) workout is
-  // completely unaffected (planRunLoggerIsCanonicalRunSession() is false
-  // there).
-  const isCanonicalRun = planRunLoggerIsCanonicalRunSession();
+  // WORKOUT-FLEXIBILITY CORRECTION: the Delete control used to be hidden
+  // for a canonical Run Session's own prescribed Sets (isSupplemental !==
+  // true), because removeSet refused to act on them. removeSet now
+  // allows removing any Set (see its own comment), so the control is
+  // shown unconditionally -- every Set in every workout, Program Run or
+  // ordinary, gets a working Delete control.
   return ex.sets.map((s, si) => {
     const inputCls = s.autoFilled ? 'set-input auto-filled' : 'set-input';
     const repCls   = (s.autoFilled && s.autoType === 'rep_goal') ? 'set-input auto-filled' : 'set-input';
     const wrapCls  = s.completed ? 'set-row-wrap completed' : 'set-row-wrap';
-    const canRemoveThisSet = !isCanonicalRun || s.isSupplemental === true;
+    const canRemoveThisSet = true;
     // EXTRA-LABEL REMOVAL CORRECTION: the supplemental-set correction
     // previously rendered a small, purely visual "EXTRA" tag on any Set
     // the person added beyond the Program Run's own prescription
@@ -2356,13 +2489,10 @@ function buildSetBadgesHtml(s) {
 function attachSwipeToSet(exIdx, si) {
   const wrap = document.getElementById(`set-wrap-${exIdx}-${si}`); const row = document.getElementById(`set-row-${exIdx}-${si}`);
   if (!wrap || !row) return;
-  // Consistency with buildSetsHTML's own decision, above: no swipe-to-
-  // reveal-Delete for a prescribed Set in a canonical Run Session --
-  // there is no Delete control underneath it to reveal. An added
-  // (isSupplemental:true) Set, and every Set in an ordinary workout,
-  // keeps working swipe-to-delete exactly as before.
-  const s = currentWorkout && currentWorkout.exercises[exIdx] && currentWorkout.exercises[exIdx].sets[si];
-  if (planRunLoggerIsCanonicalRunSession() && !(s && s.isSupplemental === true)) return;
+  // WORKOUT-FLEXIBILITY CORRECTION: consistent with buildSetsHTML's own
+  // Delete control, above, swipe-to-reveal-Delete now works for every
+  // Set in every workout, Program Run or ordinary -- there is no longer a
+  // case where the control underneath is absent.
   let startX = 0, currentX = 0, swiping = false;
   wrap.addEventListener('touchstart', e => { startX = e.touches[0].clientX; currentX = startX; swiping = true; }, { passive: true });
   wrap.addEventListener('touchmove', e => { if (!swiping) return; currentX = e.touches[0].clientX; const diff = startX - currentX; row.style.transform = diff > 0 ? `translateX(${-Math.min(diff,70)}px)` : 'translateX(0)'; }, { passive: true });
@@ -2578,19 +2708,34 @@ function addSet(idx) {
   if (container) { container.innerHTML = buildSetsHTML(currentWorkout.exercises[idx], idx, isTime, currentWorkout.rpeEnabled); currentWorkout.exercises[idx].sets.forEach((s, si) => attachSwipeToSet(idx, si)); } else renderWorkoutExercises();
 }
 function removeSet(exIdx, si) {
-  if (planRunLoggerIsCanonicalRunSession()) {
-    // Prescribed Sets stay fixed for a Run-linked Session -- removing one
-    // would mean the Session no longer matches its own prescription
-    // (plan-run-model.js's planRunWorkoutContextMatchesOccurrence), which
-    // this correction does not change. Only a Set the person added
-    // themselves (isSupplemental:true) may be removed; the check is on the
-    // actual Set, not a blanket block, so this stays correct however many
-    // supplemental Sets are present.
-    const target = currentWorkout.exercises[exIdx].sets[si];
-    if (!target || target.isSupplemental !== true) {
-      showToast("This Program Run Session's prescribed sets can't be removed. Only extra sets you've added can be.", 'error');
-      return;
-    }
+  // WORKOUT-FLEXIBILITY CORRECTION: a canonical Run Session's prescribed
+  // Sets used to be permanently fixed here -- removing one was refused
+  // outright, even when it had never been performed. That's now allowed,
+  // with set-level parity to an ordinary workout's own Delete Set (which
+  // has never asked for confirmation either):
+  //   - Not yet performed (planRunSetHasRecordedPerformance is false) --
+  //     removed immediately. plan-run-model.js's
+  //     planRunWorkoutContextMatchesOccurrence only checks that any Set
+  //     present in the saved document belongs to the plan; it never
+  //     requires every prescribed Set to still be present, so a removed,
+  //     unperformed Set is simply absent from Finish's eyes -- an honest
+  //     tombstone-by-absence, with no new model field needed.
+  //   - Genuine performance already recorded -- still removed immediately
+  //     (trim), matching exactly how an ordinary workout's Delete Set has
+  //     always behaved; nothing here reassigns or fabricates that
+  //     performance, it is simply no longer part of this saved workout,
+  //     same as unchecking a completed Set already allows today.
+  // GUARD: plan-run-model.js's planRunWorkoutDocValid requires every
+  // exercise row to keep at least one Set -- removing the last one would
+  // make this row invalid and fail the whole Finish later. An ordinary
+  // workout has the same practical floor (an exercise with zero Sets is
+  // meaningless), so this isn't a new restriction, just making the
+  // existing one honest instead of discovering it at Finish time. Point
+  // the person at Delete Exercise instead, which already handles removing
+  // the whole row correctly for every origin.
+  if (currentWorkout.exercises[exIdx].sets.length <= 1) {
+    showToast('This is the last set — use Delete Exercise to remove the whole exercise instead.', 'error');
+    return;
   }
   currentWorkout.exercises[exIdx].sets.splice(si, 1);
   const container = document.getElementById(`sets-container-${exIdx}`); const exData = getExercise(currentWorkout.exercises[exIdx].exerciseId);
@@ -3560,7 +3705,34 @@ function deleteWorkout(id) {
 }
 
 // ==================== ADD EXERCISE TO WORKOUT ====================
-function addExToWorkout(exId) { if (!currentWorkout) return; currentWorkout.exercises.push({ exerciseId: exId, sets: [{ weight:'', reps:'', time:'', rpe:'', completed:false }], perfVideos:[] }); renderWorkoutExercises(); }
+function addExToWorkout(exId) {
+  if (!currentWorkout) return;
+  if (planRunLoggerIsCanonicalRunSession()) {
+    // WORKOUT-FLEXIBILITY CORRECTION: a canonical Run Session's Add
+    // Exercise button was previously unaware of plan identity entirely --
+    // the row it pushed had no planAssignmentId/planPrescriptionId/origin
+    // at all, which made planRunLoggerBuildWorkoutDoc's identity check
+    // fail the WHOLE Finish (not just this one exercise) with
+    // missingExerciseIdentity the moment the person tried to save. Stamp
+    // this row honestly as origin:'added' with no plan-assignment identity
+    // (there is none -- it's unplanned, extra work), matching
+    // PLAN_RUN_WORKOUT_EXERCISE_KEYS and PLAN_RUN_WORKOUT_SET_KEYS in
+    // plan-run-model.js exactly, so Finish succeeds and this exercise's
+    // performance is correctly excluded from automatic progression.
+    currentWorkout.exercises.push({
+      exerciseId: exId,
+      planAssignmentId: null,
+      planPrescriptionId: null,
+      origin: 'added',
+      sets: [{ planSetId: null, weight: '', reps: '', time: '', rpe: '', completed: false, isPR: false, isNew1RM: false, isSupplemental: true }],
+      perfVideos: []
+    });
+    renderWorkoutExercises();
+    return;
+  }
+  currentWorkout.exercises.push({ exerciseId: exId, sets: [{ weight:'', reps:'', time:'', rpe:'', completed:false }], perfVideos:[] });
+  renderWorkoutExercises();
+}
 
 // ==================== PROGRAMS ====================
 function renderPrograms() {

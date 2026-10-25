@@ -296,7 +296,22 @@ function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
   var exercises = [];
   for (var i = 0; i < currentWorkout.exercises.length; i++) {
     var ex = currentWorkout.exercises[i];
-    if (typeof ex.planAssignmentId !== 'string' || typeof ex.planPrescriptionId !== 'string') {
+    // WORKOUT-FLEXIBILITY CORRECTION: an 'added' row (app-core.js's
+    // addExToWorkout, canonical-run branch) legitimately carries NO
+    // Assignment binding at all -- planAssignmentId/planPrescriptionId are
+    // both null, by design, never fabricated. Only a 'prescribed' or
+    // 'substituted' row (or a row with no `origin` stamped at all, which
+    // this slice never produces but is tolerated defensively) is required
+    // to carry real, non-null identity here. Root-cause note: before this
+    // correction, ANY added row -- reachable today via the always-visible
+    // Add Exercise button, with zero prior guard -- reached this exact
+    // check and failed the WHOLE Finish with 'missingExerciseIdentity',
+    // discarding every genuinely completed exercise in the same workout
+    // along with it. Confirmed directly against this file's own prior
+    // text before this correction.
+    if (ex.origin === 'added') {
+      if (typeof ex.exerciseId !== 'string') return { ok: false, reason: 'missingExerciseIdentity' };
+    } else if (typeof ex.planAssignmentId !== 'string' || typeof ex.planPrescriptionId !== 'string') {
       return { ok: false, reason: 'missingExerciseIdentity' };
     }
     var sets = [];
@@ -312,7 +327,12 @@ function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
       sets.push(planRunLoggerBuildPersistedSet(loggerSet));
     }
     var perfVideos = Array.isArray(ex.perfVideos) ? ex.perfVideos.filter(function (v) { return typeof v === 'string' && v.length > 0; }) : [];
-    exercises.push({ exerciseId: ex.exerciseId, planAssignmentId: ex.planAssignmentId, planPrescriptionId: ex.planPrescriptionId, sets: sets, perfVideos: perfVideos });
+    // WORKOUT-FLEXIBILITY CORRECTION: `origin` is always stamped by this
+    // point (planRunLoggerLaunch for every row present at launch,
+    // app-core.js's addExToWorkout for an added row, confirmChangeExercise
+    // for a substituted row) -- defaulted to 'prescribed' here only as a
+    // belt-and-suspenders fallback, never relied upon as the normal path.
+    exercises.push({ exerciseId: ex.exerciseId, planAssignmentId: ex.origin === 'added' ? null : ex.planAssignmentId, planPrescriptionId: ex.origin === 'added' ? null : ex.planPrescriptionId, origin: ex.origin || 'prescribed', sets: sets, perfVideos: perfVideos });
   }
   var workout = {
     id: currentWorkout.id, ownerUid: ownerUid,
@@ -409,7 +429,13 @@ function planRunLoggerLaunch(run, occurrence) {
       loggerSet.isSupplemental = false;
       return loggerSet;
     });
-    return { exerciseId: a.exerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, sets: sets, perfVideos: [] };
+    // WORKOUT-FLEXIBILITY CORRECTION: every row the Session launches with is
+    // honestly, explicitly 'prescribed' -- it is exactly what app-plan.js's
+    // own occurrence snapshot assigned. A later Change Exercise
+    // (app-core.js's confirmChangeExercise) may relabel it 'substituted';
+    // Add Exercise (app-core.js's addExToWorkout) stamps a brand-new row
+    // 'added' -- neither is ever decided here, at launch.
+    return { exerciseId: a.exerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, origin: 'prescribed', sets: sets, perfVideos: [] };
   });
   // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): this function
   // already refuses above (`if (currentWorkout) { ... return false; }`)
@@ -420,12 +446,30 @@ function planRunLoggerLaunch(run, occurrence) {
   // between it and a stale timer, consistent with every other real
   // ownership-transition site (app-core.js) clearing unconditionally.
   if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
+  // WORKOUT-FLEXIBILITY CORRECTION ROUND 2 (Finding 1 remediation): record
+  // the occurrence's own TRUE prescribed exerciseId for every Assignment,
+  // once, right here at launch, while the full occurrence snapshot is
+  // still in hand. Nothing else in this application retains that mapping
+  // after launch -- app-core.js's confirmChangeExercise previously had no
+  // way to tell "changed back to the real original exercise" apart from
+  // "changed to some other, genuinely different exercise" once a row had
+  // already been swapped once, because it could only compare against the
+  // row's CURRENT exerciseId, which may itself already reflect a prior
+  // substitution. This map is purely additive, in-memory-only, client-side
+  // state: it is never read by planRunLoggerBuildWorkoutDoc, never
+  // serialized into the persisted workout document, and has no effect on
+  // plan-run-model.js's validators or Firestore Rules/indexes -- it only
+  // helps app-core.js choose the honest `origin` label at the moment of a
+  // Change Exercise.
+  var prescribedExerciseByAssignmentId = {};
+  occurrence.assignments.forEach(function (a) { prescribedExerciseByAssignmentId[a.planAssignmentId] = a.exerciseId; });
   currentWorkout = {
     id: uid(), name: (occurrence.nameSnapshot && occurrence.nameSnapshot.sessionName) || (occurrence.nameSnapshot && occurrence.nameSnapshot.microcycleName) || 'Program Run Session',
     date: Date.now(), exercises: exercises, rpeEnabled: false, duration: 0, bodyweight: null,
     canonicalRun: {
       planRunId: occurrence.planRunId, occurrenceId: occurrence.occurrenceId, planTemplateId: occurrence.planTemplateId,
-      headRevisionId: occurrence.headRevisionId, planMicrocycleId: occurrence.planMicrocycleId, planSessionId: occurrence.planSessionId
+      headRevisionId: occurrence.headRevisionId, planMicrocycleId: occurrence.planMicrocycleId, planSessionId: occurrence.planSessionId,
+      prescribedExerciseByAssignmentId: prescribedExerciseByAssignmentId
     }
   };
   planRunLoggerFinishState = null;

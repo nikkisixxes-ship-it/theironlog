@@ -160,7 +160,46 @@ var PLAN_RUN_WORKOUT_KEYS = Object.freeze([
   'planMicrocycleId', 'planSessionId', 'recordKind', 'completionState', 'name', 'date',
   'duration', 'bodyweight', 'exercises', 'createdAt'
 ]);
-var PLAN_RUN_WORKOUT_EXERCISE_KEYS = Object.freeze(['exerciseId', 'planAssignmentId', 'planPrescriptionId', 'sets', 'perfVideos']);
+// WORKOUT-FLEXIBILITY CORRECTION (restores Change Exercise / Delete
+// Exercise / delete-a-prescribed-Set for a canonical Program Run Session --
+// see the correction report for the full root-cause trace). One new field,
+// `origin`, is added to the exercise-row shape -- CURRENT (six keys) below.
+// A row's `origin` is exactly one of three honest labels:
+//   'prescribed'  -- the row still represents exactly what was planned.
+//     Unchanged in every respect from before this correction:
+//     planAssignmentId/planPrescriptionId/exerciseId must all agree with
+//     the occurrence's own real Assignment.
+//   'substituted' -- the person swapped in a different exercise. The row
+//     KEEPS the ORIGINAL Assignment's planAssignmentId/planPrescriptionId
+//     (provenance -- what was actually prescribed is never erased, only
+//     ever read via the occurrence's own permanent snapshot), but its own
+//     exerciseId is the REPLACEMENT exercise, which previously made Finish
+//     correctly -- but too strictly -- reject the whole workout (see
+//     planRunWorkoutContextMatchesOccurrence below).
+//   'added' -- an exercise the person added beyond the prescription. Carries
+//     NO Assignment binding at all (planAssignmentId/planPrescriptionId are
+//     both null, never fabricated), exactly mirroring how a Set the person
+//     adds beyond prescription already carries isSupplemental:true/
+//     planSetId:null.
+// A row's own Sets are UNCHANGED by this correction -- a 'substituted' row's
+// Sets still resolve against the SAME Assignment's own real orderedSets
+// (see planRunWorkoutContextMatchesOccurrence), and an 'added' row's Sets
+// must all be supplemental (isSupplemental:true, planSetId:null), exactly
+// like any other added Set.
+// LEGACY (five keys, no `origin`) -- every exercise row this application has
+// ever been able to write before this correction. Read back and validated
+// exactly as before: origin is implied 'prescribed' -- the exact value that
+// reproduces every existing document's own real meaning unchanged.
+var PLAN_RUN_WORKOUT_EXERCISE_KEYS = Object.freeze(['exerciseId', 'planAssignmentId', 'planPrescriptionId', 'origin', 'sets', 'perfVideos']);
+var PLAN_RUN_WORKOUT_EXERCISE_KEYS_LEGACY = Object.freeze(['exerciseId', 'planAssignmentId', 'planPrescriptionId', 'sets', 'perfVideos']);
+var PLAN_RUN_WORKOUT_EXERCISE_ORIGINS = Object.freeze(['prescribed', 'substituted', 'added']);
+// True for a CURRENT-shape row explicitly stamped origin:'prescribed', and
+// for any LEGACY-shape row (no `origin` field at all -- every legacy row is,
+// and remains, a prescribed row, exactly like planRunWorkoutSetIsSupplemental's
+// own legacy-defaulting convention immediately below it in this file).
+function planRunWorkoutExerciseIsPrescribedOrigin(ex) {
+  return ex.origin === 'prescribed' || ex.origin === undefined;
+}
 // SUPPLEMENTAL-SET CORRECTION (Stage 7 production finding -- Program Run
 // Sessions could not log any Set beyond their prescription at all). One new
 // field, `isSupplemental`, is added to the Set shape -- CURRENT (nine keys)
@@ -1121,8 +1160,37 @@ function planRunWorkoutDocValid(v) {
   if (!Array.isArray(v.exercises) || v.exercises.length === 0) return false;
   for (var i = 0; i < v.exercises.length; i++) {
     var ex = v.exercises[i];
-    if (!planRunExactKeys(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS)) return false;
-    if (!planRunIsId(ex.exerciseId) || !planRunIsId(ex.planAssignmentId) || !planRunIsId(ex.planPrescriptionId)) return false;
+    // WORKOUT-FLEXIBILITY CORRECTION: a row is either CURRENT shape (six
+    // keys, carries its own explicit `origin`) or LEGACY shape (five keys,
+    // no `origin` at all -- every legacy row is, and remains, 'prescribed').
+    // See PLAN_RUN_WORKOUT_EXERCISE_KEYS's own comment above for the full
+    // rationale; mirrors planRunWorkoutSetValid's identical dual-shape
+    // convention immediately above in this file.
+    var exIsCurrentShape = planRunExactKeys(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS);
+    var exIsLegacyShape = !exIsCurrentShape && planRunExactKeys(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS_LEGACY);
+    if (!exIsCurrentShape && !exIsLegacyShape) return false;
+    if (exIsCurrentShape) {
+      if (PLAN_RUN_WORKOUT_EXERCISE_ORIGINS.indexOf(ex.origin) === -1) return false;
+      if (ex.origin === 'added') {
+        // An added row carries no Assignment binding at all -- never a
+        // fabricated or reused one. Both identity fields must be exactly
+        // null, never merely falsy.
+        if (ex.planAssignmentId !== null || ex.planPrescriptionId !== null) return false;
+      } else {
+        // 'prescribed' or 'substituted' -- both still bind to a real
+        // Assignment; only `exerciseId` may legitimately differ from what
+        // was originally prescribed, and only for 'substituted' (checked by
+        // planRunWorkoutContextMatchesOccurrence, which has the occurrence
+        // snapshot this function does not).
+        if (!planRunIsId(ex.planAssignmentId) || !planRunIsId(ex.planPrescriptionId)) return false;
+      }
+      if (!planRunIsId(ex.exerciseId)) return false;
+    } else {
+      // Legacy shape: origin did not exist, so it is implied 'prescribed' --
+      // every legacy row is a real, bound Assignment, exactly as it always
+      // was.
+      if (!planRunIsId(ex.exerciseId) || !planRunIsId(ex.planAssignmentId) || !planRunIsId(ex.planPrescriptionId)) return false;
+    }
     if (!Array.isArray(ex.sets) || ex.sets.length === 0) return false;
     // FOUNDATION CORRECTION (perfVideos empty-array acceptance): `perfVideos`
     // must still be PRESENT (planRunExactKeys, above) and must still be a
@@ -1201,24 +1269,59 @@ function planRunWorkoutContextMatchesOccurrence(workoutDoc, occurrenceDoc) {
   if (workoutDoc.planMicrocycleId !== occurrenceDoc.planMicrocycleId) return false;
   if (workoutDoc.planSessionId !== occurrenceDoc.planSessionId) return false;
   // Every exercise the workout stamps must resolve to a real Assignment on
-  // this occurrence's own snapshot, with matching exerciseId/prescriptionId.
+  // this occurrence's own snapshot, with matching prescriptionId -- and,
+  // per the WORKOUT-FLEXIBILITY CORRECTION below, an exerciseId that
+  // agrees with the Assignment's own prescribed exercise UNLESS the row is
+  // honestly labeled 'substituted' (and genuinely differs -- a row cannot
+  // mislabel an unchanged exercise as a "substitution" to game this check).
+  // An 'added' row carries no Assignment at all and is handled separately,
+  // before ever reaching byAssignmentId.
   var byAssignmentId = {};
   occurrenceDoc.assignments.forEach(function (a) { byAssignmentId[a.planAssignmentId] = a; });
+  // WORKOUT-FLEXIBILITY CORRECTION -- cross-row duplicate-claim guard. More
+  // than one row may now legitimately share the SAME planAssignmentId (the
+  // split-at-substitution case: the original row keeps its own already-
+  // performed Sets, a new 'substituted' row carries the still-unperformed
+  // remainder of the SAME Assignment's Sets) -- so Set-identity uniqueness
+  // can no longer be checked per-row alone (planRunWorkoutDocValid's own
+  // seenSetIds check is deliberately scoped per-row only, for exactly this
+  // reason). This accumulator is scoped to the WHOLE document, catching a
+  // real prescribed planSetId claimed by two different rows, under the
+  // same Assignment or (defensively) any other -- a genuine double-claim,
+  // never a legitimate split.
+  var claimedSetIds = {};
   for (var i = 0; i < workoutDoc.exercises.length; i++) {
     var ex = workoutDoc.exercises[i];
+    if (ex.origin === 'added') {
+      // No Assignment to resolve against, and none required -- an added
+      // row's own Sets are already required (planRunWorkoutDocValid, via
+      // planRunWorkoutSetValid) to be exclusively supplemental, which is
+      // never a claim on any prescribed slot.
+      continue;
+    }
     var a = byAssignmentId[ex.planAssignmentId];
-    if (!a || a.exerciseId !== ex.exerciseId || a.planPrescriptionId !== ex.planPrescriptionId) return false;
+    if (!a || a.planPrescriptionId !== ex.planPrescriptionId) return false;
+    if (planRunWorkoutExerciseIsPrescribedOrigin(ex)) {
+      if (a.exerciseId !== ex.exerciseId) return false;
+    } else {
+      // 'substituted' -- must genuinely differ from what was prescribed;
+      // an unchanged exerciseId mislabeled 'substituted' is rejected, not
+      // silently accepted as a no-op substitution.
+      if (a.exerciseId === ex.exerciseId) return false;
+    }
     var bySetId = {};
     a.orderedSets.forEach(function (os) { bySetId[os.planSetId] = os; });
     for (var s = 0; s < ex.sets.length; s++) {
       // SUPPLEMENTAL-SET CORRECTION: a supplemental Set has no prescribed
       // identity by design (planSetId:null) -- it still had to belong to a
-      // real, matched Assignment (the exerciseId/planPrescriptionId check
-      // just above, unchanged), but there is no prescribed Set for it to
-      // resolve to, and none is required. Every non-supplemental Set must
-      // still resolve exactly as before this correction.
+      // real, matched Assignment (the prescriptionId check just above,
+      // unchanged), but there is no prescribed Set for it to resolve to,
+      // and none is required. Every non-supplemental Set must still
+      // resolve exactly as before this correction.
       if (planRunWorkoutSetIsSupplemental(ex.sets[s])) continue;
       if (!bySetId[ex.sets[s].planSetId]) return false;
+      if (Object.prototype.hasOwnProperty.call(claimedSetIds, ex.sets[s].planSetId)) return false;
+      claimedSetIds[ex.sets[s].planSetId] = true;
     }
   }
   return true;
@@ -1484,7 +1587,19 @@ function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, wor
   };
   var performedBySetId = {};
   (workoutDoc.exercises || []).forEach(function (ex) {
-    if (ex.planAssignmentId === assignment.planAssignmentId) {
+    // WORKOUT-FLEXIBILITY CORRECTION: matching on planAssignmentId alone is
+    // no longer sufficient -- a 'substituted' row now legitimately shares
+    // its planAssignmentId with the original prescribed row (provenance),
+    // but its performed Sets must NEVER automatically feed progression
+    // evidence for the Rule governing this Assignment's ORIGINAL exercise
+    // (the owner's explicit requirement: a swap never auto-counts). Only a
+    // row that genuinely IS the originally-prescribed exercise for this
+    // Assignment (origin:'prescribed', or a legacy row with no `origin` at
+    // all, which is the exact same thing under the pre-correction default)
+    // ever contributes evidence here. This is a no-op for every row that
+    // existed before this correction, since every such row already had
+    // exerciseId === assignment.exerciseId unconditionally.
+    if (ex.planAssignmentId === assignment.planAssignmentId && planRunWorkoutExerciseIsPrescribedOrigin(ex)) {
       // Amended-shape adapter (spec §3A.6.4) -- see the identical comment
       // in planRunOccurrenceEligibleForCompletion above.
       ex.sets.forEach(function (s) { performedBySetId[s.planSetId] = { completed: s.completed, reps: s.reps, seconds: s.time }; });
@@ -2374,9 +2489,7 @@ function planRunClassifyTrainingMaxEstablishRequest(p) {
 // `assignment` is the enabled Rule's own occurrence-snapshot assignment
 // object (`planAssignmentId` is the only field this function reads from
 // it). Returns `{ qualifies: true, amount }` or `{ qualifies: false }` --
-// never throws, never guesses when identity is ambiguous (spec SS4.3 step
-// 2: zero or two-or-more matching `exercises[]` entries both mean "not
-// qualifying", exactly alike).
+// never throws.
 // SUPPLEMENTAL-SET CORRECTION (owner-directed decision, not inferred -- see
 // the correction report): unlike planRunOccurrenceEligibleForCompletion and
 // planRunBuildProgressionTriple (both of which are already, and remain,
@@ -2390,12 +2503,57 @@ function planRunClassifyTrainingMaxEstablishRequest(p) {
 // the one place this codebase's existing "never let un-prescribed evidence
 // influence an automatic outcome" principle had not yet been applied,
 // because the opportunity for it to matter did not exist until now.
+//
+// WORKOUT-FLEXIBILITY CORRECTION ROUND 3 (independent review Finding,
+// Round 2 review): the original spec's "zero or two-or-more matching
+// `exercises[]` entries both mean 'not qualifying', exactly alike" rule
+// (spec SS4.3 step 2) was written before the origin/split lifecycle
+// existed, when a workout could only ever contain AT MOST one exercise row
+// per Assignment -- "two-or-more" could then only mean a genuinely
+// malformed or ambiguous document, never a legitimate state. The
+// workout-flexibility correction's own split-at-change mechanism now
+// legitimately produces exactly this shape on an ordinary, honest
+// lifecycle: perform part of prescribed A, substitute the remainder to B
+// (truthful split: original A row keeps its performed sets, a new
+// 'substituted' B row carries the remainder), then change the still-
+// unperformed B row back to A before ever touching it -- which correctly
+// restores it to `origin:'prescribed'` (see Finding 1's own fix, this same
+// file via app-core.js) rather than leaving it mislabeled. The result is
+// TWO truthful `origin:'prescribed'` rows for the same Assignment, one
+// holding the already-completed work and one holding the still-unperformed
+// remainder -- a state `planRunWorkoutContextMatchesOccurrence`'s own
+// cross-row `claimedSetIds` guard already confirms is non-colliding and
+// valid (it is the ordinary, expected shape of a truthful restoration, not
+// a validation failure). Treating "more than one matching row" as
+// automatically disqualifying, unchanged, silently suppressed automatic
+// working-load establishment on this exact ordinary partial-work-then-
+// restore lifecycle even though genuine completed prescribed evidence was
+// right there in one of the two rows. This function now aggregates
+// qualifying evidence across EVERY prescribed-origin row for this
+// Assignment instead of requiring there be exactly one. This is evidence
+// AGGREGATION only -- it never merges, renumbers, or rewrites the
+// underlying rows themselves (those stay exactly as
+// confirmChangeExercise/Finish-build produced them), and it adds no new
+// provenance mechanism: cross-row duplicate real `planSetId` claims remain
+// exactly as rejected as before, solely by
+// planRunWorkoutContextMatchesOccurrence, which this function continues to
+// assume has already run (it is only ever called on an already-validated
+// `planRunWorkoutDocValid` document, unchanged). A 'substituted' row
+// sharing this Assignment's planAssignmentId (provenance only) is excluded
+// exactly as before -- a swap never auto-counts; only genuinely
+// 'prescribed'-origin evidence is ever aggregated here. Zero matching rows
+// still correctly yields "not qualifying" (there is no code path that
+// produces qualifying weights with no prescribed-origin row to hold them).
 function planRunSelectQualifyingWorkingLoadWeight(workout, assignment) {
-  var matches = workout.exercises.filter(function (ex) { return ex.planAssignmentId === assignment.planAssignmentId; });
-  if (matches.length !== 1) return { qualifies: false };
-  var qualifyingWeights = matches[0].sets
-    .filter(function (st) { return !planRunWorkoutSetIsSupplemental(st) && st.completed === true && typeof st.weight === 'number' && Number.isFinite(st.weight); })
-    .map(function (st) { return st.weight; });
+  var matches = workout.exercises.filter(function (ex) { return ex.planAssignmentId === assignment.planAssignmentId && planRunWorkoutExerciseIsPrescribedOrigin(ex); });
+  var qualifyingWeights = [];
+  matches.forEach(function (ex) {
+    ex.sets.forEach(function (st) {
+      if (!planRunWorkoutSetIsSupplemental(st) && st.completed === true && typeof st.weight === 'number' && Number.isFinite(st.weight)) {
+        qualifyingWeights.push(st.weight);
+      }
+    });
+  });
   if (qualifyingWeights.length === 0) return { qualifies: false };
   return { qualifies: true, amount: Math.max.apply(null, qualifyingWeights) };
 }
@@ -2977,6 +3135,11 @@ if (typeof module !== 'undefined' && module.exports) {
     planRunValidateTrainingMaxEstablishPackage: planRunValidateTrainingMaxEstablishPackage,
     planRunValidateCheckTrainingMaxEstablishStatusInput: planRunValidateCheckTrainingMaxEstablishStatusInput,
     planRunClassifyTrainingMaxEstablishRequest: planRunClassifyTrainingMaxEstablishRequest,
-    planRunSelectQualifyingWorkingLoadWeight: planRunSelectQualifyingWorkingLoadWeight
+    planRunSelectQualifyingWorkingLoadWeight: planRunSelectQualifyingWorkingLoadWeight,
+    // WORKOUT-FLEXIBILITY CORRECTION exports -- exposed so the focused test
+    // harness (and any future caller) can reference the real origin
+    // vocabulary/predicate instead of re-deriving or hardcoding it.
+    PLAN_RUN_WORKOUT_EXERCISE_ORIGINS: PLAN_RUN_WORKOUT_EXERCISE_ORIGINS,
+    planRunWorkoutExerciseIsPrescribedOrigin: planRunWorkoutExerciseIsPrescribedOrigin
   };
 }
