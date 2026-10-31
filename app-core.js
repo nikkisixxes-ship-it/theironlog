@@ -1508,7 +1508,10 @@ function renderHistoryStats() {
   // performance (shared predicate, plan-run-model.js).
   const totalSets = appDb.workouts.reduce((a,w) => a + w.exercises.reduce((b,e) => b + e.sets.filter(planRunSetHasRecordedPerformance).length, 0), 0) + appDb.importedSets.length;
   let totalVol = 0;
-  appDb.workouts.forEach(w => w.exercises.forEach(e => e.sets.forEach(s => { if (s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); })));
+  // UNPERFORMED-EXERCISE HISTORY CORRECTION: Total Volume now uses the same
+  // shared predicate as Total Sets on the line above -- an unchecked,
+  // prefilled target weight x reps was previously counted as lifted volume.
+  appDb.workouts.forEach(w => w.exercises.forEach(e => e.sets.forEach(s => { if (planRunSetHasRecordedPerformance(s) && s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); })));
   appDb.importedSets.forEach(s => { if (s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); });
   const totalSecs = appDb.workouts.reduce((a,w) => a + (w.duration||0), 0);
   const totalHours = totalSecs / 3600;
@@ -3437,6 +3440,11 @@ function getWorkoutHighlights(w) {
     const isBW   = exData && exData.tracking === 'bodyweight_reps'; const isWeighted = !isTime && !isBW;
     let bestSet = null, bestVal = -1;
     for (const s of e.sets) {
+      // UNPERFORMED-EXERCISE HISTORY CORRECTION: only genuinely performed
+      // Sets (shared predicate) may become a highlight -- an unchecked,
+      // prefilled target (e.g. a planned "135 x 5" never actually done)
+      // previously could be shown here as if it had been lifted.
+      if (!planRunSetHasRecordedPerformance(s)) continue;
       if (isWeighted && s.weight && +s.weight > 0 && s.reps && +s.reps > 0) { const v = calc1RM(+s.weight, +s.reps); if (v > bestVal) { bestVal = v; bestSet = s; } }
       else if (isBW && s.reps && +s.reps > 0) { if (+s.reps > bestVal) { bestVal = +s.reps; bestSet = s; } }
       else if (isTime && s.time && +s.time > 0) { if (+s.time > bestVal) { bestVal = +s.time; bestSet = s; } }
@@ -3616,7 +3624,17 @@ function toggleRecentCard(wid) {
 }
 function buildRecentExpandedHtml(wid) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return '';
+  // UNPERFORMED-EXERCISE HISTORY CORRECTION: an exercise with no
+  // genuinely performed Set (shared predicate) is no longer rendered at all
+  // -- previously its name row still appeared with an empty set list (the
+  // reported "blank exercise" in History). `ei` stays the exercise's ORIGINAL
+  // index (the video modal looks it up by that index); the visible number
+  // is its position among the exercises actually shown. Read-only: the
+  // stored workout object is never modified.
+  let shownNum = 0;
   const exercisesHtml = w.exercises.map((e, ei) => {
+    if (!e.sets.some(planRunSetHasRecordedPerformance)) return '';
+    shownNum++;
     const ex = getExercise(e.exerciseId); const name = ex ? ex.name : e.exerciseId;
     const isTime = ex && (ex.tracking === 'time' || ex.tracking === 'weight_time');
     const perfVideos = e.perfVideos || []; const refVideos = getExVideos(e.exerciseId);
@@ -3647,7 +3665,7 @@ function buildRecentExpandedHtml(wid) {
       const e1rmBadge = qualifiesForBadge && s.isNew1RM && s.weight && s.reps ? `<span class="recent-badge recent-badge-1rm" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">E1RM: ${Math.round(calc1RM(+s.weight,+s.reps))}</span>` : (qualifiesForBadge && s.isPR ? `<span style="display:inline-block;min-width:72px"></span>` : '');
       return `<div class="recent-set-row"><span class="recent-set-weight">${weightStr}</span><span class="recent-set-x">${xStr}</span><span class="recent-set-reps">${repsStr}</span><span class="recent-set-badges">${prBadge}${e1rmBadge}</span></div>`;
     }).join('');
-    return `<div class="recent-ex-block"><div class="recent-ex-name-row"><span class="recent-ex-num">${ei+1}</span><span class="recent-ex-name">${name}</span>${videoIcon}</div><div class="recent-ex-sets">${setsHtml}</div></div>`;
+    return `<div class="recent-ex-block"><div class="recent-ex-name-row"><span class="recent-ex-num">${shownNum}</span><span class="recent-ex-name">${name}</span>${videoIcon}</div><div class="recent-ex-sets">${setsHtml}</div></div>`;
   }).join('');
   // FOUNDATION SLICE ADDITION (spec §3A.9) -- a canonical (Program Run)
   // workout OMITS the Edit control entirely (never merely disables it) and
@@ -3852,12 +3870,15 @@ function renderCopyOutput(){
   // below stay correctly aligned -- a genuinely completed Set still
   // exports exactly as logged (unchanged); an untouched one no longer
   // appears at all (never a fabricated '- —' line).
+  // UNPERFORMED-EXERCISE HISTORY CORRECTION: in both formats below, an
+  // exercise with no genuinely performed Set is now skipped entirely
+  // (previously its name heading was still printed with nothing under it).
   if(copyFormat==='txt'){
     out+=`${w.name.toUpperCase()}\n${d}\n`;if(w.duration)out+=`Duration: ${fmtDuration(w.duration)}\n`;out+='─'.repeat(40)+'\n\n';
-    w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   } else {
     out+=`[u][size=200]${w.name}[/size][/u]\n[i]${d}[/i]\n`;if(w.duration)out+=`[i]Duration: ${fmtDuration(w.duration)}[/i]\n`;out+='\n';
-    w.exercises.forEach(e=>{const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   }
   document.getElementById('copy-output').textContent=out;
 }

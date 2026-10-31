@@ -735,7 +735,14 @@ function planRunLoggerFinishCommit(pkg, result) {
   // resolves after the person has already navigated elsewhere must not
   // yank them back to Home or pop a toast about a screen they're not on.
   var wasVisible = planRunLoggerFinishIsPageVisible();
-  appDb.workouts.unshift(pkg.workout);
+  // POST-FINISH STALE-TRAIN CORRECTION (supporting work): the committed
+  // workout document may already have reached appDb.workouts through this
+  // app's ordinary COL_WORKOUTS live listener before this callback runs
+  // (the listener and the transaction promise have no guaranteed order).
+  // Insert it only if that workout id is not already present, so local
+  // History holds it exactly once either way.
+  var alreadyLocal = appDb.workouts.some(function (w) { return w && w.id === pkg.workout.id; });
+  if (!alreadyLocal) appDb.workouts.unshift(pkg.workout);
   var resultRefs = result.resultRefs || null;
   planRunLoggerFinishState = null;
   planRunLoggerFinishCurrentOperationId = null;
@@ -764,6 +771,11 @@ function planRunLoggerFinishCommit(pkg, result) {
     // resolved; showPage('page-home') above would have done this via its
     // own id==='page-log' branch, so it's done directly here instead.
     planRunLoggerFinishRender();
+    // POST-FINISH STALE-TRAIN CORRECTION: if the person is already looking
+    // at TRAIN when this late commit lands, refresh it in place (no
+    // redirect, no toast) through the same renderHome() path showPage uses,
+    // so the finished Session never stays displayed as In Progress.
+    if (typeof activePage === 'function' && activePage() === 'page-home' && typeof renderHome === 'function') renderHome();
   }
 }
 

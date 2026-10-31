@@ -392,7 +392,20 @@ function planRunUiApplyFirstPageResult(result) {
       hasMore: !!result.hasMore,
       nextCursor: result.hasMore ? result.nextCursor : null,
       loadingMore: false,
-      loadMoreError: false
+      loadMoreError: false,
+      // POST-FINISH STALE-TRAIN CORRECTION: a fresh first-page list is the
+      // authoritative re-read, so every per-Run Session detail cached under
+      // the PREVIOUS list is discarded here and re-read below. Previously
+      // this cache was keyed by planRunId only and never invalidated, so
+      // after a successful Finish (which advances the Run's
+      // nextOccurrenceId) the refreshed list was paired with the OLD
+      // occurrence's cached detail -- the just-finished Session kept
+      // showing "In Progress" until an app restart cleared memory. Any
+      // still-in-flight older detail response is dropped by the existing
+      // per-Run epoch check (its entry no longer exists / carries a newer
+      // epoch). A plain re-render of the section never reaches this line,
+      // so re-rendering alone still never refetches.
+      detailByRunId: {}
     });
     // USABILITY CORRECTION (independent-review finding, this round): kick
     // off each new Run's own detail read automatically, the instant the
