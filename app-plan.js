@@ -1954,7 +1954,11 @@ function planNormalizeCanonicalGraph(draft) {
             effectiveBoundary: 'ongoing',
             requiredTracks: [],
             inputContract: 'gatewaySetOutcome',
-            outputContract: 'nextAssignmentAdjustment'
+            outputContract: 'nextAssignmentAdjustment',
+            // PROGRESSION SERIES FOUNDATION: optional, explicit series link
+            // (omitted entirely when absent -- planStripUndefined).
+            progressionSeriesId: planNormalizeAbsent(prog.progressionSeriesId),
+            progressionSeriesName: planNormalizeAbsent(prog.progressionSeriesName)
           }, []); // Rule carries assignmentId as a back-reference only; Assignment depends on Rule, not vice versa.
         }
       }
@@ -6443,7 +6447,13 @@ var PLAN_READER_SEMANTIC_FIELDS = Object.freeze({
   planScheduleOpportunityRevision: Object.freeze(['templateId', 'opportunityId', 'microcycle', 'session', 'orderKey', 'recurrence']),
   planPrescriptionRevision: Object.freeze(['templateId', 'assignmentId', 'prescriptionId', 'componentApplicability', 'unresolvedResolutionMethod']),
   planSetRevision: Object.freeze(['prescriptionId', 'setId', 'orderKey', 'weight', 'addedWeight', 'percent', 'reps', 'minReps', 'maxReps', 'rir', 'minRir', 'maxRir', 'seconds', 'minSeconds', 'maxSeconds', 'loadType', 'repsType', 'effortType', 'timeType', 'notes']),
-  planRuleRevision: Object.freeze(['templateId', 'assignmentId', 'ruleId', 'enabled', 'evaluationType', 'gatewaySetIndex', 'adjustmentType', 'loadIncrease', 'tmIncrease', 'failBehavior', 'authority', 'scope', 'effectiveBoundary', 'requiredTracks', 'inputContract', 'outputContract']),
+  // PROGRESSION SERIES FOUNDATION: two OPTIONAL trailing fields
+  // (`progressionSeriesId`, `progressionSeriesName`). Absent on every Rule
+  // saved before this feature, so those Rules extract -- and re-hash --
+  // exactly as before; present only on a Rule its author explicitly linked
+  // into a Progression series. Recognised by BOTH builds so a series-linked
+  // Program always reads (and round-trips) intact.
+  planRuleRevision: Object.freeze(['templateId', 'assignmentId', 'ruleId', 'enabled', 'evaluationType', 'gatewaySetIndex', 'adjustmentType', 'loadIncrease', 'tmIncrease', 'failBehavior', 'authority', 'scope', 'effectiveBoundary', 'requiredTracks', 'inputContract', 'outputContract', 'progressionSeriesId', 'progressionSeriesName']),
   planImplementationRelationshipRevision: Object.freeze(['templateId', 'assignmentId', 'relationshipId', 'exerciseId', 'eligibilityMode', 'sourceRevisionSemantics', 'constraints', 'resolver', 'resolutionTiming', 'permittedBindingScope', 'acceptancePolicy', 'lifecycleInterval'])
 });
 
@@ -8439,7 +8449,11 @@ function planBuildCanonicalTemplateEditSession(input) {
                   loadIncrease: (progressionRule && progressionRule.loadIncrease) || 0,
                   tmIncrease: (progressionRule && progressionRule.tmIncrease) || 0,
                   failBehavior: (progressionRule && progressionRule.failBehavior) || 'repeat',
-                  planRuleId: progressionRuleId
+                  planRuleId: progressionRuleId,
+                  // PROGRESSION SERIES FOUNDATION: carried through unchanged
+                  // (absent -> undefined -> omitted again on re-normalize).
+                  progressionSeriesId: (progressionRule && progressionRule.progressionSeriesId) || undefined,
+                  progressionSeriesName: (progressionRule && progressionRule.progressionSeriesName) || undefined
                 }
               };
             })
@@ -8936,6 +8950,10 @@ function planCanonicalAdaptProgressionField(prog) {
     failBehavior: planCanonicalAdapterOptionalString(prog.failBehavior)
   };
   if (typeof prog.planRuleId === 'string' && prog.planRuleId) out.planRuleId = prog.planRuleId;
+  // PROGRESSION SERIES FOUNDATION: an explicit series link is preserved
+  // exactly; it is never created here.
+  if (typeof prog.progressionSeriesId === 'string' && prog.progressionSeriesId) out.progressionSeriesId = prog.progressionSeriesId;
+  if (typeof prog.progressionSeriesName === 'string' && prog.progressionSeriesName) out.progressionSeriesName = prog.progressionSeriesName;
   return out;
 }
 
@@ -10985,6 +11003,166 @@ function planCanonicalEditorHandleSetProgressionField(mi, si, ei, field, rawValu
   }
 }
 
+// =============================================================================
+// PROGRESSION SERIES FOUNDATION -- explicit, author-defined Progression series.
+//
+// A series links Progression-bearing exercise entries across Sessions and
+// Microcycles so they share ONE continuing value in a Program Run. Membership
+// is only ever set by these explicit actions (and carried by Duplicate
+// Microcycle, which copies the writer's own links). Nothing here matches by
+// exercise, name, position, Session or week.
+//
+// Stored on the entry's own `progression` object as `progressionSeriesId` +
+// `progressionSeriesName`, and saved on the canonical Rule revision.
+// First-implementation restrictions (validated on save and at Run Start):
+//   - every member has an enabled Progression;
+//   - one exercise identity and one Progression type (Increase Fixed Load =
+//     Working Load, or Increase Training Max) per series;
+//   - at most one member per Session;
+//   - at most PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE (20) series-linked
+//     entries in one Session (a Firestore Rules access-call limit).
+// =============================================================================
+var PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH = 120;
+var PLAN_PROGRESSION_SERIES_MAX_PER_SESSION_FALLBACK = 20;
+
+function planProgressionSeriesUiEnabled() {
+  return typeof planProgressionSeriesFeatureEnabled === 'function' && planProgressionSeriesFeatureEnabled();
+}
+
+// Pure: lists every series in an editor state (enabled Progressions only).
+// Returns [{ seriesId, seriesName, exerciseId, adjustmentType, members: [{mi, si, ei}] }]
+function planCanonicalEditorListProgressionSeries(es) {
+  var byId = {}, order = [];
+  ((es && es.microcycles) || []).forEach(function (mc, mi) {
+    (mc.sessions || []).forEach(function (s, si) {
+      (s.exercises || []).forEach(function (ex, ei) {
+        var p = ex && ex.progression;
+        if (!p || !p.enabled || typeof p.progressionSeriesId !== 'string' || !p.progressionSeriesId) return;
+        if (!byId[p.progressionSeriesId]) {
+          byId[p.progressionSeriesId] = { seriesId: p.progressionSeriesId, seriesName: p.progressionSeriesName || '', exerciseId: ex.exerciseId, adjustmentType: p.adjustmentType, members: [] };
+          order.push(p.progressionSeriesId);
+        }
+        byId[p.progressionSeriesId].members.push({ mi: mi, si: si, ei: ei });
+      });
+    });
+  });
+  return order.map(function (id) { return byId[id]; });
+}
+
+// Pure: why this entry cannot join that series (null when it can).
+function planCanonicalEditorSeriesLinkBlockReason(es, mi, si, ei, series) {
+  var ex = es.microcycles[mi].sessions[si].exercises[ei];
+  var p = ex.progression;
+  if (!p || !p.enabled) return 'Turn on Progression for this exercise first.';
+  if (p.progressionSeriesId) return p.progressionSeriesId === series.seriesId ? 'Already in this series.' : 'This exercise is already in another series. Remove it from that series first.';
+  if (series.exerciseId !== ex.exerciseId) return 'A series can only link the same exercise.';
+  if (series.adjustmentType !== p.adjustmentType) return 'A series can only link the same Progression type (Increase Fixed Load or Increase Training Max).';
+  for (var k = 0; k < series.members.length; k++) {
+    if (series.members[k].mi === mi && series.members[k].si === si) return 'This series already has an exercise in this Session.';
+  }
+  return null;
+}
+
+function planCanonicalEditorSeriesGuard(callerName) {
+  if (!planCanonicalEditorGuardMutable(callerName)) return false;
+  if (!planProgressionSeriesUiEnabled()) {
+    planCanonicalEditorState.validationMessage = 'Progression series are not available in this version of the app.';
+    planCanonicalEditorRender();
+    return false;
+  }
+  return true;
+}
+
+function planCanonicalEditorHandleStartProgressionSeries(mi, si, ei, rawName) {
+  if (!planCanonicalEditorSeriesGuard('planCanonicalEditorHandleStartProgressionSeries')) return { status: 'blocked' };
+  var st = planCanonicalEditorState;
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var p = ex.progression;
+  if (!p || !p.enabled) { st.validationMessage = 'Turn on Progression for this exercise first.'; planCanonicalEditorRender(); return { status: 'blocked', reason: 'progressionDisabled' }; }
+  if (p.progressionSeriesId) { st.validationMessage = 'This exercise is already in a series. Remove it from that series first.'; planCanonicalEditorRender(); return { status: 'blocked', reason: 'alreadyInSeries' }; }
+  var name = (typeof rawName === 'string' ? rawName.trim() : '') || (planCanonicalGetExerciseName(ex.exerciseId) + ' progression');
+  if (name.length > PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH) name = name.slice(0, PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH);
+  var allocator = (st.ctx && typeof st.ctx.allocateId === 'function') ? st.ctx.allocateId : planDefaultIdAllocator;
+  p.progressionSeriesId = allocator();
+  p.progressionSeriesName = name;
+  st.validationMessage = null;
+  planCanonicalEditorRender();
+  return { status: 'started', seriesId: p.progressionSeriesId };
+}
+
+function planCanonicalEditorHandleLinkProgressionSeries(mi, si, ei, seriesId) {
+  if (!planCanonicalEditorSeriesGuard('planCanonicalEditorHandleLinkProgressionSeries')) return { status: 'blocked' };
+  var st = planCanonicalEditorState;
+  var es = st.editorState;
+  planCanonicalEditorResolveExercise(mi, si, ei);
+  var series = planCanonicalEditorListProgressionSeries(es).filter(function (x) { return x.seriesId === seriesId; })[0];
+  if (!series) { st.validationMessage = 'That series no longer exists.'; planCanonicalEditorRender(); return { status: 'blocked', reason: 'noSuchSeries' }; }
+  var reason = planCanonicalEditorSeriesLinkBlockReason(es, mi, si, ei, series);
+  if (reason) { st.validationMessage = reason; planCanonicalEditorRender(); return { status: 'blocked', reason: reason }; }
+  var p = es.microcycles[mi].sessions[si].exercises[ei].progression;
+  p.progressionSeriesId = series.seriesId;
+  p.progressionSeriesName = series.seriesName;
+  st.validationMessage = null;
+  planCanonicalEditorRender();
+  return { status: 'linked', seriesId: series.seriesId };
+}
+
+function planCanonicalEditorHandleUnlinkProgressionSeries(mi, si, ei) {
+  if (!planCanonicalEditorSeriesGuard('planCanonicalEditorHandleUnlinkProgressionSeries')) return { status: 'blocked' };
+  var p = planCanonicalEditorResolveExercise(mi, si, ei).progression;
+  if (p) { delete p.progressionSeriesId; delete p.progressionSeriesName; }
+  planCanonicalEditorState.validationMessage = null;
+  planCanonicalEditorRender();
+  return { status: 'unlinked' };
+}
+
+function planCanonicalEditorHandleRenameProgressionSeries(seriesId, rawName) {
+  if (!planCanonicalEditorSeriesGuard('planCanonicalEditorHandleRenameProgressionSeries')) return { status: 'blocked' };
+  var st = planCanonicalEditorState;
+  var name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!name || name.length > PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH) {
+    st.validationMessage = 'Give the series a name of 1–' + PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH + ' characters.';
+    planCanonicalEditorRender();
+    return { status: 'blocked' };
+  }
+  var es = st.editorState;
+  planCanonicalEditorListProgressionSeries(es).forEach(function (series) {
+    if (series.seriesId !== seriesId) return;
+    series.members.forEach(function (m) { es.microcycles[m.mi].sessions[m.si].exercises[m.ei].progression.progressionSeriesName = name; });
+  });
+  st.validationMessage = null;
+  return { status: 'renamed' };
+}
+
+// Pure: save-time series validation (BOTH builds -- a Program that already
+// carries series links must stay internally consistent whichever build edits
+// it). Returns a message, or null.
+function planCanonicalEditorValidateProgressionSeries(es) {
+  var maxPerSession = (typeof PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE === 'number') ? PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE : PLAN_PROGRESSION_SERIES_MAX_PER_SESSION_FALLBACK;
+  var list = planCanonicalEditorListProgressionSeries(es);
+  var linkedPerSession = {};
+  for (var i = 0; i < list.length; i++) {
+    var s = list[i];
+    var label = s.seriesName ? '“' + s.seriesName + '”' : 'A Progression series';
+    var seenSession = {};
+    for (var m = 0; m < s.members.length; m++) {
+      var mem = s.members[m];
+      var ex = es.microcycles[mem.mi].sessions[mem.si].exercises[mem.ei];
+      var p = ex.progression;
+      if (ex.exerciseId !== s.exerciseId) return label + ' links different exercises (Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + '). Remove it from the series or change the exercise back.';
+      if (p.adjustmentType !== s.adjustmentType) return label + ' mixes Progression types (Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + ').';
+      if ((p.progressionSeriesName || '') !== s.seriesName) return label + ' has members with different names. Rename the series to make them match.';
+      if (!s.seriesName || s.seriesName.length > PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH) return 'Every Progression series needs a name of 1–' + PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH + ' characters.';
+      var key = mem.mi + ':' + mem.si;
+      if (seenSession[key]) return label + ' has two exercises in Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + '. A series can have at most one per Session.';
+      seenSession[key] = true;
+      linkedPerSession[key] = (linkedPerSession[key] || 0) + 1;
+      if (linkedPerSession[key] > maxPerSession) return 'Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + ' has more than ' + maxPerSession + ' series-linked exercises (a database limit).';
+    }
+  }
+  return null;
+}
+
 // ---- Removal controls (requirement 1: "Add removal controls for sets,
 // exercises, sessions, and microcycles... Prevent deletion from leaving a
 // structurally unusable Program"). Each refuses to remove -- leaving state
@@ -11143,7 +11321,8 @@ function planCanonicalEditorValidateBeforeSave(es) {
       }
     }
   }
-  return null;
+  // PROGRESSION SERIES FOUNDATION.
+  return planCanonicalEditorValidateProgressionSeries(es);
 }
 
 // ---- planCanonicalEditorApplySaveResult(st, result) ----
@@ -12365,8 +12544,46 @@ function planCanonicalEditorRender() {
       '<label style="font-size:11px">On Failure<select data-testid="progression-failBehavior"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'failBehavior\',this.value)">' +
         '<option value="repeat" ' + (prog.failBehavior === 'repeat' ? 'selected' : '') + '>Repeat Prescription</option>' +
         '</select></label>' +
+      progressionSeriesHtml(mi, si, ei, ex) +
       '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-disable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ')">Disable Progression</button>' +
       '</div>';
+  }
+
+  // PROGRESSION SERIES FOUNDATION -- the explicit series panel. Hidden in the
+  // compatibility build except as a read-only label on an already-linked entry.
+  function progressionSeriesHtml(mi, si, ei, ex) {
+    var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
+    var prog = ex.progression;
+    var enabledUi = planProgressionSeriesUiEnabled();
+    var allSeries = planCanonicalEditorListProgressionSeries(st.editorState);
+    var mine = prog.progressionSeriesId ? allSeries.filter(function (x) { return x.seriesId === prog.progressionSeriesId; })[0] : null;
+    var wrap = function (inner) { return '<div class="plan-canonical-editor-series" data-testid="progression-series-panel"' + idx + ' style="margin:8px 0;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px">' + inner + '</div>'; };
+    function where(m) {
+      var mc = st.editorState.microcycles[m.mi], ss = mc.sessions[m.si];
+      return escapeHtml((mc.name || ('Microcycle ' + (m.mi + 1))) + ' · ' + (ss.name || ('Session ' + (m.si + 1))));
+    }
+    if (mine) {
+      var memberList = '<ul data-testid="progression-series-members" style="margin:4px 0 6px 18px;padding:0;font-size:12px">' +
+        mine.members.map(function (m) { return '<li>' + where(m) + (m.mi === mi && m.si === si && m.ei === ei ? ' <em>(this one)</em>' : '') + '</li>'; }).join('') + '</ul>';
+      if (!enabledUi) {
+        return wrap('<div style="font-size:12px;font-weight:600" data-testid="progression-series-label">Progression series: ' + escapeHtml(mine.seriesName) + '</div>' + memberList +
+          '<div style="font-size:11px;color:var(--text3)">Editing Progression series needs the newer version of the app.</div>');
+      }
+      return wrap('<div style="font-size:12px;font-weight:600" data-testid="progression-series-label">Progression series: ' + escapeHtml(mine.seriesName) + '</div>' +
+        '<div style="font-size:11px;color:var(--text3)">These exercises share one continuing value in a Program Run. Each finished Session updates it; the next linked Session uses the result.</div>' +
+        '<label style="font-size:11px">Series name<input type="text" maxlength="' + PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH + '" data-testid="progression-series-name"' + idx + ' ' + lockedAttr + ' value="' + escapeHtml(mine.seriesName) + '" oninput="planCanonicalEditorHandleRenameProgressionSeries(\'' + escapeHtml(mine.seriesId) + '\', this.value)"></label>' +
+        '<div style="font-size:11px;margin-top:4px">Linked exercises (' + mine.members.length + '):</div>' + memberList +
+        '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-series-unlink"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleUnlinkProgressionSeries(' + mi + ',' + si + ',' + ei + ')">Remove from series</button>');
+    }
+    if (!enabledUi) return '';
+    var options = allSeries.map(function (sr) {
+      var reason = planCanonicalEditorSeriesLinkBlockReason(st.editorState, mi, si, ei, sr);
+      return '<option value="' + escapeHtml(sr.seriesId) + '" ' + (reason ? 'disabled' : '') + '>' + escapeHtml(sr.seriesName + ' (' + sr.members.length + ')' + (reason ? ' — ' + reason : '')) + '</option>';
+    }).join('');
+    return wrap('<div style="font-size:12px;font-weight:600">Progression series: none</div>' +
+      '<div style="font-size:11px;color:var(--text3)">Without a series, this exercise\u2019s Progression only affects this one Session. Link exercises into a series to carry the value forward. Nothing is linked automatically.</div>' +
+      '<button type="button" class="btn btn-secondary btn-sm" data-testid="progression-series-start"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleStartProgressionSeries(' + mi + ',' + si + ',' + ei + ')">Start a new series here</button>' +
+      (allSeries.length ? '<label style="font-size:11px;display:block;margin-top:6px">Or link to an existing series<select data-testid="progression-series-link"' + idx + ' ' + lockedAttr + ' onchange="if(this.value)planCanonicalEditorHandleLinkProgressionSeries(' + mi + ',' + si + ',' + ei + ',this.value)"><option value="">Choose a series…</option>' + options + '</select></label>' : ''));
   }
 
   // ---- Shared global header: identical Save/outcome/validation/save-phase/
@@ -13787,6 +14004,14 @@ if (typeof module !== 'undefined' && module.exports) {
     planCanonicalEditorBoot: planCanonicalEditorBoot,
     planCanonicalEditorHandleNew: planCanonicalEditorHandleNew,
     planCanonicalEditorHandleEnableProgression: planCanonicalEditorHandleEnableProgression,
+    // PROGRESSION SERIES FOUNDATION
+    planCanonicalEditorListProgressionSeries: planCanonicalEditorListProgressionSeries,
+    planCanonicalEditorSeriesLinkBlockReason: planCanonicalEditorSeriesLinkBlockReason,
+    planCanonicalEditorHandleStartProgressionSeries: planCanonicalEditorHandleStartProgressionSeries,
+    planCanonicalEditorHandleLinkProgressionSeries: planCanonicalEditorHandleLinkProgressionSeries,
+    planCanonicalEditorHandleUnlinkProgressionSeries: planCanonicalEditorHandleUnlinkProgressionSeries,
+    planCanonicalEditorHandleRenameProgressionSeries: planCanonicalEditorHandleRenameProgressionSeries,
+    planCanonicalEditorValidateProgressionSeries: planCanonicalEditorValidateProgressionSeries,
     planCanonicalEditorHandleDisableProgression: planCanonicalEditorHandleDisableProgression,
     planCanonicalEditorHandleAddMicrocycle: planCanonicalEditorHandleAddMicrocycle,
     planCanonicalEditorHandleAddSession: planCanonicalEditorHandleAddSession,

@@ -235,7 +235,55 @@ function planRunStartTemplateLevelSuggestionIsValid(state, planTemplateId, rule)
 // so production callers below pass nothing and get the real bare-global
 // lookup, while a Node test can pass { sha256Hex, buildCanonicalEncoding }
 // explicitly).
-function planRunStartBuildPackage(profile, planRunId, operationId, progressionInitialValues, hashDeps) {
+// PROGRESSION SERIES FOUNDATION -- groups the enabled Rules a PLAN revision
+// explicitly links into Progression series (rule payload `progressionSeriesId`
+// /`progressionSeriesName`). Nothing is inferred: a Rule without an explicit
+// link is never grouped with anything. Returns
+//   { ok: true, series: [{ seriesId, seriesName, exerciseId, kind, adjustmentType, members: [{ microcycleId, sessionId, planAssignmentId, planRuleId, ruleRevisionId }] }], seriesRuleIds: {planRuleId: seriesId} }
+// or { ok: false, reason } when the links are inconsistent (different
+// exercises/value kinds/names, or two members in one Session).
+function planRunStartCollectSeries(profileView) {
+  var byId = {}, order = [], seriesRuleIds = {};
+  var runnable = planRunStartFilterRunnableStructure(profileView);
+  for (var mi = 0; mi < runnable.length; mi++) {
+    var mc = runnable[mi];
+    for (var si = 0; si < mc.sessions.length; si++) {
+      var sess = mc.sessions[si];
+      var seenInSession = {};
+      for (var ai = 0; ai < sess.assignments.length; ai++) {
+        var a = sess.assignments[ai];
+        var rules = a.rules || [];
+        for (var ri = 0; ri < rules.length; ri++) {
+          var rl = rules[ri];
+          if (rl.enabled !== true || typeof rl.progressionSeriesId !== 'string' || !rl.progressionSeriesId) continue;
+          var sid = rl.progressionSeriesId;
+          var kind = rl.adjustmentType === 'addLoad' ? 'workingLoad' : 'trainingMax';
+          var name = (typeof rl.progressionSeriesName === 'string' && rl.progressionSeriesName) ? rl.progressionSeriesName : '';
+          if (!byId[sid]) {
+            byId[sid] = { seriesId: sid, seriesName: name, exerciseId: a.exerciseId, kind: kind, adjustmentType: rl.adjustmentType, members: [] };
+            order.push(sid);
+          }
+          var e = byId[sid];
+          if (e.exerciseId !== a.exerciseId) return { ok: false, reason: 'progressionSeriesExerciseMismatch', seriesName: e.seriesName };
+          if (e.kind !== kind) return { ok: false, reason: 'progressionSeriesValueKindMismatch', seriesName: e.seriesName };
+          if (e.seriesName !== name) return { ok: false, reason: 'progressionSeriesNameMismatch', seriesName: e.seriesName };
+          if (seenInSession[sid]) return { ok: false, reason: 'progressionSeriesTwoMembersInOneSession', seriesName: e.seriesName };
+          seenInSession[sid] = true;
+          e.members.push({ microcycleId: sess.microcycleId, sessionId: sess.sessionId, planAssignmentId: a.assignmentSubjectId, planRuleId: rl.ruleSubjectId, ruleRevisionId: rl.ruleRevisionId });
+          seriesRuleIds[rl.ruleSubjectId] = sid;
+        }
+      }
+    }
+  }
+  for (var k = 0; k < order.length; k++) if (!byId[order[k]].seriesName) return { ok: false, reason: 'progressionSeriesNameMissing', seriesName: '' };
+  return { ok: true, series: order.map(function (id) { return byId[id]; }), seriesRuleIds: seriesRuleIds };
+}
+
+// `seriesValues` (PROGRESSION SERIES FOUNDATION, optional): the confirmed
+// starting value for each series, [{ seriesId, amount, unit,
+// initializationSource }]. Omitted/empty for a Program with no series, which
+// then builds exactly the original package shape.
+function planRunStartBuildPackage(profile, planRunId, operationId, progressionInitialValues, hashDeps, seriesValues) {
   var receipt = profile.verificationReceipt;
   var pv = profile.profileView;
   var runnable = planRunStartFilterRunnableStructure(pv);
@@ -245,11 +293,14 @@ function planRunStartBuildPackage(profile, planRunId, operationId, progressionIn
       var occurrenceId = planRunBuildOccurrenceId(planRunId, sess.microcycleId, sess.sessionId, hashDeps);
       var assignments = sess.assignments.map(function (a) {
         var rules = (a.rules || []).map(function (r) {
-          return {
+          var entry = {
             planRuleId: r.ruleSubjectId, ruleRevisionId: r.ruleRevisionId, adjustmentType: r.adjustmentType,
             evaluationType: r.evaluationType, failBehavior: r.failBehavior, gatewaySetIndex: r.gatewaySetIndex,
             loadIncrease: r.loadIncrease, tmIncrease: r.tmIncrease, enabled: r.enabled
           };
+          // PROGRESSION SERIES FOUNDATION: snapshot the explicit series link.
+          if (r.enabled === true && typeof r.progressionSeriesId === 'string' && r.progressionSeriesId) entry.progressionSeriesId = r.progressionSeriesId;
+          return entry;
         });
         return {
           planAssignmentId: a.assignmentSubjectId, planPrescriptionId: a.prescriptionSubjectId, exerciseId: a.exerciseId,
@@ -264,12 +315,30 @@ function planRunStartBuildPackage(profile, planRunId, operationId, progressionIn
       });
     });
   });
-  return {
+  var pkg = {
     operationId: operationId, ownerUid: receipt.ownerUid, planTemplateId: receipt.templateId, planRunId: planRunId,
     headRevisionId: receipt.headRevisionId, manifestId: receipt.manifestId, graphHash: receipt.graphHash,
     nameSnapshot: (typeof pv.name === 'string' && pv.name) ? pv.name : '(untitled Program)',
     occurrences: occurrences, progressionInitialValues: progressionInitialValues
   };
+  // PROGRESSION SERIES FOUNDATION: one entry per explicit series, with its
+  // single confirmed starting value and its member occurrences.
+  var collected = planRunStartCollectSeries(pv);
+  if (collected.ok && collected.series.length) {
+    var valueById = {};
+    (seriesValues || []).forEach(function (v) { valueById[v.seriesId] = v; });
+    pkg.progressionSeries = collected.series.map(function (e) {
+      var v = valueById[e.seriesId] || { amount: null, unit: null, initializationSource: null };
+      return {
+        seriesId: e.seriesId, seriesName: e.seriesName, exerciseId: e.exerciseId, valueKind: e.kind,
+        members: e.members.map(function (m) {
+          return { occurrenceId: planRunBuildOccurrenceId(planRunId, m.microcycleId, m.sessionId, hashDeps), planAssignmentId: m.planAssignmentId, planRuleId: m.planRuleId, ruleRevisionId: m.ruleRevisionId };
+        }),
+        amount: v.amount, unit: v.unit, initializationSource: v.initializationSource
+      };
+    });
+  }
+  return pkg;
 }
 
 // -----------------------------------------------------------------------------
@@ -522,13 +591,37 @@ function planRunStartOpen(templateId, ctxOverride) {
         planRunStartRender();
         return { outcome: 'ineligible' };
       }
-      var enabledRules = planRunStartEnumerateEnabledRules(profile.profileView).map(function (r) {
+      // PROGRESSION SERIES FOUNDATION: Rules explicitly linked into a series
+      // get ONE starting-value row per series (key 'series:<id>'); every
+      // other Rule keeps its own row exactly as before.
+      var collectedSeries = planRunStartCollectSeries(profile.profileView);
+      var hasSeries = !collectedSeries.ok || collectedSeries.series.length > 0;
+      if (hasSeries && (typeof planProgressionSeriesFeatureEnabled !== 'function' || !planProgressionSeriesFeatureEnabled())) {
+        planRunStartState = { phase: 'ineligible', epoch: epoch, reason: 'progressionSeriesRequiresFeatureBuild' };
+        planRunStartRender();
+        return { outcome: 'ineligible', reason: 'progressionSeriesRequiresFeatureBuild' };
+      }
+      if (!collectedSeries.ok) {
+        planRunStartState = { phase: 'ineligible', epoch: epoch, reason: collectedSeries.reason, seriesName: collectedSeries.seriesName };
+        planRunStartRender();
+        return { outcome: 'ineligible', reason: collectedSeries.reason };
+      }
+      var enabledRules = planRunStartEnumerateEnabledRules(profile.profileView).filter(function (r) {
+        return !Object.prototype.hasOwnProperty.call(collectedSeries.seriesRuleIds, r.planRuleId);
+      }).map(function (r) {
         return Object.assign({}, r, {
           exerciseName: planCanonicalGetExerciseName(r.exerciseId),
           suggestionState: progressionAvailable ? 'loading' : 'unavailable',
           suggestion: null, amount: '', unit: 'lb', confirmed: false, initializationSource: null, deferred: false
         });
-      });
+      }).concat(collectedSeries.series.map(function (e) {
+        return {
+          isSeries: true, planRuleId: 'series:' + e.seriesId, seriesId: e.seriesId, seriesName: e.seriesName,
+          memberCount: e.members.length, exerciseId: e.exerciseId, adjustmentType: e.adjustmentType, kind: e.kind,
+          exerciseName: planCanonicalGetExerciseName(e.exerciseId),
+          suggestionState: 'unavailable', suggestion: null, amount: '', unit: 'lb', confirmed: false, initializationSource: null, deferred: false
+        };
+      }));
       planRunStartState = {
         phase: 'confirmingValues', epoch: epoch, ctx: ctx, templateId: templateId, ownerUid: ctx.ownerUid,
         profile: profile, rules: enabledRules, submitting: false, submitError: null
@@ -561,6 +654,7 @@ function planRunStartFetchSuggestions(epoch, expectedUid) {
   var st = planRunStartState;
   if (!st || st.phase !== 'confirmingValues') return;
   st.rules.forEach(function (rule) {
+    if (rule.isSeries) return; // PROGRESSION SERIES FOUNDATION: no per-Rule suggestion source for a series
     var p;
     try {
       p = st.ctx.readProgressionState(rule.planRuleId);
@@ -679,6 +773,9 @@ function planRunStartHandleLeaveBlankToggle(planRuleId, checked) {
   if (!st || st.phase !== 'confirmingValues' || st.submitting) return;
   var row = st.rules.filter(function (r) { return r.planRuleId === planRuleId; })[0];
   if (!row) return;
+  // PROGRESSION SERIES FOUNDATION: a training-max series has no later
+  // per-series "set it now" path, so it always needs a value at Start.
+  if (checked && row.isSeries && row.kind === 'trainingMax') return;
   if (checked) {
     row.deferred = true;
     row.confirmed = true;
@@ -761,14 +858,19 @@ function planRunStartSubmit() {
   // an invented default. A non-deferred row is unchanged from before this
   // correction. Key order matches PLAN_RUN_PROGRESSION_INITIAL_KEYS
   // (plan-run-model.js) in both branches.
-  var progressionInitialValues = st.rules.map(function (r) {
+  var seriesValues = st.rules.filter(function (r) { return r.isSeries; }).map(function (r) {
+    return r.deferred
+      ? { seriesId: r.seriesId, amount: null, unit: null, initializationSource: 'deferred' }
+      : { seriesId: r.seriesId, amount: Number(r.amount), unit: r.unit, initializationSource: r.initializationSource };
+  });
+  var progressionInitialValues = st.rules.filter(function (r) { return !r.isSeries; }).map(function (r) {
     return r.deferred
       ? { planRuleId: r.planRuleId, planAssignmentId: r.planAssignmentId, ruleRevisionId: r.ruleRevisionId, exerciseId: r.exerciseId, kind: r.kind, amount: null, unit: null, initializationSource: 'deferred' }
       : { planRuleId: r.planRuleId, planAssignmentId: r.planAssignmentId, ruleRevisionId: r.ruleRevisionId, exerciseId: r.exerciseId, kind: r.kind, amount: Number(r.amount), unit: r.unit, initializationSource: r.initializationSource };
   });
   var planRunId = uid();
   var operationId = uid();
-  var pkg = planRunStartBuildPackage(st.profile, planRunId, operationId, progressionInitialValues);
+  var pkg = planRunStartBuildPackage(st.profile, planRunId, operationId, progressionInitialValues, undefined, seriesValues);
   var epoch = st.epoch, expectedUid = st.ownerUid, ctx = st.ctx;
   var pre;
   try {
@@ -1011,6 +1113,12 @@ function planRunStartRenderRuleRow(row, disabled) {
   }
   var needsAction = !(row.deferred || (row.confirmed && row.amount !== '' && isFinite(Number(row.amount))));
   var typeLabel = row.adjustmentType === 'addLoad' ? 'Add Load' : 'Increase Training Max';
+  // PROGRESSION SERIES FOUNDATION: a series row is one starting value shared,
+  // and carried forward, across every linked Session.
+  var seriesLine = row.isSeries
+    ? '<div data-testid="start-series-label" style="font-size:12px;color:var(--text2)">Progression series “' + escapeHtml(row.seriesName) + '” — one starting value, carried forward across ' + row.memberCount + ' linked Session' + (row.memberCount === 1 ? '' : 's') + '</div>'
+    : '';
+  var leaveBlankAllowed = !(row.isSeries && row.kind === 'trainingMax');
   // ROUND 6 CORRECTION -- explanatory copy for the "Leave blank" choice,
   // worded per-kind so the person knows what happens next without needing
   // to understand "workingLoad"/"trainingMax" as terms: a blank working
@@ -1024,16 +1132,28 @@ function planRunStartRenderRuleRow(row, disabled) {
   var ad = amountUnitDisabled ? 'disabled' : '';
   return '<div class="planrun-start-rule-row" data-testid="start-rule-row" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" style="border:1px solid var(--border,#ccc);border-radius:6px;padding:8px;margin:6px 0">'
     + '<div style="font-weight:600">' + escapeHtml(row.exerciseName) + '<span style="font-weight:400;color:var(--text2);font-size:12px"> — ' + escapeHtml(typeLabel) + '</span></div>'
+    + seriesLine
     + suggestionHtml
     + '<label style="display:inline-block;margin-top:4px">Starting Amount<input type="number" step="any" ' + ad + ' data-testid="start-amount-input" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-amount value="' + escapeHtml(row.amount) + '"></label> '
     + '<label>Unit<select ' + ad + ' data-testid="start-unit-select" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-unit>'
     + '<option value="lb" ' + (row.unit === 'lb' ? 'selected' : '') + '>lb</option>'
     + '<option value="kg" ' + (row.unit === 'kg' ? 'selected' : '') + '>kg</option>'
     + '</select></label>'
-    + '<div style="margin-top:4px"><label style="font-size:13px"><input type="checkbox" ' + d + ' data-testid="start-leave-blank-checkbox" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-leave-blank ' + (row.deferred ? 'checked' : '') + '> Leave blank — I’ll set this later</label></div>'
+    + (leaveBlankAllowed ? '<div style="margin-top:4px"><label style="font-size:13px"><input type="checkbox" ' + d + ' data-testid="start-leave-blank-checkbox" data-planrun-start-rule-id="' + escapeHtml(row.planRuleId) + '" data-planrun-start-leave-blank ' + (row.deferred ? 'checked' : '') + '> Leave blank — I’ll set this later</label></div>' : '')
     + (row.deferred ? '<div data-testid="start-deferred-explainer" style="color:var(--text2);font-size:12px;margin-top:2px">' + escapeHtml(deferredExplainer) + '</div>' : '')
     + (needsAction ? '<div data-testid="start-rule-needs-action" style="color:#b00;font-size:12px;margin-top:2px">Needs a confirmed value</div>' : '<div data-testid="start-rule-confirmed" style="color:#080;font-size:12px;margin-top:2px">' + (row.deferred ? 'Will be set later' : 'Confirmed') + '</div>')
     + '</div>';
+}
+
+function planRunStartIneligibleMessage(st) {
+  // PROGRESSION SERIES FOUNDATION messages; the original no-Sessions copy is unchanged.
+  if (st.reason === 'progressionSeriesRequiresFeatureBuild') return 'This Program uses Progression series, which needs the newer version of the app to start. Nothing was changed.';
+  var n = st.seriesName ? '“' + st.seriesName + '”' : 'A Progression series';
+  if (st.reason === 'progressionSeriesExerciseMismatch') return n + ' links different exercises. Fix it in PLAN before starting.';
+  if (st.reason === 'progressionSeriesValueKindMismatch') return n + ' mixes Working Load and Training Max progressions. Fix it in PLAN before starting.';
+  if (st.reason === 'progressionSeriesTwoMembersInOneSession') return n + ' has two members in the same Session. Fix it in PLAN before starting.';
+  if (st.reason === 'progressionSeriesNameMismatch' || st.reason === 'progressionSeriesNameMissing') return n + ' has inconsistent naming. Re-save it in PLAN before starting.';
+  return 'This Program has no Sessions to start yet.';
 }
 
 function planRunStartRender() {
@@ -1062,7 +1182,7 @@ function planRunStartRender() {
     html += '<div data-testid="start-read-timed-out" style="padding:8px;border-radius:6px;background:#ffe;color:#740">This is taking longer than expected. We couldn’t confirm this Program’s details. Nothing was started.</div>';
     html += '<div style="margin-top:8px"><button type="button" class="btn-primary" data-testid="start-retry-read-btn" data-planrun-start-action="retry-read">Retry</button></div>';
   } else if (st.phase === 'ineligible') {
-    html += '<div data-testid="start-ineligible" style="color:var(--text2)">This Program has no Sessions to start yet.</div>';
+    html += '<div data-testid="start-ineligible" style="color:var(--text2)">' + escapeHtml(planRunStartIneligibleMessage(st)) + '</div>';
   } else if (st.phase === 'confirmingValues' || st.phase === 'rejected' || st.phase === 'uncertain' || st.phase === 'alreadyRunning') {
     var disabledRows = st.submitting || st.phase !== 'confirmingValues';
     if (st.rules.length === 0) {
@@ -1112,6 +1232,7 @@ if (typeof module !== 'undefined' && module.exports) {
     planRunStartCountRunnableSessions: planRunStartCountRunnableSessions,
     planRunStartEnumerateEnabledRules: planRunStartEnumerateEnabledRules,
     planRunStartTemplateLevelSuggestionIsValid: planRunStartTemplateLevelSuggestionIsValid,
-    planRunStartBuildPackage: planRunStartBuildPackage
+    planRunStartBuildPackage: planRunStartBuildPackage,
+    planRunStartCollectSeries: planRunStartCollectSeries
   };
 }

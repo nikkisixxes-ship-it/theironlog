@@ -415,9 +415,94 @@ function planRunLoggerLaunch(run, occurrence) {
     showToast('This Program Run is being ended. Wait for that to finish before opening the logger.', 'error');
     return false;
   }
+  // PROGRESSION SERIES FOUNDATION: a Session with no series-linked Rule opens
+  // exactly as before (synchronously, nothing extra read). A Session WITH one
+  // first reads the current, committed series value(s) -- every time it is
+  // opened -- and resolves Working Load / Training Max prescriptions from them.
+  var seriesLinked = planRunLoggerOccurrenceSeriesLinks(occurrence);
+  if (seriesLinked.length === 0) return planRunLoggerOpenOccurrence(run, occurrence, null);
+  if (typeof planProgressionSeriesFeatureEnabled !== 'function' || !planProgressionSeriesFeatureEnabled()) {
+    showToast('This Session uses a Progression series, which needs the newer version of the app. Nothing was changed.', 'error');
+    return false;
+  }
+  if (planRunLoggerSeriesLaunchPending) return false; // one open at a time
+  var ownerAtStart = planRunLoggerCurrentUid();
+  var token = {};
+  planRunLoggerSeriesLaunchPending = token;
+  var readPromise;
+  try {
+    readPromise = Promise.resolve(fsPlanRunPersistence.fsPlanRunReadSeriesForOccurrence({ ownerUid: ownerAtStart, planRunId: occurrence.planRunId, occurrence: occurrence }));
+  } catch (err) {
+    readPromise = Promise.reject(err);
+  }
+  return readPromise.then(function (result) {
+    if (planRunLoggerSeriesLaunchPending !== token) return false;
+    planRunLoggerSeriesLaunchPending = null;
+    // Re-check what the synchronous guards above checked: the world may have
+    // changed while the read was in flight.
+    if (planRunLoggerCurrentUid() !== ownerAtStart || currentWorkout) return false;
+    if (typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId)) return false;
+    if (!result || result.outcome !== 'verified') {
+      showToast('This Session\u2019s Progression series values can\u2019t be confirmed right now, so it wasn\u2019t opened. Nothing was changed.', 'error');
+      return false;
+    }
+    return planRunLoggerOpenOccurrence(run, occurrence, result.valuesByRuleId);
+  }, function () {
+    if (planRunLoggerSeriesLaunchPending !== token) return false;
+    planRunLoggerSeriesLaunchPending = null;
+    showToast('Couldn\u2019t load this Session\u2019s Progression series values. Check your connection and try again.', 'error');
+    return false;
+  });
+}
+
+// PROGRESSION SERIES FOUNDATION -- module state + helpers for series-linked
+// Session launch. Never persisted.
+var planRunLoggerSeriesLaunchPending = null;
+function planRunLoggerOccurrenceSeriesLinks(occurrence) {
+  var out = [];
+  (occurrence.assignments || []).forEach(function (a) {
+    (a.rules || []).forEach(function (rl) {
+      var sid = (typeof planRunRuleEntrySeriesId === 'function') ? planRunRuleEntrySeriesId(rl) : null;
+      if (sid !== null && rl.enabled) out.push({ planAssignmentId: a.planAssignmentId, planRuleId: rl.planRuleId, seriesId: sid });
+    });
+  });
+  return out;
+}
+function planRunLoggerAppWeightUnit() {
+  return (typeof appDb !== 'undefined' && appDb && appDb.unit === 'kg') ? 'kg' : 'lb';
+}
+// The series value (if any) this assignment's prescriptions resolve from.
+// Only a resolved value in the app's current weight unit is used; anything
+// else leaves the prescription exactly as the Session snapshot has it
+// (never converted, never guessed).
+function planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId) {
+  if (!seriesValuesByRuleId) return null;
+  for (var i = 0; i < (a.rules || []).length; i++) {
+    var rl = a.rules[i];
+    if (!rl.enabled || !Object.prototype.hasOwnProperty.call(seriesValuesByRuleId, rl.planRuleId)) continue;
+    var v = seriesValuesByRuleId[rl.planRuleId];
+    return { rule: rl, value: v, usable: v.currentValue.amount !== null && v.currentValue.unit === planRunLoggerAppWeightUnit() };
+  }
+  return null;
+}
+
+function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
+  var seriesResolution = {};
+  var unitMismatch = false;
   var exercises = occurrence.assignments.map(function (a) {
+    var sv = planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId);
+    var activeCtx = null, progressionCtx = null;
+    if (sv) {
+      seriesResolution[a.planAssignmentId] = { planRuleId: sv.rule.planRuleId, seriesId: sv.value.seriesId, seriesName: sv.value.seriesName, valueKind: sv.value.valueKind, amount: sv.value.currentValue.amount, unit: sv.value.currentValue.unit, used: sv.usable };
+      if (sv.value.currentValue.amount !== null && !sv.usable) unitMismatch = true;
+      if (sv.usable) {
+        var holder = {}; holder[a.exerciseId] = { value: sv.value.currentValue.amount };
+        activeCtx = sv.value.valueKind === 'workingLoad' ? { workingLoads: holder } : { trainingMaxes: holder };
+        progressionCtx = { enabled: true, adjustmentType: sv.rule.adjustmentType };
+      }
+    }
     var sets = (a.orderedSets || []).map(function (os) {
-      var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, a.exerciseId, null, null) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
+      var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, a.exerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
       loggerSet.planSetId = os.planSetId;
       loggerSet.isPR = false;
       loggerSet.isNew1RM = false;
@@ -472,6 +557,9 @@ function planRunLoggerLaunch(run, occurrence) {
       prescribedExerciseByAssignmentId: prescribedExerciseByAssignmentId
     }
   };
+  // In-memory only (never part of the persisted workout document): which
+  // series value each assignment was opened with.
+  if (seriesValuesByRuleId) currentWorkout.canonicalRun.seriesResolution = seriesResolution;
   planRunLoggerFinishState = null;
   planRunLoggerFinishCurrentOperationId = null;
   document.getElementById('workout-exercises').innerHTML = '';
@@ -480,6 +568,7 @@ function planRunLoggerLaunch(run, occurrence) {
   renderWorkoutExercises();
   showPage('page-log');
   startWorkoutTimer();
+  if (unitMismatch) showToast('A Progression series value is recorded in a different weight unit than your current setting, so it was not filled in.', 'error');
   return true;
 }
 

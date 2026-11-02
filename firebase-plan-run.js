@@ -412,6 +412,40 @@
           // populated at genuine Start from the SAME `slotId` variable
           // already computed near the top of this function (before the
           // transaction even opened) -- no new computation is introduced.
+          // PROGRESSION SERIES FOUNDATION: one series-state document per
+          // author-defined series in this package, holding the series' single
+          // starting value and its immutable membership snapshot. Series-linked
+          // Rules get no per-Rule state document (planRunValidateStartPackage
+          // already excluded them from progressionInitialValues), so there is
+          // never a second, competing value for the same Rule. createdAt/
+          // updatedAt use the server timestamp so the amended Rules can
+          // require they were created in this very request.
+          var seriesServerTs = deps.serverTimestamp ? deps.serverTimestamp() : now;
+          var occOrderIndex = {};
+          orderedOccIds.forEach(function (id, idx) { occOrderIndex[id] = idx; });
+          var seriesWrites = (Array.isArray(pkg.progressionSeries) ? pkg.progressionSeries : []).map(function (e) {
+            var memberAssignmentIds = {}, memberRuleIds = {}, memberRuleRevisionIds = {};
+            e.members.forEach(function (m) {
+              memberAssignmentIds[m.occurrenceId] = m.planAssignmentId;
+              memberRuleIds[m.occurrenceId] = m.planRuleId;
+              memberRuleRevisionIds[m.occurrenceId] = m.ruleRevisionId;
+            });
+            var memberOccurrenceIds = e.members.map(function (m) { return m.occurrenceId; }).sort(function (x, y) { return occOrderIndex[x] - occOrderIndex[y]; });
+            var build = function (ts) {
+              return {
+                recordType: 'planProgramRunSeriesState', schemaVersion: 1, ownerUid: pkg.ownerUid, planRunId: pkg.planRunId,
+                planTemplateId: pkg.planTemplateId, headRevisionId: pkg.headRevisionId, manifestId: pkg.manifestId,
+                seriesId: e.seriesId, seriesName: e.seriesName, exerciseId: e.exerciseId, valueKind: e.valueKind,
+                memberAssignmentIds: memberAssignmentIds, memberRuleIds: memberRuleIds, memberRuleRevisionIds: memberRuleRevisionIds,
+                memberOccurrenceIds: memberOccurrenceIds,
+                currentValue: { kind: e.valueKind, amount: e.amount, unit: e.unit }, isCurrentValueUnresolved: e.amount === null,
+                initializationSource: e.initializationSource, status: 'active', needsManualReviewReason: null,
+                appliedOccurrenceIds: [], lastProcessedOccurrenceId: null, lastProcessedWorkoutId: null, lastOperationId: null,
+                lastEvaluatedAt: null, createdAt: ts, updatedAt: ts
+              };
+            };
+            return { path: colPath(pkg.ownerUid, 'seriesState', M('planRunBuildSeriesStateId')(pkg.planRunId, e.seriesId)), data: build(seriesServerTs), byteData: build(now) };
+          });
           var runData = {
             recordType: 'planProgramRun', schemaVersion: 1, ownerUid: pkg.ownerUid, planRunId: pkg.planRunId,
             planTemplateId: pkg.planTemplateId, headRevisionId: pkg.headRevisionId, manifestId: pkg.manifestId, graphHash: pkg.graphHash,
@@ -430,7 +464,7 @@
           // request-time preflight above already bounds this for any
           // well-formed request; this recheck is what makes the cap
           // impossible to bypass through a code path that skips preflight.
-          var actualWriteCount = 1 /* run */ + occWrites.length + stateWrites.length + 1 /* slot */ + 1 /* receipt */;
+          var actualWriteCount = 1 /* run */ + occWrites.length + stateWrites.length + seriesWrites.length + 1 /* slot */ + 1 /* receipt */;
           if (actualWriteCount > M('PLAN_RUN_SAFETY_CAPS').maxStartTransactionWrites) {
             return { outcome: 'budgetExceeded', reasons: ['tooManyWrites'] };
           }
@@ -451,6 +485,7 @@
           var stagedByteWrites = [{ path: runPath, kind: 'run', data: runData }]
             .concat(occWrites.map(function (w) { return { path: w.path, kind: 'occurrence', data: w.data }; }))
             .concat(stateWrites.map(function (w) { return { path: w.path, kind: 'progressionState', data: w.data }; }))
+            .concat(seriesWrites.map(function (w) { return { path: w.path, kind: 'seriesState', data: w.byteData }; }))
             .concat([{ path: slotPath, kind: 'activeSlot', data: finalSlotData }, { path: receiptPath, kind: 'operation', data: receiptData }]);
           var byteBudget = M('planRunCheckStagedTransactionBytes')(stagedByteWrites);
           if (!byteBudget.ok) return { outcome: 'budgetExceeded', reasons: byteBudget.reasons };
@@ -458,6 +493,7 @@
           tx.set(runPath, runData);
           occWrites.forEach(function (w) { tx.set(w.path, w.data); });
           stateWrites.forEach(function (w) { tx.set(w.path, w.data); });
+          seriesWrites.forEach(function (w) { tx.set(w.path, w.data); });
           if (slotExists) tx.update(slotPath, { activePlanRunId: pkg.planRunId, updatedAt: now });
           else tx.set(slotPath, { ownerUid: pkg.ownerUid, planTemplateId: pkg.planTemplateId, activeSlotId: slotId, activePlanRunId: pkg.planRunId, updatedAt: now });
           tx.set(receiptPath, receiptData);
@@ -779,10 +815,30 @@
       var budgetCheck = M('planRunCheckFinishBudget')(expectedIds.length, workoutBytesForBudget);
       if (!budgetCheck.ok) return { terminal: { outcome: 'budgetExceeded', reasons: budgetCheck.reasons } };
 
+      // PROGRESSION SERIES FOUNDATION: a Rule whose Session entry carries a
+      // series link is backed by that series' single Run-scoped state
+      // document (planProgramRunSeriesState) instead of a per-Rule state. A
+      // series has at most one member per Session, so this is still exactly
+      // one state read per enabled Rule. The compatibility build never runs
+      // carry-forward under different semantics: it refuses, writing nothing.
+      var seriesIdByRuleId = {}, seriesPathByRuleId = {};
+      for (var si0 = 0; si0 < enabledRules.length; si0++) {
+        var sidLinked = M('planRunRuleEntrySeriesId')(enabledRules[si0].ruleEntry);
+        if (sidLinked === null) continue;
+        if (!M('planProgressionSeriesFeatureEnabled')()) {
+          return { terminal: { outcome: 'invalidInput', reason: 'progressionSeriesRequiresFeatureBuild' } };
+        }
+        seriesIdByRuleId[enabledRules[si0].ruleEntry.planRuleId] = sidLinked;
+        seriesPathByRuleId[enabledRules[si0].ruleEntry.planRuleId] = colPath(pkg.ownerUid, 'seriesState', M('planRunBuildSeriesStateId')(pkg.planRunId, sidLinked));
+      }
+
       var stateRaw = {}, requestedRecRaw = {};
       for (var i = 0; i < expectedIds.length; i++) {
         var rid = expectedIds[i];
-        var sSnap = await tx.get(colPath(pkg.ownerUid, 'progressionState', M('planRunBuildRuleStateId')(pkg.planRunId, rid)));
+        var statePathForRead = Object.prototype.hasOwnProperty.call(seriesPathByRuleId, rid)
+          ? seriesPathByRuleId[rid]
+          : colPath(pkg.ownerUid, 'progressionState', M('planRunBuildRuleStateId')(pkg.planRunId, rid));
+        var sSnap = await tx.get(statePathForRead);
         var rSnap = await tx.get(colPath(pkg.ownerUid, 'applications', M('planRunBuildApplicationId')(pkg.planRunId, rid, pkg.workoutId)));
         stateRaw[rid] = sSnap; requestedRecRaw[rid] = rSnap;
       }
@@ -856,11 +912,17 @@
       // sufficient evidence on its own.
       var perRuleStillUnresolved = {};
       expectedIds.forEach(function (rid) {
-        stateFlags[rid] = classifyDocFlags(stateRaw[rid], M('planRunProgressionStateDocValidAnyVersion'), M('planRunStateIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid]);
+        if (Object.prototype.hasOwnProperty.call(seriesIdByRuleId, rid)) {
+          stateFlags[rid] = classifyDocFlags(stateRaw[rid], M('planRunSeriesStateDocValid'), M('planRunSeriesStateIdentityOk'), [pkg.ownerUid, pkg.planRunId, seriesIdByRuleId[rid]]);
+        } else {
+          stateFlags[rid] = classifyDocFlags(stateRaw[rid], M('planRunProgressionStateDocValidAnyVersion'), M('planRunStateIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid]);
+        }
         requestedFlags[rid] = classifyDocFlags(requestedRecRaw[rid], M('planRunApplicationDocValid'), M('planRunApplicationIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid, pkg.workoutId]);
         if (winningRecRaw) winningFlags[rid] = classifyDocFlags(winningRecRaw[rid], M('planRunApplicationDocValid'), M('planRunApplicationIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid, winningWorkoutId]);
         var sd = stateRaw[rid] && stateRaw[rid].exists ? stateRaw[rid].data : null;
-        perRuleStillUnresolved[rid] = !!(sd && sd.schemaVersion === 2 && sd.currentValue && sd.currentValue.amount === null);
+        perRuleStillUnresolved[rid] = Object.prototype.hasOwnProperty.call(seriesIdByRuleId, rid)
+          ? !!(sd && sd.currentValue && sd.currentValue.amount === null)
+          : !!(sd && sd.schemaVersion === 2 && sd.currentValue && sd.currentValue.amount === null);
       });
       var boundaryOk = M('planRunFinishStructuralBoundaryOk')({
         expectedRuleIds: expectedIds, stateDocs: stateFlags, requestedRecordDocs: requestedFlags,
@@ -951,7 +1013,8 @@
       return {
         decision: decision, runDoc: runDoc, occurrenceDoc: occurrenceDoc, enabledRules: enabledRules, expectedIds: expectedIds,
         stateRaw: stateRaw, requestedRecRaw: requestedRecRaw, runPath: runPath, occPath: occPath, receiptPath: receiptPath,
-        slotSnap: slotSnap, slotPath: slotPath, wouldBeLast: wouldBeLast
+        slotSnap: slotSnap, slotPath: slotPath, wouldBeLast: wouldBeLast,
+        seriesIdByRuleId: seriesIdByRuleId, seriesPathByRuleId: seriesPathByRuleId
       };
     }
 
@@ -1009,10 +1072,80 @@
           // Step 11 -- pure computation only; nothing is written to `tx` yet.
           var now = deps.timestamp();
           var appliedIds = [], reviewedIds = [], establishedIds = [], stillUnresolvedIds = [], notAttemptedIds = [], stagedStateWrites = [], stagedRecordWrites = [];
+          // PROGRESSION SERIES FOUNDATION: series updates staged by this Finish.
+          var stagedSeriesWrites = [];
+          var seriesServerTs = deps.serverTimestamp ? deps.serverTimestamp() : now;
           for (var k = 0; k < r.enabledRules.length; k++) {
             var ruleEntry = r.enabledRules[k].ruleEntry, assignment = r.enabledRules[k].assignment;
             var rid = ruleEntry.planRuleId;
             var stateData = r.stateRaw[rid].data;
+            if (Object.prototype.hasOwnProperty.call(r.seriesIdByRuleId, rid)) {
+              // ---- Series-linked Rule. Same evaluator, same five outcome
+              // buckets, same per-Rule application record as a per-Rule state;
+              // only the value stream it reads and updates is the series'.
+              var sDoc = stateData;
+              if (sDoc.appliedOccurrenceIds.indexOf(pkg.occurrenceId) !== -1) {
+                // The series already recorded this Session while the Session
+                // itself is still unfinished -- never apply twice.
+                return { outcome: 'integrityConflict', reason: 'seriesAlreadyAppliedForOccurrence' };
+              }
+              var sReview = null;
+              if (!M('planRunSeriesMemberMatches')(sDoc, occurrenceDoc, assignment, ruleEntry)) {
+                sReview = 'assignmentIdentityMismatch';
+              } else if (sDoc.memberRuleRevisionIds[occurrenceDoc.occurrenceId] !== ruleEntry.ruleRevisionId) {
+                sReview = 'ruleChangedSinceState';
+              } else if (sDoc.valueKind !== M('planRunValueKindForAdjustment')(ruleEntry.adjustmentType) || sDoc.currentValue.kind !== sDoc.valueKind) {
+                sReview = 'adjustmentTypeChanged';
+              }
+              var sUnresolved = !sReview && sDoc.currentValue.amount === null;
+              var sDecision = null, sEstAmount = null, sEstUnit = null;
+              if (!sReview && !sUnresolved) {
+                var sTriple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, occurrenceDoc, pkg.workout, pkg.workoutId);
+                var sValidation = M('planValidateProgressionEvaluationInput')(sTriple.rule, sTriple.evidence, sTriple.basis);
+                if (!sValidation.ok) { sReview = 'notEvaluable'; }
+                else {
+                  var sEval = M('planEvaluateCanonicalProgression')(sTriple.rule, sDoc.currentValue, sTriple.evidence, sTriple.basis);
+                  if (sEval.decision === 'notEvaluable') sReview = 'notEvaluable'; else sDecision = sEval;
+                }
+              } else if (!sReview && sUnresolved && sDoc.valueKind === 'workingLoad') {
+                var sSel = M('planRunSelectQualifyingWorkingLoadWeight')(pkg.workout, assignment);
+                if (sSel.qualifies) {
+                  sEstAmount = sSel.amount;
+                  sEstUnit = deps.resolveDefaultWeightUnit ? deps.resolveDefaultWeightUnit() : 'lb';
+                }
+              }
+              var sRecPath = colPath(pkg.ownerUid, 'applications', M('planRunBuildApplicationId')(pkg.planRunId, rid, pkg.workoutId));
+              // Bookkeeping every member Finish records, binding this update
+              // to this exact occurrence, workout and operation (receipt).
+              var sPatch = {
+                appliedOccurrenceIds: sDoc.appliedOccurrenceIds.concat([pkg.occurrenceId]),
+                lastProcessedOccurrenceId: pkg.occurrenceId, lastProcessedWorkoutId: pkg.workoutId,
+                lastOperationId: pkg.operationId, lastEvaluatedAt: now
+              };
+              if (sReview) {
+                sPatch.status = 'needsManualReview'; sPatch.needsManualReviewReason = sReview;
+                stagedRecordWrites.push({ path: sRecPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'reviewed', decision: null, reviewReason: sReview, recordedAt: now } });
+                reviewedIds.push(rid);
+              } else if (!sUnresolved && sDecision.decision === 'notAttempted') {
+                // Neutral: value AND review status unchanged.
+                stagedRecordWrites.push({ path: sRecPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'notAttempted', decision: null, reviewReason: null, recordedAt: now } });
+                notAttemptedIds.push(rid);
+              } else if (!sUnresolved) {
+                sPatch.currentValue = sDecision.nextValue; sPatch.status = 'active'; sPatch.needsManualReviewReason = null;
+                stagedRecordWrites.push({ path: sRecPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'applied', decision: sDecision.decision, reviewReason: null, recordedAt: now } });
+                appliedIds.push(rid);
+              } else if (sEstAmount !== null) {
+                sPatch.currentValue = { kind: 'workingLoad', amount: sEstAmount, unit: sEstUnit };
+                sPatch.isCurrentValueUnresolved = false; sPatch.initializationSource = 'establishedFromLoggedPerformance';
+                sPatch.status = 'active'; sPatch.needsManualReviewReason = null;
+                stagedRecordWrites.push({ path: sRecPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'established', decision: null, reviewReason: null, recordedAt: now } });
+                establishedIds.push(rid);
+              } else {
+                stillUnresolvedIds.push(rid);
+              }
+              stagedSeriesWrites.push({ path: r.seriesPathByRuleId[rid], ruleId: rid, patch: sPatch });
+              continue;
+            }
             var reviewReason = null;
             if (stateData.planAssignmentId !== assignment.planAssignmentId || stateData.planTemplateId !== occurrenceDoc.planTemplateId || stateData.exerciseId !== assignment.exerciseId) {
               reviewReason = 'assignmentIdentityMismatch';
@@ -1163,7 +1296,7 @@
           // ROUND 2 CORRECTION (section 1): a final, freshly-computed write
           // recheck, derived from the ACTUAL staged-write arrays (never a
           // caller-supplied count), immediately before any write is issued.
-          var actualWriteCount = 2 /* workout set + occurrence update */ + stagedStateWrites.length + stagedRecordWrites.length + 1 /* run update */ + (runBecomesComplete ? 1 : 0) /* slot release */ + 1 /* receipt */;
+          var actualWriteCount = 2 /* workout set + occurrence update */ + stagedStateWrites.length + stagedSeriesWrites.length + stagedRecordWrites.length + 1 /* run update */ + (runBecomesComplete ? 1 : 0) /* slot release */ + 1 /* receipt */;
           if (actualWriteCount > M('PLAN_RUN_SAFETY_CAPS').maxFinishTransactionWrites) {
             return { outcome: 'budgetExceeded', reasons: ['tooManyWrites'] };
           }
@@ -1180,6 +1313,12 @@
           // alongside this).
           var resultRefs = { workoutId: pkg.workoutId, occurrenceId: pkg.occurrenceId, planRunId: pkg.planRunId, appliedRuleIds: appliedIds, needsManualReviewRuleIds: reviewedIds, establishedRuleIds: establishedIds, stillUnresolvedRuleIds: stillUnresolvedIds, notAttemptedRuleIds: notAttemptedIds };
           var receiptData2 = { ownerUid: pkg.ownerUid, operationId: pkg.operationId, operationType: 'runFinish', preparedPackageHash: packageHash(pkg), outcome: 'committed', resultRefs: resultRefs, createdAt: now };
+          // PROGRESSION SERIES FOUNDATION: when this Finish updates any series,
+          // the receipt and each series update carry the SERVER timestamp, so
+          // the amended Rules can require (receipt.createdAt == request.time ==
+          // series.updatedAt) that they were written by this one request. A
+          // Finish with no series member is byte-for-byte unchanged.
+          var receiptWriteData = stagedSeriesWrites.length ? Object.assign({}, receiptData2, { createdAt: seriesServerTs }) : receiptData2;
 
           // ROUND 3 CORRECTION (finding 3): the real, non-bypassable
           // final-document-size + aggregate-transaction-byte check. Each
@@ -1207,6 +1346,8 @@
             // prior round but is no longer true here). Each push above now
             // carries its own `ruleId`, read directly here instead.
             return { path: w.path, kind: 'progressionState', data: Object.assign({}, r.stateRaw[w.ruleId].data, w.data) };
+          })).concat(stagedSeriesWrites.map(function (w) {
+            return { path: w.path, kind: 'seriesState', data: Object.assign({}, r.stateRaw[w.ruleId].data, w.patch, { updatedAt: now }) };
           })).concat(stagedRecordWrites.map(function (w) {
             return { path: w.path, kind: 'application', data: w.data };
           })).concat([{ path: r.runPath, kind: 'run', data: finalRunData }]);
@@ -1220,10 +1361,11 @@
           tx.set(workoutPath(pkg.ownerUid, pkg.workoutId), pkg.workout);
           tx.update(r.occPath, { status: 'completed', workoutId: pkg.workoutId, completedAt: now, updatedAt: now });
           stagedStateWrites.forEach(function (w) { tx.update(w.path, w.data); });
+          stagedSeriesWrites.forEach(function (w) { tx.update(w.path, Object.assign({}, w.patch, { updatedAt: seriesServerTs })); });
           stagedRecordWrites.forEach(function (w) { tx.set(w.path, w.data); });
           tx.update(r.runPath, runUpdate);
           if (runBecomesComplete) tx.update(r.slotPath, { activePlanRunId: null, updatedAt: now });
-          tx.set(r.receiptPath, receiptData2);
+          tx.set(r.receiptPath, receiptWriteData);
           return { outcome: 'committed', resultRefs: resultRefs };
         });
       } catch (err) { throw classifyRunTransactionFailure(err); }
@@ -2008,6 +2150,64 @@
     // reachable path except an input-validation failure (0 reads); never
     // writes. Gated by disabledGate() first.
     // =========================================================================
+    // =========================================================================
+    // PROGRESSION SERIES FOUNDATION -- read the CURRENT series values a
+    // Session's series-linked Rules resolve from. Read-only (zero writes).
+    // Called every time a Session is opened in the logger, so it always sees
+    // the latest successfully committed series value. `occurrence` is the
+    // already-verified occurrence document (fsPlanRunReadForDisplay); every
+    // series it links to is read fresh and must be a structurally valid,
+    // identity-correct series state that names THIS Session's own
+    // assignment/rule as its member -- otherwise the Session is refused
+    // honestly (never guessed from earlier workouts).
+    //   { outcome: 'verified', valuesByRuleId: { planRuleId: { seriesId,
+    //       seriesName, valueKind, currentValue, status, needsManualReviewReason } } }
+    //   { outcome: 'noSeries' }  -- this Session has no series-linked Rule
+    //   { outcome: 'seriesStateMissing' | 'seriesStateMalformed' |
+    //       'seriesMembershipMismatch' | 'invalidInput', reason? }
+    // =========================================================================
+    async function fsPlanRunReadSeriesForOccurrence(pkg) {
+      disabledGate();
+      if (!M('planRunIsPlainObject')(pkg)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      var ownerUid = pkg.ownerUid, planRunId = pkg.planRunId, occ = pkg.occurrence;
+      if (!M('planRunIsId')(ownerUid) || !M('planRunIsId')(planRunId)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      if (ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      if (!M('planRunOccurrenceDocValid')(occ) || !M('planRunOccurrenceIdentityOk')(occ, ownerUid, planRunId, occ.occurrenceId)) {
+        return { outcome: 'invalidInput', reason: 'occurrenceMalformed' };
+      }
+      var linked = [];
+      occ.assignments.forEach(function (a) {
+        a.rules.forEach(function (rl) {
+          var sid = M('planRunRuleEntrySeriesId')(rl);
+          if (sid !== null && rl.enabled) linked.push({ assignment: a, rule: rl, seriesId: sid });
+        });
+      });
+      if (!linked.length) return { outcome: 'noSeries' };
+      if (!M('planProgressionSeriesFeatureEnabled')()) return { outcome: 'invalidInput', reason: 'progressionSeriesRequiresFeatureBuild' };
+      var valuesByRuleId = {};
+      for (var i = 0; i < linked.length; i++) {
+        var L = linked[i];
+        var raw;
+        try {
+          raw = await deps.getDoc(colPath(ownerUid, 'seriesState', M('planRunBuildSeriesStateId')(planRunId, L.seriesId)));
+        } catch (err) { throw classifyRunTransactionFailure(err); }
+        if (!raw.exists) return { outcome: 'seriesStateMissing', reason: L.seriesId };
+        if (!M('planRunSeriesStateDocValid')(raw.data) || !M('planRunSeriesStateIdentityOk')(raw.data, ownerUid, planRunId, L.seriesId)) {
+          return { outcome: 'seriesStateMalformed', reason: L.seriesId };
+        }
+        if (!M('planRunSeriesMemberMatches')(raw.data, occ, L.assignment, L.rule) ||
+            raw.data.valueKind !== M('planRunValueKindForAdjustment')(L.rule.adjustmentType)) {
+          return { outcome: 'seriesMembershipMismatch', reason: L.seriesId };
+        }
+        valuesByRuleId[L.rule.planRuleId] = {
+          seriesId: raw.data.seriesId, seriesName: raw.data.seriesName, valueKind: raw.data.valueKind,
+          currentValue: { kind: raw.data.currentValue.kind, amount: raw.data.currentValue.amount, unit: raw.data.currentValue.unit },
+          status: raw.data.status, needsManualReviewReason: raw.data.needsManualReviewReason
+        };
+      }
+      return { outcome: 'verified', valuesByRuleId: valuesByRuleId };
+    }
+
     async function fsPlanRunReadForDisplay(pkg) {
       disabledGate();
       // Step 1: validate input shape, mode, and ownerUid -- zero I/O on any
@@ -2181,6 +2381,7 @@
       fsPlanRunEstablishTrainingMax: fsPlanRunEstablishTrainingMax,
       fsPlanRunCheckTrainingMaxEstablishStatus: fsPlanRunCheckTrainingMaxEstablishStatus,
       fsPlanRunListUnresolvedTrainingMaxStates: fsPlanRunListUnresolvedTrainingMaxStates,
+      fsPlanRunReadSeriesForOccurrence: fsPlanRunReadSeriesForOccurrence,
       CanonicalPlanRunWriterDisabledError: CanonicalPlanRunWriterDisabledError,
       CanonicalPlanRunAuthorizationError: CanonicalPlanRunAuthorizationError,
       CanonicalPlanRunUnavailableError: CanonicalPlanRunUnavailableError,
@@ -2199,6 +2400,10 @@
     return {
       currentUid: function () { return (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null; },
       timestamp: function () { return root.firebase.firestore.Timestamp.now(); },
+      // PROGRESSION SERIES FOUNDATION: used only for series-state writes and
+      // the receipt of a Finish that updates a series (see fsPlanRunStart/
+      // fsPlanRunFinish), so the amended Rules can bind them to one request.
+      serverTimestamp: function () { return root.firebase.firestore.FieldValue.serverTimestamp(); },
       transaction: function (fn) {
         return db.runTransaction(function (t) {
           return fn({

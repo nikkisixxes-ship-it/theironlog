@@ -51,7 +51,11 @@ var PLAN_RUN_COLLECTIONS = Object.freeze({
   // document per Run, deterministically addressed by planRunId, deleted the
   // instant its End attempt resolves (committed or cancelled) -- see
   // firebase-plan-run.js's Begin/Cancel/Complete-End changes.
-  endCoordination: 'planProgramRunEndCoordination'
+  endCoordination: 'planProgramRunEndCoordination',
+  // PROGRESSION SERIES FOUNDATION -- one Run-scoped, carry-forward value
+  // stream per author-defined Progression series (see "PROGRESSION SERIES
+  // FOUNDATION" sections below).
+  seriesState: 'planProgramRunSeriesState'
 });
 
 // ---- Shared small vocabularies, mirrored byte-for-byte from the accepted
@@ -72,6 +76,65 @@ var PLAN_RUN_OPERATION_TYPES = Object.freeze(['runStart', 'runFinish', 'runEnd',
 // maintainability improvement, out of scope here, matching every prior
 // specification round's own explicit decision not to attempt it.
 var PLAN_RUN_VALUE_INITIALIZATION_SOURCES = Object.freeze(['manual', 'confirmedFromSuggestion', 'deferred', 'establishedFromLoggedPerformance']);
+
+// =============================================================================
+// PROGRESSION SERIES FOUNDATION -- build switch.
+//
+// The compatibility build and the feature build are the SAME source files
+// except for this one value:
+//   - compatibility build: false. Every new optional field/record the feature
+//     build writes (PLAN rule `progressionSeriesId`/`progressionSeriesName`,
+//     Session rule-entry `progressionSeriesId`, the Start package's
+//     `progressionSeries`, and `planProgramRunSeriesState` documents) is READ
+//     and validated, but no code path creates, exposes, or writes one, and a
+//     series-linked Program/Run/Session is refused honestly rather than run
+//     under different (non-carry-forward) semantics.
+//   - feature build: true. Series authoring, Start snapshotting,
+//     carry-forward at Finish, and series-value resolution at Session launch.
+// Read at call time (never captured at load), so app-plan.js,
+// app-plan-run-start-ui.js, app-plan-run-logger-ui.js and
+// firebase-plan-run.js all see the same value.
+// =============================================================================
+var PLAN_PROGRESSION_SERIES_FEATURE_ENABLED = false;
+function planProgressionSeriesFeatureEnabled() {
+  return (typeof PLAN_PROGRESSION_SERIES_FEATURE_ENABLED !== 'undefined') && PLAN_PROGRESSION_SERIES_FEATURE_ENABLED === true;
+}
+
+// One `planProgramRunSeriesState` document per (Run, series). Membership is
+// stored as three FLAT maps keyed by occurrenceId -- `memberAssignmentIds`,
+// `memberRuleIds`, `memberRuleRevisionIds` (each occurrenceId -> one id
+// string) -- rather than one map of nested member records. CORRECTION
+// (independent review finding 1): Firestore Rules cannot loop, so they cannot
+// check the shape of every nested record; with flat string maps they can
+// check every key and value in a fixed number of steps (see the Rules'
+// planRunSeriesMembersValid). The information is identical. A series has at
+// most one member per Session and, like every identity field, its
+// membership is immutable after Start. `memberOccurrenceIds`
+// is the same membership in Run order. `appliedOccurrenceIds` grows by
+// exactly one occurrence per successful Finish of a member Session -- never
+// twice for the same Session.
+var PLAN_RUN_SERIES_STATE_KEYS = Object.freeze([
+  'recordType', 'schemaVersion', 'ownerUid', 'planRunId', 'planTemplateId', 'headRevisionId', 'manifestId',
+  'seriesId', 'seriesName', 'exerciseId', 'valueKind', 'memberAssignmentIds', 'memberRuleIds', 'memberRuleRevisionIds', 'memberOccurrenceIds',
+  'currentValue', 'isCurrentValueUnresolved', 'initializationSource', 'status', 'needsManualReviewReason',
+  'appliedOccurrenceIds', 'lastProcessedOccurrenceId', 'lastProcessedWorkoutId', 'lastOperationId',
+  'lastEvaluatedAt', 'createdAt', 'updatedAt'
+]);
+var PLAN_RUN_SERIES_MEMBER_MAP_KEYS = Object.freeze(['memberAssignmentIds', 'memberRuleIds', 'memberRuleRevisionIds']);
+var PLAN_RUN_SERIES_START_ENTRY_KEYS = Object.freeze(['seriesId', 'seriesName', 'exerciseId', 'valueKind', 'members', 'amount', 'unit', 'initializationSource']);
+var PLAN_RUN_SERIES_START_MEMBER_KEYS = Object.freeze(['occurrenceId', 'planAssignmentId', 'planRuleId', 'ruleRevisionId']);
+var PLAN_RUN_SERIES_NAME_MAX_LENGTH = 120;
+// GENUINE PLATFORM LIMIT, not a product choice: Firestore Security Rules
+// allow at most 20 get()/exists()/getAfter() calls per transaction. The
+// amended Rules check each series-state update against the Finish receipt
+// created in the same request with exactly one getAfter() call, and no other
+// Finish write uses any. One Finish can therefore update at most 20 series --
+// i.e. one Session may contain at most 20 series-linked Progression rules.
+// Series per Run, and Sessions per series, are not limited by this. Measured
+// on the Firestore Emulator (correction round): full Finish requests with
+// every N from 1 to 20 series members were accepted, so no lower cap is
+// needed.
+var PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE = 20;
 
 // ---- Field-key lists (exact-key validation -- spec Part 5, field-by-field).
 // ROUND 5 CORRECTION (amendment Rounds 2+3, "activeSlotId" field addition) --
@@ -330,6 +393,14 @@ function planRunBuildRuleStateId(planRunId, planRuleId, hashDeps) {
   if (!deps || !planRunIsId(planRunId) || !planRunIsId(planRuleId)) return null;
   return deps.sha256Hex(deps.buildCanonicalEncoding({ planRunId: planRunId, planRuleId: planRuleId }));
 }
+// PROGRESSION SERIES FOUNDATION: deterministic series-state id. The encoded
+// key name (`progressionSeriesId`) differs from every other id builder's, so
+// it can never collide with a per-Rule state id.
+function planRunBuildSeriesStateId(planRunId, seriesId, hashDeps) {
+  var deps = planRunResolveHashDeps(hashDeps);
+  if (!deps || !planRunIsId(planRunId) || !planRunIsId(seriesId)) return null;
+  return deps.sha256Hex(deps.buildCanonicalEncoding({ planRunId: planRunId, progressionSeriesId: seriesId }));
+}
 function planRunBuildApplicationId(planRunId, planRuleId, workoutId, hashDeps) {
   var deps = planRunResolveHashDeps(hashDeps);
   if (!deps || !planRunIsId(planRunId) || !planRunIsId(planRuleId) || !planRunIsId(workoutId)) return null;
@@ -380,8 +451,20 @@ function planRunPrescribedValid(v) {
   return true;
 }
 
+// PROGRESSION SERIES FOUNDATION: a Session rule entry may additionally carry
+// one optional `progressionSeriesId`, snapshotted from PLAN at Start. Absent on
+// every pre-existing Session (unchanged shape, unchanged validation).
+var PLAN_RUN_RULE_ENTRY_KEYS_WITH_SERIES = Object.freeze(PLAN_RUN_RULE_ENTRY_KEYS.concat(['progressionSeriesId']));
+function planRunRuleEntrySeriesId(v) {
+  return (planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId')) ? v.progressionSeriesId : null;
+}
 function planRunRuleEntryValid(v) {
-  if (!planRunExactKeys(v, PLAN_RUN_RULE_ENTRY_KEYS)) return false;
+  if (planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId')) {
+    if (!planRunExactKeys(v, PLAN_RUN_RULE_ENTRY_KEYS_WITH_SERIES)) return false;
+    if (!planRunIsId(v.progressionSeriesId)) return false;
+    // PLAN only ever emits a series link on an enabled Rule.
+    if (v.enabled !== true) return false;
+  } else if (!planRunExactKeys(v, PLAN_RUN_RULE_ENTRY_KEYS)) return false;
   if (!planRunIsId(v.planRuleId) || !planRunIsId(v.ruleRevisionId)) return false;
   if (!['addLoad', 'increaseTM'].includes(v.adjustmentType)) return false;
   if (!['strict', 'volume', 'gateway'].includes(v.evaluationType)) return false;
@@ -558,6 +641,81 @@ function planRunProgressionStateDocValidV2(v) {
 // in principle, it is the ordinary real case).
 function planRunProgressionStateDocValidAnyVersion(v) {
   return planRunProgressionStateDocValid(v) || planRunProgressionStateDocValidV2(v);
+}
+
+// =============================================================================
+// PROGRESSION SERIES FOUNDATION -- series-state document validator (shape and
+// internal consistency only; see planRunSeriesStateIdentityOk for path/
+// identity, and planRunSeriesMemberMatches for Session binding).
+// =============================================================================
+function planRunValueKindForAdjustment(adjustmentType) {
+  return adjustmentType === 'addLoad' ? 'workingLoad' : (adjustmentType === 'increaseTM' ? 'trainingMax' : null);
+}
+function planRunSeriesStateDocValid(v) {
+  if (!planRunExactKeys(v, PLAN_RUN_SERIES_STATE_KEYS)) return false;
+  if (v.recordType !== 'planProgramRunSeriesState' || v.schemaVersion !== 1) return false;
+  var ids = ['ownerUid', 'planRunId', 'planTemplateId', 'headRevisionId', 'manifestId', 'seriesId', 'exerciseId'];
+  for (var i = 0; i < ids.length; i++) if (!planRunIsId(v[ids[i]])) return false;
+  if (typeof v.seriesName !== 'string' || v.seriesName.length === 0 || v.seriesName.length > PLAN_RUN_SERIES_NAME_MAX_LENGTH) return false;
+  if (!PLAN_RUN_VALUE_KINDS.includes(v.valueKind)) return false;
+  // Membership: memberOccurrenceIds (Run order, no duplicates, valid ids) and
+  // three flat maps whose key sets each equal exactly that list and whose
+  // values are valid ids, with no Rule id used twice. Same guarantees as the
+  // Rules' planRunSeriesMembersValid.
+  if (!Array.isArray(v.memberOccurrenceIds)) return false;
+  var occCount = v.memberOccurrenceIds.length;
+  if (occCount === 0 || occCount > PLAN_RUN_SAFETY_CAPS.maxOccurrencesPerRun) return false;
+  if (!v.memberOccurrenceIds.every(planRunIsId) || planRunArrayHasDuplicates(v.memberOccurrenceIds)) return false;
+  for (var mk = 0; mk < PLAN_RUN_SERIES_MEMBER_MAP_KEYS.length; mk++) {
+    var mm = v[PLAN_RUN_SERIES_MEMBER_MAP_KEYS[mk]];
+    if (!planRunIsPlainObject(mm) || Object.keys(mm).length !== occCount) return false;
+    for (var oi = 0; oi < occCount; oi++) {
+      var oid = v.memberOccurrenceIds[oi];
+      if (!Object.prototype.hasOwnProperty.call(mm, oid) || !planRunIsId(mm[oid])) return false;
+    }
+  }
+  var memberRuleIdList = v.memberOccurrenceIds.map(function (o) { return v.memberRuleIds[o]; });
+  if (planRunArrayHasDuplicates(memberRuleIdList)) return false;
+  if (!planRunCurrentValueValid(v.currentValue) || v.currentValue.kind !== v.valueKind) return false;
+  if (typeof v.isCurrentValueUnresolved !== 'boolean' || v.isCurrentValueUnresolved !== (v.currentValue.amount === null)) return false;
+  if (!PLAN_RUN_VALUE_INITIALIZATION_SOURCES.includes(v.initializationSource)) return false;
+  if (v.isCurrentValueUnresolved && v.initializationSource !== 'deferred') return false;
+  if (v.initializationSource === 'deferred' && !v.isCurrentValueUnresolved) return false;
+  if ((v.initializationSource === 'deferred' || v.initializationSource === 'establishedFromLoggedPerformance') && v.valueKind !== 'workingLoad') return false;
+  if (!['active', 'needsManualReview'].includes(v.status)) return false;
+  if (v.status === 'active' && v.needsManualReviewReason !== null) return false;
+  if (v.status === 'needsManualReview' && !PLAN_RUN_REVIEW_REASONS.includes(v.needsManualReviewReason)) return false;
+  if (!Array.isArray(v.appliedOccurrenceIds) || planRunArrayHasDuplicates(v.appliedOccurrenceIds)) return false;
+  if (!v.appliedOccurrenceIds.every(function (o) { return Object.prototype.hasOwnProperty.call(v.memberRuleIds, o); })) return false;
+  if (v.appliedOccurrenceIds.length === 0) {
+    if (v.lastProcessedOccurrenceId !== null || v.lastProcessedWorkoutId !== null || v.lastOperationId !== null || v.lastEvaluatedAt !== null) return false;
+  } else {
+    if (v.lastProcessedOccurrenceId !== v.appliedOccurrenceIds[v.appliedOccurrenceIds.length - 1]) return false;
+    if (!planRunIsId(v.lastProcessedWorkoutId) || !planRunIsId(v.lastOperationId) || !planRunIsTimestamp(v.lastEvaluatedAt)) return false;
+  }
+  if (!planRunIsTimestamp(v.createdAt) || !planRunIsTimestamp(v.updatedAt)) return false;
+  return true;
+}
+function planRunSeriesStateIdentityOk(doc, ownerUid, planRunId, seriesId) {
+  return !!doc && doc.ownerUid === ownerUid && doc.planRunId === planRunId && doc.seriesId === seriesId;
+}
+// True when this series state really names this Session's own assignment and
+// rule as its member for this occurrence, for the same exercise, PLAN
+// revision and value kind. Used identically at Session launch and at Finish.
+function planRunSeriesMemberMatches(seriesDoc, occurrenceDoc, assignment, ruleEntry) {
+  if (!seriesDoc || !occurrenceDoc || !assignment || !ruleEntry) return false;
+  var occId = occurrenceDoc.occurrenceId;
+  var isMember = Object.prototype.hasOwnProperty.call(seriesDoc.memberRuleIds, occId);
+  return isMember &&
+    seriesDoc.memberAssignmentIds[occId] === assignment.planAssignmentId &&
+    seriesDoc.memberRuleIds[occId] === ruleEntry.planRuleId &&
+    seriesDoc.exerciseId === assignment.exerciseId &&
+    seriesDoc.planTemplateId === occurrenceDoc.planTemplateId &&
+    seriesDoc.headRevisionId === occurrenceDoc.headRevisionId &&
+    seriesDoc.manifestId === occurrenceDoc.manifestId &&
+    seriesDoc.planRunId === occurrenceDoc.planRunId &&
+    seriesDoc.ownerUid === occurrenceDoc.ownerUid &&
+    planRunRuleEntrySeriesId(ruleEntry) === seriesDoc.seriesId;
 }
 
 // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS8.2/SS8.3 (unchanged
@@ -2265,8 +2423,14 @@ function planRunRemoveFromRemaining(remaining, occurrenceId) {
 // =============================================================================
 var PLAN_RUN_PROGRESSION_INITIAL_KEYS = Object.freeze(['planRuleId', 'planAssignmentId', 'ruleRevisionId', 'exerciseId', 'kind', 'amount', 'unit', 'initializationSource']);
 
+var PLAN_RUN_START_PACKAGE_KEYS = Object.freeze(['operationId', 'ownerUid', 'planTemplateId', 'planRunId', 'headRevisionId', 'manifestId', 'graphHash', 'nameSnapshot', 'occurrences', 'progressionInitialValues']);
 function planRunValidateStartPackage(pkg) {
-  if (!planRunExactKeys(pkg, ['operationId', 'ownerUid', 'planTemplateId', 'planRunId', 'headRevisionId', 'manifestId', 'graphHash', 'nameSnapshot', 'occurrences', 'progressionInitialValues'])) return { ok: false, reason: 'malformedPackageShape' };
+  // PROGRESSION SERIES FOUNDATION: `progressionSeries` is an OPTIONAL
+  // eleventh key, present only when at least one enabled Rule carries a
+  // series link. A package without series keeps exactly its original
+  // ten-key shape and validation.
+  var hasSeriesKey = planRunIsPlainObject(pkg) && Object.prototype.hasOwnProperty.call(pkg, 'progressionSeries');
+  if (!planRunExactKeys(pkg, hasSeriesKey ? PLAN_RUN_START_PACKAGE_KEYS.concat(['progressionSeries']) : PLAN_RUN_START_PACKAGE_KEYS)) return { ok: false, reason: 'malformedPackageShape' };
   var idFields = ['operationId', 'ownerUid', 'planTemplateId', 'planRunId', 'headRevisionId', 'manifestId', 'graphHash'];
   if (idFields.some(function (k) { return !planRunIsId(pkg[k]); })) return { ok: false, reason: 'malformedPackageShape' };
   if (typeof pkg.nameSnapshot !== 'string') return { ok: false, reason: 'malformedPackageShape' };
@@ -2287,6 +2451,12 @@ function planRunValidateStartPackage(pkg) {
     o.assignments.forEach(function (a) { a.rules.forEach(function (r) { if (r.enabled) allEnabledRuleIds.push(r.planRuleId); }); });
   }
   if (planRunArrayHasDuplicates(allEnabledRuleIds)) return { ok: false, reason: 'duplicateEnabledRuleAcrossOccurrences' };
+  var seriesCheck = planRunValidateStartSeries(pkg, hasSeriesKey);
+  if (!seriesCheck.ok) return seriesCheck;
+  // Enabled Rules that belong to a series get their starting value once, per
+  // series (pkg.progressionSeries); only the remaining Rules appear in
+  // progressionInitialValues -- exactly as every Rule did before.
+  allEnabledRuleIds = allEnabledRuleIds.filter(function (rid) { return !Object.prototype.hasOwnProperty.call(seriesCheck.seriesRuleIds, rid); });
   if (!Array.isArray(pkg.progressionInitialValues)) return { ok: false, reason: 'malformedProgressionInitialValues' };
   var providedRuleIds = {};
   for (var j = 0; j < pkg.progressionInitialValues.length; j++) {
@@ -2320,6 +2490,74 @@ function planRunValidateStartPackage(pkg) {
     if (!providedRuleIds[allEnabledRuleIds[k]]) return { ok: false, reason: 'progressionInitialValuesDoNotMatchEnabledRules' };
   }
   return { ok: true };
+}
+
+// PROGRESSION SERIES FOUNDATION -- Start-package series validation. Every
+// enabled Session rule entry carrying `progressionSeriesId` must be a member
+// of exactly the matching `progressionSeries` entry and vice versa; a series
+// has at most one member per Session, one exercise identity, one value kind,
+// and one starting value. Nothing is inferred: membership is exactly what the
+// rule entries (snapshotted from PLAN) declare.
+function planRunValidateStartSeries(pkg, hasSeriesKey) {
+  var linkedByRuleId = {}; // planRuleId -> {occurrenceId, assignment, rule}
+  var linkedCountByOcc = {};
+  var anyLinked = false;
+  for (var i = 0; i < pkg.occurrences.length; i++) {
+    var o = pkg.occurrences[i];
+    for (var a = 0; a < o.assignments.length; a++) {
+      var asg = o.assignments[a];
+      for (var r = 0; r < asg.rules.length; r++) {
+        var rule = asg.rules[r];
+        var sid = planRunRuleEntrySeriesId(rule);
+        if (sid === null) continue;
+        anyLinked = true;
+        linkedByRuleId[rule.planRuleId] = { occurrenceId: o.occurrenceId, assignment: asg, rule: rule, seriesId: sid };
+        linkedCountByOcc[o.occurrenceId] = (linkedCountByOcc[o.occurrenceId] || 0) + 1;
+        if (linkedCountByOcc[o.occurrenceId] > PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE) return { ok: false, reason: 'tooManySeriesMembersInOneSession' };
+      }
+    }
+  }
+  if (!anyLinked && !hasSeriesKey) return { ok: true, seriesRuleIds: {} };
+  if (!planProgressionSeriesFeatureEnabled()) return { ok: false, reason: 'progressionSeriesRequiresFeatureBuild' };
+  if (!anyLinked || !hasSeriesKey) return { ok: false, reason: 'progressionSeriesMembershipMismatch' };
+  if (!Array.isArray(pkg.progressionSeries) || pkg.progressionSeries.length === 0) return { ok: false, reason: 'malformedProgressionSeries' };
+  var seenSeries = {}, coveredRules = {};
+  for (var s = 0; s < pkg.progressionSeries.length; s++) {
+    var e = pkg.progressionSeries[s];
+    if (!planRunExactKeys(e, PLAN_RUN_SERIES_START_ENTRY_KEYS)) return { ok: false, reason: 'malformedProgressionSeries' };
+    if (!planRunIsId(e.seriesId) || !planRunIsId(e.exerciseId)) return { ok: false, reason: 'malformedProgressionSeries' };
+    if (typeof e.seriesName !== 'string' || !e.seriesName || e.seriesName.length > PLAN_RUN_SERIES_NAME_MAX_LENGTH) return { ok: false, reason: 'malformedProgressionSeries' };
+    if (!PLAN_RUN_VALUE_KINDS.includes(e.valueKind)) return { ok: false, reason: 'malformedProgressionSeries' };
+    if (Object.prototype.hasOwnProperty.call(seenSeries, e.seriesId)) return { ok: false, reason: 'duplicateProgressionSeries' };
+    seenSeries[e.seriesId] = true;
+    var bothNull = e.amount === null && e.unit === null;
+    var bothReal = typeof e.amount === 'number' && Number.isFinite(e.amount) && PLAN_RUN_VALUE_UNITS.includes(e.unit);
+    if (!bothNull && !bothReal) return { ok: false, reason: 'malformedProgressionSeriesValue' };
+    if (bothNull && !(e.initializationSource === 'deferred' && e.valueKind === 'workingLoad')) return { ok: false, reason: 'malformedProgressionSeriesValue' };
+    if (bothReal && !['manual', 'confirmedFromSuggestion'].includes(e.initializationSource)) return { ok: false, reason: 'malformedProgressionSeriesValue' };
+    if (!Array.isArray(e.members) || e.members.length === 0) return { ok: false, reason: 'malformedProgressionSeries' };
+    var seenOcc = {};
+    for (var m = 0; m < e.members.length; m++) {
+      var mem = e.members[m];
+      if (!planRunExactKeys(mem, PLAN_RUN_SERIES_START_MEMBER_KEYS)) return { ok: false, reason: 'malformedProgressionSeries' };
+      var linked = Object.prototype.hasOwnProperty.call(linkedByRuleId, mem.planRuleId) ? linkedByRuleId[mem.planRuleId] : null;
+      if (!linked || linked.seriesId !== e.seriesId || linked.occurrenceId !== mem.occurrenceId ||
+          linked.assignment.planAssignmentId !== mem.planAssignmentId || linked.rule.ruleRevisionId !== mem.ruleRevisionId) {
+        return { ok: false, reason: 'progressionSeriesMembershipMismatch' };
+      }
+      if (linked.assignment.exerciseId !== e.exerciseId) return { ok: false, reason: 'progressionSeriesExerciseMismatch' };
+      if (planRunValueKindForAdjustment(linked.rule.adjustmentType) !== e.valueKind) return { ok: false, reason: 'progressionSeriesValueKindMismatch' };
+      if (Object.prototype.hasOwnProperty.call(seenOcc, mem.occurrenceId)) return { ok: false, reason: 'progressionSeriesTwoMembersInOneSession' };
+      seenOcc[mem.occurrenceId] = true;
+      if (Object.prototype.hasOwnProperty.call(coveredRules, mem.planRuleId)) return { ok: false, reason: 'progressionSeriesMembershipMismatch' };
+      coveredRules[mem.planRuleId] = true;
+    }
+  }
+  var linkedIds = Object.keys(linkedByRuleId);
+  for (var k = 0; k < linkedIds.length; k++) {
+    if (!coveredRules[linkedIds[k]]) return { ok: false, reason: 'progressionSeriesMembershipMismatch' };
+  }
+  return { ok: true, seriesRuleIds: coveredRules };
 }
 
 function planRunValidateFinishPackage(pkg) {
@@ -2610,6 +2848,8 @@ var PLAN_RUN_SAFETY_CAPS = Object.freeze({
   maxAssignmentsPerOccurrence: 40,
   maxOrderedSetsPerAssignment: 40,
   maxEnabledRulesPerOccurrence: 40,
+  // PROGRESSION SERIES FOUNDATION -- see PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE.
+  maxSeriesMembersPerOccurrence: PLAN_RUN_MAX_SERIES_MEMBERS_PER_OCCURRENCE,
   // maxStartTransactionWrites: Cloud Firestore hard-caps every transaction
   // (like every batch write) at 500 total document writes -- a platform
   // ceiling, not a tunable choice. The measurement pass's own formula
@@ -2671,6 +2911,13 @@ var PLAN_RUN_SAFETY_CAPS = Object.freeze({
   // most 200 bytes per id per `planRunIsId`), comfortably inside this cap.
   maxProgressionStateDocumentBytes: 16 * 1024,
   maxGenericDocumentBytes: 64 * 1024,
+  // PROGRESSION SERIES FOUNDATION: a series-state document holds its full
+  // membership (at most one member per Session, at most 400 Sessions per
+  // Run). With the app's own ids this is ~450 bytes per member (~180 KiB at
+  // 400 members; measured by the emulator suite's 400-member case), so
+  // 256 KiB -- the same cap as a Run document, far under Firestore's 1 MiB
+  // document limit -- never limits a valid Run.
+  maxSeriesStateDocumentBytes: 256 * 1024,
   // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS5.9 (unchanged
   // through Round 6): the explicit training-max establishment operation's
   // own budget -- up to 3 reads (progressionState, this operation's own
@@ -2706,7 +2953,12 @@ function planRunPreflightStart(pkg) {
   if (maxAssignmentsSeen > PLAN_RUN_SAFETY_CAPS.maxAssignmentsPerOccurrence) reasons.push('tooManyAssignmentsInOneOccurrence');
   if (maxSetsSeen > PLAN_RUN_SAFETY_CAPS.maxOrderedSetsPerAssignment) reasons.push('tooManySetsInOneAssignment');
   if (enabledRuleCount > PLAN_RUN_SAFETY_CAPS.maxEnabledRulesPerOccurrence * occCount) reasons.push('tooManyEnabledRules');
-  var estimatedWrites = 3 + occCount + enabledRuleCount; // Run + slot(claim) + receipt, plus one write per occurrence and per enabled-Rule progression-state doc
+  // PROGRESSION SERIES FOUNDATION: a series-linked Rule gets no per-Rule
+  // progression-state document; each series gets exactly one series-state
+  // document instead.
+  var seriesList = Array.isArray(pkg.progressionSeries) ? pkg.progressionSeries : [];
+  var seriesMemberCount = seriesList.reduce(function (n, e) { return n + e.members.length; }, 0);
+  var estimatedWrites = 3 + occCount + (enabledRuleCount - seriesMemberCount) + seriesList.length; // Run + slot(claim) + receipt, one per occurrence, one per non-series enabled Rule, one per series
   if (estimatedWrites > PLAN_RUN_SAFETY_CAPS.maxStartTransactionWrites) reasons.push('tooManyWrites');
   var estimatedBytes = occurrenceBytesTotal + planRunEstimateDocBytes({ pkg: pkg });
   if (estimatedBytes > PLAN_RUN_SAFETY_CAPS.maxEstimatedRequestBytes) reasons.push('estimatedRequestTooLarge');
@@ -2951,6 +3203,7 @@ function planRunFinalDocumentByteCapFor(kind) {
   if (kind === 'occurrence') return PLAN_RUN_SAFETY_CAPS.maxOccurrenceDocumentBytes;
   if (kind === 'workout') return PLAN_RUN_SAFETY_CAPS.maxWorkoutDocumentBytes;
   if (kind === 'progressionState') return PLAN_RUN_SAFETY_CAPS.maxProgressionStateDocumentBytes;
+  if (kind === 'seriesState') return PLAN_RUN_SAFETY_CAPS.maxSeriesStateDocumentBytes;
   return PLAN_RUN_SAFETY_CAPS.maxGenericDocumentBytes;
 }
 // The real, non-bypassable check every one of Start/Finish/End now runs
