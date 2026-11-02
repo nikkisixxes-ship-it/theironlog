@@ -95,7 +95,7 @@ var PLAN_RUN_VALUE_INITIALIZATION_SOURCES = Object.freeze(['manual', 'confirmedF
 // app-plan-run-start-ui.js, app-plan-run-logger-ui.js and
 // firebase-plan-run.js all see the same value.
 // =============================================================================
-var PLAN_PROGRESSION_SERIES_FEATURE_ENABLED = false;
+var PLAN_PROGRESSION_SERIES_FEATURE_ENABLED = true;
 function planProgressionSeriesFeatureEnabled() {
   return (typeof PLAN_PROGRESSION_SERIES_FEATURE_ENABLED !== 'undefined') && PLAN_PROGRESSION_SERIES_FEATURE_ENABLED === true;
 }
