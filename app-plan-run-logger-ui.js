@@ -832,6 +832,11 @@ function planRunLoggerFinishCommit(pkg, result) {
   // History holds it exactly once either way.
   var alreadyLocal = appDb.workouts.some(function (w) { return w && w.id === pkg.workout.id; });
   if (!alreadyLocal) appDb.workouts.unshift(pkg.workout);
+  // POST-FINISH AUTHORITATIVE-STATE GUARD: record the committed fact (this
+  // Session of this Run is no longer remaining work) BEFORE any TRAIN
+  // refresh below, so TRAIN never presents a read that predates it. See
+  // planRunUiNoteFinishCommitted (app-plan-run-ui.js).
+  if (typeof planRunUiNoteFinishCommitted === 'function') planRunUiNoteFinishCommitted(pkg.planRunId, pkg.occurrenceId);
   var resultRefs = result.resultRefs || null;
   planRunLoggerFinishState = null;
   planRunLoggerFinishCurrentOperationId = null;

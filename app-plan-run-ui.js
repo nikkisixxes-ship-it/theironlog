@@ -255,6 +255,134 @@ var planRunUiDetailEpochCounter = 0; // detail surface: shared counter, compared
 var planRunUiPreviewEpoch = 0;       // Session-preview surface
 var planRunUiLastKnownOwnerUid;      // undefined until first observed -- deliberately distinct from null (signed out)
 
+// ---- POST-FINISH AUTHORITATIVE-STATE GUARD (live Stage 3 smoke finding) ----
+// A successful Finish is the one moment this screen KNOWS a fact for certain:
+// that Session (occurrence) of that Run is no longer remaining work -- the
+// Finish transaction removed it from the Run's remainingOccurrenceIds in the
+// same atomic commit that completed it (and completed the Run if it was the
+// last one). The reads TRAIN then makes (the active-Run list and each Run's
+// Session detail) are ordinary, cache-eligible Firestore reads that are not
+// guaranteed to reflect a transaction the instant it commits. Previously
+// TRAIN rendered whatever those reads returned, so a read that had not yet
+// caught up showed the just-finished Session as the "Next Session" (In
+// Progress / Completed), or a completed Run as still active, with nothing
+// ever re-reading it. Now planRunLoggerFinishCommit records the committed
+// fact here (planRunUiNoteFinishCommitted) BEFORE it refreshes TRAIN, and any
+// list or detail result that contradicts it is treated as not-yet-current:
+// TRAIN keeps showing its existing loading state and re-reads (bounded,
+// increasing delays); if the reads still disagree after the last attempt it
+// shows the existing honest "Couldn't load" + Retry state. A just-finished
+// Session is never presented as current.
+//
+// PAGINATION CORRECTION (independent review): the active-Run list is paged
+// (20 per page, ordered by startedAt then planRunId, no limit on active
+// Runs), so a guarded Run can be on page two or later. Absence from an
+// INCOMPLETE first page proves nothing. Each guard therefore records whether
+// the commit has been PROVEN reflected (`verified`), and proof comes only
+// from authoritative evidence:
+//   - an agreeing copy of that Run (listed on any page without the finished
+//     Session, or a Session detail read that agrees), or
+//   - absence from a COMPLETE list (no further page exists), or
+//   - when page one is incomplete and the Run is not on it, ONE targeted
+//     read of that Run (planRunUiProveGuardedRuns): it has moved on, or it is
+//     no longer active (completed/ended).
+// Page one is not shown until every unproven guard is proven; every later
+// page is checked the same way before it is appended. A guard is never
+// deleted before proof; a proven guard stays (cheaply) as a filter for the
+// rest of the signed-in session, because a finished Session can never
+// become remaining work again and a completed Run can never become active
+// again -- so it can only ever hide data that predates the commit. All
+// guards are cleared on any owner change (planRunUiResetState).
+var planRunUiJustFinishedByRunId = {};   // planRunId -> { occurrenceId committed by Finish, verified }
+var planRunUiAuthoritativeAttempts = 0;  // first-page rechecks spent while any guard is unproven
+var planRunUiNextPageAttempts = 0;       // rechecks spent on the current Load More
+var PLAN_RUN_UI_AUTHORITATIVE_RETRY_DELAYS_MS = [300, 600, 1200, 2400, 4800];
+function planRunUiNoteFinishCommitted(planRunId, occurrenceId) {
+  if (typeof planRunId !== 'string' || typeof occurrenceId !== 'string') return;
+  planRunUiJustFinishedByRunId[planRunId] = { occurrenceId: occurrenceId, verified: false };
+  planRunUiAuthoritativeAttempts = 0;
+}
+function planRunUiGuardFor(planRunId) {
+  return Object.prototype.hasOwnProperty.call(planRunUiJustFinishedByRunId, planRunId) ? planRunUiJustFinishedByRunId[planRunId] : null;
+}
+function planRunUiMarkGuardVerified(planRunId) {
+  var g = planRunUiGuardFor(planRunId);
+  if (g) g.verified = true;
+  if (!planRunUiUnverifiedGuardIds().length) planRunUiAuthoritativeAttempts = 0;
+}
+function planRunUiUnverifiedGuardIds() {
+  return Object.keys(planRunUiJustFinishedByRunId).filter(function (id) { return !planRunUiJustFinishedByRunId[id].verified; });
+}
+// True when this Run document (from any list page or from a detail read)
+// still lists the just-finished Session as next or remaining work -- i.e. it
+// predates the committed Finish.
+function planRunUiRunContradictsFinish(run) {
+  var g = run ? planRunUiGuardFor(run.planRunId) : null;
+  if (!g) return false;
+  return run.nextOccurrenceId === g.occurrenceId ||
+    (Array.isArray(run.remainingOccurrenceIds) && run.remainingOccurrenceIds.indexOf(g.occurrenceId) !== -1);
+}
+// Page one is incomplete and these guarded Runs are not on it: read each one
+// directly (the same read-only 'display' read used for a Session detail,
+// addressed to the finished Session, which always exists). The page is
+// shown only when every one is proven; any contradicting, unreadable or
+// failed read is treated as not-yet-current (bounded rechecks, then the
+// existing error + Retry). Responses that a newer list read or an owner
+// change has superseded are dropped.
+function planRunUiProveGuardedRuns(result, ids) {
+  var epoch = planRunUiListEpoch;
+  var uid = planRunUiCurrentUid();
+  var pending = ids.length;
+  var failed = false;
+  planRunUiState = Object.assign(planRunUiState, { phase: 'loading', runs: [], detailByRunId: {} });
+  planRunUiRenderSection();
+  function current() { return planRunUiIsListResponseCurrent(epoch, uid); }
+  function settleOne(ok) {
+    if (!current()) return;
+    if (!ok) failed = true;
+    if (--pending > 0) return;
+    if (failed) { planRunUiRetryUntilAuthoritative(); return; }
+    planRunUiAcceptFirstPage(result);
+  }
+  ids.forEach(function (id) {
+    var g = planRunUiGuardFor(id);
+    var p;
+    try {
+      p = fsPlanRunPersistence.fsPlanRunReadForDisplay({ ownerUid: uid, planRunId: id, occurrenceId: g.occurrenceId, mode: 'display' });
+    } catch (err) { settleOne(false); return; }
+    p.then(function (r) {
+      if (!current()) return;
+      if (!r || r.outcome !== 'verified' || !r.run || planRunUiRunContradictsFinish(r.run)) { settleOne(false); return; }
+      // Agreeing copy: the Run has moved on (still active, finished Session
+      // removed) or is no longer active (completed/ended). Either proves it.
+      planRunUiMarkGuardVerified(id);
+      settleOne(true);
+    }).catch(function () { settleOne(false); });
+  });
+}
+// Called with a contradicting read: schedules the next list re-read (which
+// also re-reads every Session detail) or, after the last attempt, shows the
+// existing error + Retry. Returns nothing; the caller has already decided not
+// to render the contradicting data.
+function planRunUiRetryUntilAuthoritative() {
+  var attempt = planRunUiAuthoritativeAttempts++;
+  if (attempt >= PLAN_RUN_UI_AUTHORITATIVE_RETRY_DELAYS_MS.length) {
+    planRunUiAuthoritativeAttempts = 0;
+    planRunUiState = Object.assign(planRunUiState, { phase: 'error', runs: [], detailByRunId: {} });
+    planRunUiRenderSection();
+    return;
+  }
+  planRunUiState = Object.assign(planRunUiState, { phase: 'loading', runs: [], detailByRunId: {} });
+  planRunUiRenderSection();
+  var scheduledEpoch = planRunUiListEpoch;
+  var scheduledUid = planRunUiCurrentUid();
+  setTimeout(function () {
+    // Skip if anything newer already re-read the list, or the owner changed.
+    if (scheduledEpoch !== planRunUiListEpoch || planRunUiCurrentUid() !== scheduledUid) return;
+    planRunUiFetchFirstPage();
+  }, PLAN_RUN_UI_AUTHORITATIVE_RETRY_DELAYS_MS[attempt]);
+}
+
 function planRunUiCurrentUid() {
   return (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null;
 }
@@ -281,6 +409,9 @@ function planRunUiIsPreviewResponseCurrent(epoch, expectedUid) {
 // (i.e. `planRunUiResetForOwner` below) must clear that themselves.
 function planRunUiResetState() {
   planRunUiState = { phase: 'idle', runs: [], hasMore: false, nextCursor: null, loadingMore: false, loadMoreError: false, expandedRunId: null, detailByRunId: {}, menuOpenRunId: null };
+  planRunUiJustFinishedByRunId = {};
+  planRunUiAuthoritativeAttempts = 0;
+  planRunUiNextPageAttempts = 0;
   planRunUiListEpoch++;
   planRunUiPreviewEpoch++;
   planRunUiLastPreviewRunOccurrence = null;
@@ -386,33 +517,22 @@ function planRunUiApplyFirstPageResult(result) {
   if (!result || typeof result.outcome !== 'string') {
     planRunUiState = Object.assign(planRunUiState, { phase: 'error' });
   } else if (result.outcome === 'ok') {
-    planRunUiState = Object.assign(planRunUiState, {
-      phase: result.runs.length ? 'ok' : 'empty',
-      runs: result.runs,
-      hasMore: !!result.hasMore,
-      nextCursor: result.hasMore ? result.nextCursor : null,
-      loadingMore: false,
-      loadMoreError: false,
-      // POST-FINISH STALE-TRAIN CORRECTION: a fresh first-page list is the
-      // authoritative re-read, so every per-Run Session detail cached under
-      // the PREVIOUS list is discarded here and re-read below. Previously
-      // this cache was keyed by planRunId only and never invalidated, so
-      // after a successful Finish (which advances the Run's
-      // nextOccurrenceId) the refreshed list was paired with the OLD
-      // occurrence's cached detail -- the just-finished Session kept
-      // showing "In Progress" until an app restart cleared memory. Any
-      // still-in-flight older detail response is dropped by the existing
-      // per-Run epoch check (its entry no longer exists / carries a newer
-      // epoch). A plain re-render of the section never reaches this line,
-      // so re-rendering alone still never refetches.
-      detailByRunId: {}
+    // POST-FINISH AUTHORITATIVE-STATE GUARD: a list that still shows a
+    // just-finished Session as remaining work predates the committed Finish
+    // -- never render it; re-read instead (see the guard's header above).
+    if (result.runs.some(planRunUiRunContradictsFinish)) { planRunUiRetryUntilAuthoritative(); return; }
+    // PAGINATION CORRECTION: a guarded Run listed on this page without the
+    // finished Session is proven. A guarded Run NOT on this page is proven
+    // absent only if this page is the complete list; otherwise it is read
+    // directly before anything is shown.
+    var unproven = planRunUiUnverifiedGuardIds().filter(function (id) {
+      if (result.runs.some(function (r) { return r.planRunId === id; })) { planRunUiMarkGuardVerified(id); return false; }
+      if (!result.hasMore) { planRunUiMarkGuardVerified(id); return false; }
+      return true;
     });
-    // USABILITY CORRECTION (independent-review finding, this round): kick
-    // off each new Run's own detail read automatically, the instant the
-    // list itself resolves -- never waiting for a "View" click. See
-    // planRunUiEnsureRunDetailLoaded's own header for exactly why this is
-    // safe alongside the existing, unchanged toggle mechanism.
-    result.runs.forEach(function (r) { planRunUiEnsureRunDetailLoaded(r.planRunId); });
+    if (unproven.length) { planRunUiProveGuardedRuns(result, unproven); return; }
+    planRunUiAcceptFirstPage(result);
+    return;
   } else if (result.outcome === 'integrityConflict') {
     // §3A.2.2: a distinct state, no Start/Resume/Choose-Session affordance
     // against anything on this section while it is showing.
@@ -424,6 +544,40 @@ function planRunUiApplyFirstPageResult(result) {
     // ignored).
     planRunUiState = Object.assign(planRunUiState, { phase: 'error' });
   }
+  planRunUiRenderSection();
+}
+
+// Renders an accepted first page (every guard proven): the unchanged
+// pre-existing "ok" handling.
+function planRunUiAcceptFirstPage(result) {
+  planRunUiNextPageAttempts = 0;
+  planRunUiState = Object.assign(planRunUiState, {
+    phase: result.runs.length ? 'ok' : 'empty',
+    runs: result.runs,
+    hasMore: !!result.hasMore,
+    nextCursor: result.hasMore ? result.nextCursor : null,
+    loadingMore: false,
+    loadMoreError: false,
+    // POST-FINISH STALE-TRAIN CORRECTION: a fresh first-page list is the
+    // authoritative re-read, so every per-Run Session detail cached under
+    // the PREVIOUS list is discarded here and re-read below. Previously
+    // this cache was keyed by planRunId only and never invalidated, so
+    // after a successful Finish (which advances the Run's
+    // nextOccurrenceId) the refreshed list was paired with the OLD
+    // occurrence's cached detail -- the just-finished Session kept
+    // showing "In Progress" until an app restart cleared memory. Any
+    // still-in-flight older detail response is dropped by the existing
+    // per-Run epoch check (its entry no longer exists / carries a newer
+    // epoch). A plain re-render of the section never reaches this line,
+    // so re-rendering alone still never refetches.
+    detailByRunId: {}
+  });
+  // USABILITY CORRECTION (independent-review finding, this round): kick
+  // off each new Run's own detail read automatically, the instant the
+  // list itself resolves -- never waiting for a "View" click. See
+  // planRunUiEnsureRunDetailLoaded's own header for exactly why this is
+  // safe alongside the existing, unchanged toggle mechanism.
+  result.runs.forEach(function (r) { planRunUiEnsureRunDetailLoaded(r.planRunId); });
   planRunUiRenderSection();
 }
 
@@ -461,6 +615,31 @@ function planRunUiFetchNextPage() {
       planRunUiRenderSection();
       return;
     }
+    // PAGINATION CORRECTION: every later page is checked before it is
+    // appended. A page that still lists a just-finished Session (or a Run
+    // whose final Session was finished) as remaining work predates the
+    // commit: it is never shown; "Loading more…" stays up while it is
+    // re-read with the same bounded delays, then the existing "Couldn't load
+    // more" + Load more state.
+    if (result.runs.some(planRunUiRunContradictsFinish)) {
+      var attempt = planRunUiNextPageAttempts++;
+      if (attempt >= PLAN_RUN_UI_AUTHORITATIVE_RETRY_DELAYS_MS.length) {
+        planRunUiNextPageAttempts = 0;
+        planRunUiState.loadingMore = false;
+        planRunUiState.loadMoreError = true;
+        planRunUiRenderSection();
+        return;
+      }
+      var recheckEpoch = planRunUiListEpoch;
+      setTimeout(function () {
+        if (recheckEpoch !== planRunUiListEpoch || planRunUiCurrentUid() !== expectedUid) return;
+        planRunUiState.loadingMore = false; // let planRunUiFetchNextPage run again (it re-sets it)
+        planRunUiFetchNextPage();
+      }, PLAN_RUN_UI_AUTHORITATIVE_RETRY_DELAYS_MS[attempt]);
+      return;
+    }
+    planRunUiNextPageAttempts = 0;
+    result.runs.forEach(function (r) { if (planRunUiGuardFor(r.planRunId)) planRunUiMarkGuardVerified(r.planRunId); });
     planRunUiState.runs = planRunUiState.runs.concat(result.runs);
     planRunUiState.hasMore = !!result.hasMore;
     planRunUiState.nextCursor = result.hasMore ? result.nextCursor : null;
@@ -635,6 +814,11 @@ function planRunUiEnsureRunDetailLoaded(planRunId) {
   p.then(function (result) {
     if (!planRunUiIsDetailResponseCurrent(planRunId, epoch, expectedUid)) return; // superseded/owner changed -- drop silently
     if (result && result.outcome === 'verified') {
+      // POST-FINISH AUTHORITATIVE-STATE GUARD: the Session detail re-reads
+      // the Run document itself; if that copy predates a committed Finish
+      // (or the detail is the just-finished Session), do not show it.
+      if (planRunUiDetailContradictsFinish(result)) { planRunUiRetryUntilAuthoritative(); return; }
+      planRunUiNoteDetailAgrees(planRunId);
       planRunUiState.detailByRunId[planRunId] = { phase: 'verified', run: result.run, occurrence: result.occurrence, epoch: epoch };
     } else {
       planRunUiState.detailByRunId[planRunId] = { phase: 'unverified', outcome: result && result.outcome, epoch: epoch };
@@ -645,6 +829,20 @@ function planRunUiEnsureRunDetailLoaded(planRunId) {
     planRunUiState.detailByRunId[planRunId] = { phase: 'error', epoch: epoch };
     planRunUiRenderSection();
   });
+}
+// A verified detail that agrees with the committed Finish is authoritative
+// proof for that Run.
+function planRunUiNoteDetailAgrees(planRunId) {
+  if (planRunUiGuardFor(planRunId)) planRunUiMarkGuardVerified(planRunId);
+}
+// A just-finished Session shown as the detail, or a Run copy that still
+// lists it as remaining work, contradicts the committed Finish.
+function planRunUiDetailContradictsFinish(result) {
+  if (!result || !result.run) return false;
+  var g = planRunUiGuardFor(result.run.planRunId);
+  if (!g) return false;
+  return planRunUiRunContradictsFinish(result.run) ||
+    (!!result.occurrence && result.occurrence.occurrenceId === g.occurrenceId);
 }
 
 // USABILITY CORRECTION ADDITION (independent-review finding, this round):
@@ -693,6 +891,10 @@ function planRunUiToggleRunDetail(planRunId) {
   p.then(function (result) {
     if (!planRunUiIsDetailResponseCurrent(planRunId, epoch, expectedUid)) return; // superseded/owner changed -- drop silently
     if (result && result.outcome === 'verified') {
+      // POST-FINISH AUTHORITATIVE-STATE GUARD (same check as the automatic
+      // detail read above).
+      if (planRunUiDetailContradictsFinish(result)) { planRunUiRetryUntilAuthoritative(); return; }
+      planRunUiNoteDetailAgrees(planRunId);
       planRunUiState.detailByRunId[planRunId] = { phase: 'verified', run: result.run, occurrence: result.occurrence, epoch: epoch };
     } else {
       // Any non-'verified' outcome (runAbsent/runMalformed/
