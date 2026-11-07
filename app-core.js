@@ -292,6 +292,10 @@ function ensureImportedSetsLoaded(reason) {
 
 auth.onAuthStateChanged(async user => {
   const mySession = ++initSession;
+  // ACTIVE-WORKOUT RECOVERY: first, so a previous owner's open workout is
+  // kept under that owner's own draft before anything below discards it,
+  // and nothing of it stays visible to a different account.
+  awDraftHandleAuthChange(user);
   // Every auth transition (sign-in, sign-out, user switch) unsubscribes all
   // previously-attached listeners immediately -- not only via the manual Sign Out
   // control -- so a stale listener can never write a previous user's data into a
@@ -401,6 +405,9 @@ auth.onAuthStateChanged(async user => {
     document.getElementById('loading-screen').style.display = 'none';
     console.log(DIAG, 'startup complete — imported sets NOT loaded (deferred until HISTORY/Import/Export needs them)');
     renderHome();
+    // ACTIVE-WORKOUT RECOVERY: only now -- signed in, startup finished -- is
+    // this owner's draft looked for (an auth delay never looks like "none").
+    awDraftOfferRecovery(user.uid);
 
     // SLICE 5B correction round 1 (finding 6) -- the ONLY entry point for
     // the new manual progression starting-value/correction UI
@@ -942,6 +949,7 @@ function finalizeStartActiveWorkout(activeId, mi, si) {
   // whatever workout was open before this call could otherwise go on to
   // mutate the NEW workout assigned just below if it happened to reuse the
   // same exIdx/setIdx indices. Cleared here, before the replacement.
+  if (awDraftBlocksOpeningWorkout()) return;
   clearAllPRDebounceTimers();
   currentWorkout = {
     id: uid(), name, date: Date.now(), exercises: [], rpeEnabled: false, duration: 0, bodyweight: null,
@@ -957,7 +965,7 @@ function finalizeStartActiveWorkout(activeId, mi, si) {
   document.getElementById('workout-exercises').innerHTML = '';
   const nameDisplay = document.getElementById('log-session-name-display');
   if (nameDisplay) nameDisplay.textContent = (name || 'NEW WORKOUT').toUpperCase();
-  renderWorkoutExercises(); showPage('page-log'); startWorkoutTimer();
+  renderWorkoutExercises(); showPage('page-log'); startWorkoutTimer(); awDraftBeginForCurrentWorkout();
 }
 
 // ==================== ACTIVE-INSTANCE TRAINING MAX (Build 4) ====================
@@ -1549,15 +1557,366 @@ function updateTimerDisplay() {
   if (el) { el.textContent = fmtDuration(elapsed); el.classList.toggle('paused', workoutPaused); }
   const barEl = document.getElementById('active-bar-time');
   if (barEl) barEl.textContent = fmtDuration(elapsed);
+  // ACTIVE-WORKOUT RECOVERY safety net: stores any change made by any path
+  // within a second (an unchanged workout is not rewritten).
+  if (typeof awDraftWrite === 'function') awDraftWrite(false);
 }
 function getElapsedSeconds() {
   if (!activeWorkoutStart) return 0;
   if (workoutPaused) return Math.floor((workoutPausedAt - activeWorkoutStart - workoutPausedTotal) / 1000);
   return Math.floor((Date.now() - activeWorkoutStart - workoutPausedTotal) / 1000);
 }
-function pauseWorkout() { if (!currentWorkout || workoutPaused) return; workoutPaused = true; workoutPausedAt = Date.now(); updateTimerDisplay(); showToast('Workout paused', ''); }
-function resumeWorkout() { if (!currentWorkout || !workoutPaused) return; workoutPausedTotal += (Date.now() - workoutPausedAt); workoutPaused = false; workoutPausedAt = null; updateTimerDisplay(); showToast('Workout resumed', 'success'); }
+function pauseWorkout() { if (!currentWorkout || workoutPaused) return; workoutPaused = true; workoutPausedAt = Date.now(); updateTimerDisplay(); awDraftSaveNow(); showToast('Workout paused', ''); }
+function resumeWorkout() { if (!currentWorkout || !workoutPaused) return; workoutPausedTotal += (Date.now() - workoutPausedAt); workoutPaused = false; workoutPausedAt = null; updateTimerDisplay(); awDraftSaveNow(); showToast('Workout resumed', 'success'); }
 function stopWorkoutTimer() { if (activeWorkoutTimer) clearInterval(activeWorkoutTimer); document.getElementById('active-bar').classList.remove('visible'); workoutPaused = false; workoutPausedTotal = 0; workoutPausedAt = null; }
+// ACTIVE-WORKOUT RECOVERY: continues the timer from a recovered draft's
+// stored values (same semantics as startWorkoutTimer/pause/resume: time in
+// the background counts unless the workout was paused).
+function restoreWorkoutTimer(t) {
+  activeWorkoutStart = t.activeWorkoutStart; workoutPaused = !!t.workoutPaused;
+  workoutPausedAt = t.workoutPaused ? t.workoutPausedAt : null; workoutPausedTotal = t.workoutPausedTotal || 0;
+  if (activeWorkoutTimer) clearInterval(activeWorkoutTimer);
+  document.getElementById('active-bar').classList.add('visible');
+  activeWorkoutTimer = setInterval(updateTimerDisplay, 1000);
+  updateTimerDisplay();
+}
+
+// ==================== ACTIVE-WORKOUT LOCAL RECOVERY DRAFT ====================
+// Mobile browsers may suspend a backgrounded tab or discard it to recover
+// memory; the page then reloads from scratch. currentWorkout, the workout
+// timer and the logger's state live only in page memory, so a reload used
+// to lose an unfinished workout. This section keeps ONE versioned draft of
+// the open live workout per signed-in user, in this browser's localStorage
+// (synchronous, so the latest state is already stored if the page is
+// killed abruptly; no Firestore reads/writes, no Rules change), and offers
+// it back -- explicitly, never silently -- after the next sign-in.
+//
+// SAVE POINTS: a new live workout opens (awDraftBeginForCurrentWorkout);
+// every logger re-render (renderWorkoutExercises -- covers add/remove/
+// change/substitute/restore/reorder of exercises and sets, PR sets, RPE
+// toggle, Training-Max / 1RM / Working-Load fills); updateSet (typing:
+// short debounce); set checkboxes; pause/resume; bodyweight; performance
+// videos; every canonical Finish state change; page hidden / pagehide;
+// and a safety net on the existing one-second timer tick that stores any
+// change any other path may have made (unchanged content is not rewritten).
+// CLEAR POINTS (only): an ordinary/legacy Finish reaching its existing
+// "saved" point; a canonical Finish confirmed committed
+// (planRunLoggerFinishCommit); an explicitly confirmed Cancel; an explicit
+// "Discard Draft". Never on navigation, backgrounding, sign-out/auth delay,
+// network errors, rejected/conflicting/uncertain Finish, or unreadable
+// drafts. Historical-workout edit mode (_isEdit) is EXCLUDED: never saved,
+// never cleared.
+const AW_DRAFT_SCHEMA = 'ironlog.activeWorkoutDraft';
+const AW_DRAFT_VERSION = 1;
+const AW_DRAFT_KEY_PREFIX = 'ironlog.activeWorkoutDraft:'; // + owner uid (unversioned: a newer build's draft is still found, then refused as unsupported)
+const AW_DRAFT_TYPING_DEBOUNCE_MS = 400;
+let awDraftOwnerUid = null;          // owner of the live workout currently open in this page
+let awDraftLastBody = null;          // last stored content (savedAt excluded), to skip identical writes
+let awDraftTypingTimer = null;
+let awDraftStorageFailed = false;    // shown once per page, never repeatedly
+let awDraftRecoveredWorkoutId = null;// id of a workout restored from a draft (blocks opening another over it)
+let awDraftRecovery = null;          // unresolved recovery prompt: { ownerUid, draft|null, problem|null, busy }
+
+function awDraftKey(uid) { return AW_DRAFT_KEY_PREFIX + uid; }
+function awDraftStore() { try { return (typeof localStorage !== 'undefined') ? localStorage : null; } catch (e) { return null; } }
+function awDraftAuthUid() { return (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null; }
+function awDraftLiveWorkoutOpen() { return !!currentWorkout && !currentWorkout._isEdit; }
+
+// JSON with Firestore Timestamps tagged (a pending canonical Finish package
+// carries them); everything else in an active workout is plain data.
+function awDraftEncode(value) {
+  return JSON.stringify(value, function (k, v) {
+    if (v && typeof v === 'object' && typeof v.toMillis === 'function' && typeof v.seconds === 'number' && typeof v.nanoseconds === 'number') {
+      return { __awTimestamp: [v.seconds, v.nanoseconds] };
+    }
+    return v;
+  });
+}
+function awDraftDecode(text) {
+  return JSON.parse(text, function (k, v) {
+    if (v && typeof v === 'object' && Array.isArray(v.__awTimestamp) && v.__awTimestamp.length === 2 && Object.keys(v).length === 1) {
+      const s = v.__awTimestamp[0], ns = v.__awTimestamp[1];
+      if (typeof firebase !== 'undefined' && firebase.firestore && firebase.firestore.Timestamp) return new firebase.firestore.Timestamp(s, ns);
+      return { seconds: s, nanoseconds: ns };
+    }
+    return v;
+  });
+}
+
+function awDraftKind(w) {
+  if (w.canonicalRun) return 'canonicalRun';
+  if (w.activeProgramId) return 'legacyActiveProgram';
+  if (w.programId) return 'legacyProgram';
+  return 'ordinary';
+}
+// Only a still-unresolved canonical Finish attempt is kept (so a reload
+// reuses the existing Retry / Check Status with the SAME prepared package).
+function awDraftFinishAttempt() {
+  if (!currentWorkout || !currentWorkout.canonicalRun || typeof planRunLoggerFinishState === 'undefined') return null;
+  const st = planRunLoggerFinishState;
+  if (!st || !st.pkg || (st.phase !== 'pending' && st.phase !== 'uncertain')) return null;
+  if (st.pkg.workoutId !== currentWorkout.id) return null;
+  return { phase: st.phase, pkg: st.pkg };
+}
+function awDraftBody() {
+  const w = Object.assign({}, currentWorkout); delete w._isEdit;
+  return {
+    schema: AW_DRAFT_SCHEMA, version: AW_DRAFT_VERSION, ownerUid: awDraftOwnerUid,
+    workoutId: currentWorkout.id, kind: awDraftKind(currentWorkout), workout: w,
+    timer: { activeWorkoutStart: activeWorkoutStart, workoutPaused: !!workoutPaused, workoutPausedAt: workoutPausedAt, workoutPausedTotal: workoutPausedTotal || 0 },
+    finishAttempt: awDraftFinishAttempt()
+  };
+}
+function awDraftReportStorageFailure() {
+  if (awDraftStorageFailed) return;
+  awDraftStorageFailed = true;
+  if (typeof showToast === 'function') showToast('This browser can’t keep a recovery copy of your workout. Keep IRON LOG open until you finish.', 'error');
+}
+// Writes the open live workout to its OWNER's draft. `forOwnerOnAuthChange`
+// is used only by awDraftHandleAuthChange, to store the previous owner's
+// workout under that owner's own key at the moment of an account change.
+function awDraftWrite(forOwnerOnAuthChange) {
+  if (!awDraftLiveWorkoutOpen() || !awDraftOwnerUid) return;
+  if (!forOwnerOnAuthChange && awDraftAuthUid() !== awDraftOwnerUid) return;
+  let body;
+  try { body = awDraftEncode(awDraftBody()); } catch (e) { awDraftReportStorageFailure(); return; }
+  if (body === awDraftLastBody) return;
+  const store = awDraftStore();
+  if (!store) { awDraftReportStorageFailure(); return; }
+  try {
+    store.setItem(awDraftKey(awDraftOwnerUid), body.slice(0, -1) + ',"savedAt":' + Date.now() + '}');
+    awDraftLastBody = body;
+  } catch (e) { awDraftReportStorageFailure(); }
+}
+function awDraftSaveNow() {
+  if (awDraftTypingTimer) { clearTimeout(awDraftTypingTimer); awDraftTypingTimer = null; }
+  awDraftWrite(false);
+}
+function awDraftSaveSoon() {
+  if (awDraftTypingTimer) clearTimeout(awDraftTypingTimer);
+  awDraftTypingTimer = setTimeout(function () { awDraftTypingTimer = null; awDraftWrite(false); }, AW_DRAFT_TYPING_DEBOUNCE_MS);
+}
+// Called right after a NEW live workout is opened (it replaces this user's
+// single draft slot, exactly as it replaces currentWorkout in memory).
+function awDraftBeginForCurrentWorkout() {
+  if (!awDraftLiveWorkoutOpen()) return;
+  awDraftOwnerUid = awDraftAuthUid();
+  awDraftLastBody = null;
+  awDraftRecoveredWorkoutId = null;
+  awDraftSaveNow();
+}
+function awDraftClear(ownerUid) {
+  const uid = ownerUid || awDraftOwnerUid;
+  if (awDraftTypingTimer) { clearTimeout(awDraftTypingTimer); awDraftTypingTimer = null; }
+  if (uid) { const store = awDraftStore(); try { if (store) store.removeItem(awDraftKey(uid)); } catch (e) { /* nothing more can be done; never blocks the logger */ } }
+  if (!ownerUid || ownerUid === awDraftOwnerUid) { awDraftOwnerUid = null; awDraftLastBody = null; awDraftRecoveredWorkoutId = null; }
+}
+// Opening another workout over a recovered one -- or while the recovery
+// question is still unanswered -- is refused (it would replace the draft).
+//
+// CORRECTION (review finding 1): the draft slot is also HELD by any draft
+// still in storage that this page is not itself writing -- e.g. after "Keep
+// for Later", or a draft that is unreadable or from a newer version. That
+// is read from storage itself (not from the dialog's in-memory state), so a
+// new workout can never overwrite it. Only a confirmed Finish, a confirmed
+// Cancel or a confirmed Discard Draft releases the slot. The attempt is
+// refused and the saved draft's recovery choices are shown again.
+// `opts.historyEdit`: editing a past workout never writes or clears the
+// draft, so a held draft alone does not block it (unchanged behavior).
+function awDraftStoredRaw(uid) {
+  const store = awDraftStore();
+  if (!store || !uid) return null;
+  try { return store.getItem(awDraftKey(uid)); } catch (e) { return null; }
+}
+function awDraftSlotHeldByStoredDraft() {
+  const uid = awDraftAuthUid();
+  if (!uid) return false;
+  if (awDraftLiveWorkoutOpen() && awDraftOwnerUid === uid) return false; // the slot holds this page's own open workout
+  return awDraftStoredRaw(uid) !== null;
+}
+function awDraftBlocksOpeningWorkout(opts) {
+  if (awDraftRecovery) { showToast('Resume or discard the recovered workout first.', 'error'); return true; }
+  if (currentWorkout && awDraftRecoveredWorkoutId && currentWorkout.id === awDraftRecoveredWorkoutId) {
+    showToast('Finish or cancel your recovered workout first.', 'error'); return true;
+  }
+  if (!(opts && opts.historyEdit) && awDraftSlotHeldByStoredDraft()) {
+    showToast('You have a saved unfinished workout. Resume or discard it first.', 'error');
+    if (!currentWorkout) awDraftOfferRecovery(awDraftAuthUid());
+    return true;
+  }
+  return false;
+}
+
+// ---- auth boundary (called first thing in auth.onAuthStateChanged) ----
+function awDraftHandleAuthChange(user) {
+  const newUid = user ? user.uid : null;
+  awDraftCloseRecovery();
+  awDraftRecovery = null;
+  if (awDraftLiveWorkoutOpen() && awDraftOwnerUid && newUid !== awDraftOwnerUid) {
+    awDraftWrite(true); // keep the previous owner's latest state under the previous owner's key
+    if (!currentWorkout.canonicalRun) { // canonical: planRunLoggerFinishResetForAuthChange discards it
+      clearAllPRDebounceTimers(); stopWorkoutTimer(); currentWorkout = null;
+      const ex = document.getElementById('workout-exercises'); if (ex) ex.innerHTML = '';
+      if (activePage() === 'page-log') showPage('page-home');
+    }
+    awDraftOwnerUid = null; awDraftLastBody = null; awDraftRecoveredWorkoutId = null;
+    if (awDraftTypingTimer) { clearTimeout(awDraftTypingTimer); awDraftTypingTimer = null; }
+  }
+}
+
+// ---- recovery (called after sign-in, once startup has finished) ----
+function awDraftValidShape(d, uid) {
+  const w = d && d.workout, t = d && d.timer;
+  return !!d && typeof d === 'object' && d.ownerUid === uid && typeof d.workoutId === 'string' &&
+    !!w && typeof w === 'object' && w.id === d.workoutId && Array.isArray(w.exercises) &&
+    w.exercises.every(function (e) { return e && typeof e === 'object' && Array.isArray(e.sets); }) &&
+    ['ordinary', 'legacyActiveProgram', 'legacyProgram', 'canonicalRun'].indexOf(d.kind) !== -1 && d.kind === awDraftKind(w) &&
+    !!t && typeof t.activeWorkoutStart === 'number' && typeof t.workoutPausedTotal === 'number' &&
+    (!t.workoutPaused || typeof t.workoutPausedAt === 'number') &&
+    (d.kind !== 'canonicalRun' || (typeof w.canonicalRun.planRunId === 'string' && typeof w.canonicalRun.occurrenceId === 'string')) &&
+    (d.finishAttempt == null || (d.kind === 'canonicalRun' && d.finishAttempt.pkg && d.finishAttempt.pkg.workoutId === d.workoutId && d.finishAttempt.pkg.ownerUid === uid));
+}
+function awDraftOfferRecovery(uid) {
+  if (!uid || uid !== awDraftAuthUid() || currentWorkout) return;
+  const store = awDraftStore();
+  let raw = null;
+  try { raw = store ? store.getItem(awDraftKey(uid)) : null; } catch (e) { return; }
+  if (!raw) return;
+  let d = null, problem = null;
+  try { d = awDraftDecode(raw); } catch (e) { problem = 'malformed'; }
+  if (!problem) {
+    if (!d || d.schema !== AW_DRAFT_SCHEMA || typeof d.version !== 'number') problem = 'malformed';
+    else if (d.version > AW_DRAFT_VERSION) problem = 'unsupported';
+    else if (d.version !== AW_DRAFT_VERSION || !awDraftValidShape(d, uid)) problem = 'malformed';
+  }
+  awDraftRecovery = { ownerUid: uid, draft: problem ? null : d, problem: problem, busy: false, message: null, canResume: !problem };
+  awDraftRenderRecovery();
+}
+function awDraftSummary(d) {
+  const w = d.workout;
+  const done = w.exercises.reduce(function (a, e) { return a + e.sets.filter(function (s) { return s && s.completed; }).length; }, 0);
+  const when = d.savedAt ? new Date(d.savedAt).toLocaleString() : '';
+  return (w.name || 'Workout') + ' — ' + w.exercises.length + ' exercise' + (w.exercises.length === 1 ? '' : 's') + ', ' + done + ' set' + (done === 1 ? '' : 's') + ' checked' + (when ? ' · saved ' + when : '');
+}
+function awDraftCloseRecovery() {
+  const el = (typeof document !== 'undefined') ? document.getElementById('aw-recovery-overlay') : null;
+  if (el && el.parentNode && typeof el.remove === 'function') el.remove();
+}
+function awDraftRenderRecovery() {
+  awDraftCloseRecovery();
+  const r = awDraftRecovery; if (!r) return;
+  let title, msg, buttons = '';
+  if (r.problem) {
+    title = 'Saved Workout Unreadable';
+    msg = r.problem === 'unsupported'
+      ? 'An unfinished workout was saved by a newer version of IRON LOG, so this version can’t open it. It has been kept on this device.'
+      : 'An unfinished workout was saved on this device, but it couldn’t be read safely. It has been kept on this device.';
+    buttons = '<button class="btn btn-secondary" style="flex:1 1 130px;min-width:0;white-space:normal" data-aw-action="later" data-testid="aw-later-btn">Keep for Later</button>' +
+      '<button class="btn btn-danger" style="flex:1 1 130px;min-width:0;white-space:normal" data-aw-action="discard" data-testid="aw-discard-btn">Discard Draft</button>';
+  } else {
+    title = 'Workout Recovered';
+    msg = 'An unfinished workout was recovered. Would you like to resume it?';
+    if (r.message) msg = r.message;
+    const resume = r.canResume
+      ? '<button class="btn btn-primary" style="flex:1 1 130px;min-width:0;white-space:normal" data-aw-action="' + (r.retry ? 'retry' : 'resume') + '" data-testid="aw-resume-btn" ' + (r.busy ? 'disabled' : '') + '>' + (r.busy ? 'Checking…' : (r.retry ? 'Retry' : 'Resume Workout')) + '</button>'
+      : '<button class="btn btn-secondary" style="flex:1 1 130px;min-width:0;white-space:normal" data-aw-action="later" data-testid="aw-later-btn">Keep for Later</button>';
+    buttons = '<button class="btn btn-danger" style="flex:1 1 130px;min-width:0;white-space:normal" data-aw-action="discard" data-testid="aw-discard-btn" ' + (r.busy ? 'disabled' : '') + '>Discard Draft</button>' + resume;
+  }
+  const el = document.createElement('div');
+  el.id = 'aw-recovery-overlay';
+  el.setAttribute('data-testid', 'aw-recovery');
+  el.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:290;display:flex;align-items:center;justify-content:center;padding:20px';
+  el.innerHTML = '<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;width:100%;max-width:340px">' +
+    '<h3 style="font-family:var(--font-display);font-size:20px;font-weight:800;text-transform:uppercase;margin-bottom:8px">' + escapeHtml(title) + '</h3>' +
+    '<p data-testid="aw-recovery-msg" style="font-size:15px;color:var(--text2);margin-bottom:10px;line-height:1.5">' + escapeHtml(msg) + '</p>' +
+    (r.draft ? '<p data-testid="aw-recovery-summary" style="font-size:13px;color:var(--text3);margin-bottom:18px;line-height:1.4">' + escapeHtml(awDraftSummary(r.draft)) + '</p>' : '') +
+    '<div style="display:flex;flex-wrap:wrap;gap:10px">' + buttons + '</div></div>';
+  el.addEventListener('click', function (ev) {
+    const b = ev.target.closest ? ev.target.closest('[data-aw-action]') : null;
+    if (!b || b.disabled) return;
+    const a = b.getAttribute('data-aw-action');
+    if (a === 'resume' || a === 'retry') awDraftResume();
+    else if (a === 'discard') awDraftDiscardFromRecovery();
+    else if (a === 'later') { awDraftRecovery = null; awDraftCloseRecovery(); }
+  });
+  document.body.appendChild(el);
+}
+function awDraftDiscardFromRecovery() {
+  const r = awDraftRecovery; if (!r) return;
+  confirm2('Discard Draft', 'Discard the recovered workout? Everything entered in it will be lost.', function () {
+    if (awDraftRecovery !== r) return;
+    awDraftClear(r.ownerUid);
+    awDraftRecovery = null; awDraftCloseRecovery();
+    showToast('Recovered workout discarded', '');
+  }, 'Discard');
+}
+function awDraftResume() {
+  const r = awDraftRecovery;
+  if (!r || !r.draft || r.busy || r.ownerUid !== awDraftAuthUid() || currentWorkout) return;
+  const d = r.draft;
+  if (d.kind !== 'canonicalRun') { awDraftRestore(d); return; }
+  // A Finish attempt was still unresolved when the page went away: resume
+  // into that attempt's existing "uncertain" state and let the existing
+  // Check Status reconcile it (never a fresh Finish).
+  if (d.finishAttempt) { awDraftRestore(d); return; }
+  // Otherwise confirm, through the existing launch-mode read, that the Run
+  // is still active and this Session is still open. The draft is never
+  // rebuilt from PLAN or merged.
+  r.busy = true; r.message = 'Checking this Program Run Session…'; awDraftRenderRecovery();
+  const cr = d.workout.canonicalRun;
+  let p;
+  try {
+    p = fsPlanRunPersistence.fsPlanRunReadForDisplay({ ownerUid: r.ownerUid, planRunId: cr.planRunId, occurrenceId: cr.occurrenceId, mode: 'launch' });
+  } catch (e) { p = Promise.reject(e); }
+  Promise.resolve(p).then(function (res) {
+    if (awDraftRecovery !== r || r.ownerUid !== awDraftAuthUid()) return;
+    r.busy = false;
+    if (res && res.outcome === 'verified') { awDraftRestore(d); return; }
+    const saved = appDb.workouts.some(function (w) { return w && w.id === d.workoutId; });
+    r.canResume = false; r.retry = false;
+    r.message = saved
+      ? 'This workout has already been saved to your History, so it can’t be resumed. Nothing more was saved.'
+      : 'This Program Run Session has already been finished or skipped, or its Run has ended or is no longer available, so this workout can’t be resumed. Nothing from it was saved.';
+    awDraftRenderRecovery();
+  }, function () {
+    if (awDraftRecovery !== r || r.ownerUid !== awDraftAuthUid()) return;
+    r.busy = false; r.retry = true; r.canResume = true;
+    r.message = 'We couldn’t check this Program Run Session right now (you may be offline). Your recovered workout is kept — try again.';
+    awDraftRenderRecovery();
+  });
+}
+// Rebuilds the logger from the draft through the normal render path; the
+// timer continues from the stored start/pause values (background time
+// counts unless the workout was paused).
+function awDraftRestore(d) {
+  awDraftRecovery = null; awDraftCloseRecovery();
+  clearAllPRDebounceTimers();
+  if (awDraftTypingTimer) { clearTimeout(awDraftTypingTimer); awDraftTypingTimer = null; }
+  currentWorkout = d.workout;
+  delete currentWorkout._isEdit;
+  recomputeAllSetPRFlags(currentWorkout); // derived state regenerated, not trusted from storage
+  restoreWorkoutTimer(d.timer);
+  if (currentWorkout.canonicalRun && typeof planRunLoggerRestoreFromDraft === 'function') planRunLoggerRestoreFromDraft(d.finishAttempt);
+  document.getElementById('workout-exercises').innerHTML = '';
+  const nameDisplay = document.getElementById('log-session-name-display');
+  if (nameDisplay) nameDisplay.textContent = (currentWorkout.name || (currentWorkout.canonicalRun ? 'WORKOUT' : 'NEW WORKOUT')).toUpperCase();
+  awDraftOwnerUid = d.ownerUid;
+  awDraftLastBody = null;
+  awDraftRecoveredWorkoutId = currentWorkout.id;
+  renderWorkoutExercises();
+  showPage('page-log');
+  if (typeof planRunLoggerFinishRender === 'function') planRunLoggerFinishRender();
+  awDraftSaveNow();
+  showToast('Workout resumed', 'success');
+  if (d.finishAttempt && typeof planRunLoggerFinishCheckStatus === 'function') planRunLoggerFinishCheckStatus();
+}
+
+if (typeof document !== 'undefined' && document.addEventListener) {
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') awDraftSaveNow(); });
+}
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('pagehide', function () { awDraftSaveNow(); });
+}
 function goToActiveWorkout() { showPage('page-log'); }
 
 function onSetChecked(exIdx, si, checked) {
@@ -1598,6 +1957,7 @@ function onSetChecked(exIdx, si, checked) {
       rowEl.style.gridTemplateColumns = rowEl.style.gridTemplateColumns + ' auto';
     }
   }
+  awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: a checkbox is saved at once
 }
 
 // ==================== LOG HEADER MENU ====================
@@ -1744,7 +2104,7 @@ function reorderMove(idx, dir) { const arr = currentWorkout.exercises, n = idx +
 
 // ==================== LOG BODYWEIGHT ====================
 function openLogBWModal() { document.getElementById('bw-modal-unit').textContent = appDb.unit; document.getElementById('bw-modal-input').value = currentWorkout?.bodyweight || ''; openModal('modal-log-bw'); }
-function saveBWFromModal() { const val = parseFloat(document.getElementById('bw-modal-input').value); if (currentWorkout) currentWorkout.bodyweight = val || null; closeModal('modal-log-bw'); showToast('Bodyweight saved', 'success'); }
+function saveBWFromModal() { const val = parseFloat(document.getElementById('bw-modal-input').value); if (currentWorkout) currentWorkout.bodyweight = val || null; awDraftSaveNow(); closeModal('modal-log-bw'); showToast('Bodyweight saved', 'success'); }
 function getWorkoutBW() { if (currentWorkout && currentWorkout.bodyweight) return currentWorkout.bodyweight; for (const w of appDb.workouts) { if (w.bodyweight) return w.bodyweight; } return null; }
 
 // ==================== NOTES MODAL ====================
@@ -1779,8 +2139,8 @@ function renderVideosModalBody() {
     </div>
   </div>`;
 }
-function addPerfVideoFromModal() { const input = document.getElementById('perf-vid-modal-input'); if (!input) return; const url = input.value.trim(); if (!url) { showToast('Paste a link first', 'error'); return; } if (!currentWorkout || videosExIdx === null) return; if (!currentWorkout.exercises[videosExIdx].perfVideos) currentWorkout.exercises[videosExIdx].perfVideos = []; currentWorkout.exercises[videosExIdx].perfVideos.push(url); input.value = ''; renderVideosModalBody(); showToast('Video added', 'success'); }
-function removePerfVideo(viIdx) { if (!currentWorkout || videosExIdx === null) return; currentWorkout.exercises[videosExIdx].perfVideos.splice(viIdx, 1); renderVideosModalBody(); }
+function addPerfVideoFromModal() { const input = document.getElementById('perf-vid-modal-input'); if (!input) return; const url = input.value.trim(); if (!url) { showToast('Paste a link first', 'error'); return; } if (!currentWorkout || videosExIdx === null) return; if (!currentWorkout.exercises[videosExIdx].perfVideos) currentWorkout.exercises[videosExIdx].perfVideos = []; currentWorkout.exercises[videosExIdx].perfVideos.push(url); awDraftSaveNow(); input.value = ''; renderVideosModalBody(); showToast('Video added', 'success'); }
+function removePerfVideo(viIdx) { if (!currentWorkout || videosExIdx === null) return; currentWorkout.exercises[videosExIdx].perfVideos.splice(viIdx, 1); awDraftSaveNow(); renderVideosModalBody(); }
 
 // ==================== CHANGE EXERCISE ====================
 // WORKOUT-FLEXIBILITY CORRECTION ROUND 2 (Finding 1 remediation): decides
@@ -2311,6 +2671,7 @@ function startNewWorkout(programId, microcycleIdx, sessionIdx) {
   // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8): see
   // finalizeStartActiveWorkout's own comment above -- same real gap, same
   // fix, cleared before the replacement just below.
+  if (awDraftBlocksOpeningWorkout()) return;
   clearAllPRDebounceTimers();
   const name = (programId != null) ? getProgramSessionName(programId, microcycleIdx, sessionIdx) : '';
   currentWorkout = { id: uid(), name, date: Date.now(), exercises: [], rpeEnabled: false, duration: 0, bodyweight: null, programId: programId||null, microcycleIdx: microcycleIdx!=null?microcycleIdx:null, sessionIdx: sessionIdx!=null?sessionIdx:null };
@@ -2327,16 +2688,21 @@ function startNewWorkout(programId, microcycleIdx, sessionIdx) {
   document.getElementById('workout-exercises').innerHTML = '';
   const nameDisplay = document.getElementById('log-session-name-display');
   if (nameDisplay) nameDisplay.textContent = (name || 'NEW WORKOUT').toUpperCase();
-  renderWorkoutExercises(); showPage('page-log'); startWorkoutTimer();
+  renderWorkoutExercises(); showPage('page-log'); startWorkoutTimer(); awDraftBeginForCurrentWorkout();
 }
 function getProgramSessionName(progId, mi, si) { const prog = appDb.programs.find(p => p.id === progId); if (!prog) return ''; const sess = prog.microcycles[mi].sessions[si]; return `Week ${mi+1} · ${sess.name || `Day ${si+1}`}`; }
 
 // ==================== RENDER WORKOUT ====================
 function renderWorkoutExercises() {
   const c = document.getElementById('workout-exercises');
-  if (!currentWorkout?.exercises.length) { c.innerHTML = '<div style="text-align:center;padding:30px 0;color:var(--text3);font-size:15px">Add exercises below to begin logging</div>'; return; }
+  if (!currentWorkout?.exercises.length) {
+    c.innerHTML = '<div style="text-align:center;padding:30px 0;color:var(--text3);font-size:15px">Add exercises below to begin logging</div>';
+    if (typeof awDraftSaveNow === 'function') awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY (review finding 2): deleting the last exercise is stored at once
+    return;
+  }
   c.innerHTML = currentWorkout.exercises.map((ex, i) => buildExerciseBlock(ex, i)).join('');
   currentWorkout.exercises.forEach((ex, i) => ex.sets.forEach((s, si) => attachSwipeToSet(i, si)));
+  if (typeof awDraftSaveNow === 'function') awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: structural changes re-render through here
 }
 function buildExerciseBlock(ex, idx) {
   const exData = getExercise(ex.exerciseId); const name = exData ? exData.name : ex.exerciseId;
@@ -2595,6 +2961,7 @@ function updateSet(exIdx, setIdx, field, val) {
   if (!currentWorkout) return;
   const s = currentWorkout.exercises[exIdx].sets[setIdx];
   s[field] = val;
+  awDraftSaveSoon(); // ACTIVE-WORKOUT RECOVERY: typing (short debounce)
   if (field === 'weight') s.autoFilled = false;
   const key = `${exIdx}-${setIdx}`;
   if (prDebounceTimers[key] && prDebounceTimers[key].timer) clearTimeout(prDebounceTimers[key].timer);
@@ -2709,6 +3076,7 @@ function addSet(idx) {
   const container = document.getElementById(`sets-container-${idx}`); const exData = getExercise(currentWorkout.exercises[idx].exerciseId);
   const isTime = exData && (exData.tracking === 'time' || exData.tracking === 'weight_time');
   if (container) { container.innerHTML = buildSetsHTML(currentWorkout.exercises[idx], idx, isTime, currentWorkout.rpeEnabled); currentWorkout.exercises[idx].sets.forEach((s, si) => attachSwipeToSet(idx, si)); } else renderWorkoutExercises();
+  awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: partial re-render path
 }
 function removeSet(exIdx, si) {
   // WORKOUT-FLEXIBILITY CORRECTION: a canonical Run Session's prescribed
@@ -2744,6 +3112,7 @@ function removeSet(exIdx, si) {
   const container = document.getElementById(`sets-container-${exIdx}`); const exData = getExercise(currentWorkout.exercises[exIdx].exerciseId);
   const isTime = exData && (exData.tracking === 'time' || exData.tracking === 'weight_time');
   if (container) { container.innerHTML = buildSetsHTML(currentWorkout.exercises[exIdx], exIdx, isTime, currentWorkout.rpeEnabled); currentWorkout.exercises[exIdx].sets.forEach((s, si) => attachSwipeToSet(exIdx, si)); } else renderWorkoutExercises();
+  awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: partial re-render path
 }
 
 // ==================== PR SET ====================
@@ -2780,6 +3149,7 @@ function addPRSet(idx) {
   const newSi = ex.sets.length - 1;
   const container = document.getElementById(`sets-container-${idx}`); const isTimeEx = exData.tracking === 'time' || exData.tracking === 'weight_time';
   if (container) { container.innerHTML = buildSetsHTML(ex, idx, isTimeEx, currentWorkout.rpeEnabled); ex.sets.forEach((s, si) => attachSwipeToSet(idx, si)); } else renderWorkoutExercises();
+  awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: partial re-render path
   if (targetInfo) setTimeout(() => { const line = document.getElementById(`pr-line-${idx}-${newSi}`); if (line) { line.textContent = targetInfo; line.classList.add('visible'); } }, 50);
 }
 function calcPRWeightReps(targetE1RM, inc, bwOffset) {
@@ -2930,7 +3300,7 @@ function finishWorkout() {
   // applied directly to currentWorkout here too, immediately before it is
   // pushed to storage.
   currentWorkout.exercises.forEach(e => e.sets.forEach(sanitizeSetPRFlags));
-  appDb.workouts.unshift(currentWorkout); fsSaveWorkout(currentWorkout); stopWorkoutTimer(); currentWorkout = null;
+  appDb.workouts.unshift(currentWorkout); fsSaveWorkout(currentWorkout); awDraftClear(); stopWorkoutTimer(); currentWorkout = null; // ACTIVE-WORKOUT RECOVERY: saved -> draft no longer needed
   if (reviewActive && reviewPending) {
     showProgressionReview(reviewActive, reviewPending);
   } else {
@@ -2957,7 +3327,7 @@ function cancelWorkout() {
   // pending debounce timer scheduled against it must be cancelled here too,
   // never left to fire later against whatever workout (if any) is open by
   // then.
-  confirm2('Cancel Workout','Discard this workout? All data will be lost.', () => { clearAllPRDebounceTimers(); stopWorkoutTimer(); currentWorkout = null; showPage('page-home'); }, 'Discard');
+  confirm2('Cancel Workout','Discard this workout? All data will be lost.', () => { if (currentWorkout && !currentWorkout._isEdit) awDraftClear(); clearAllPRDebounceTimers(); stopWorkoutTimer(); currentWorkout = null; showPage('page-home'); }, 'Discard');
 }
 
 // ==================== PROGRESSION V1 — SUGGESTIONS REVIEW (Build 3) ====================
@@ -3711,6 +4081,7 @@ function editHistoricalWorkout(wid) {
   // finalizeStartActiveWorkout's own comment above -- same real gap, same
   // fix, cleared before the replacement just below.
   clearAllPRDebounceTimers();
+  if (awDraftBlocksOpeningWorkout({ historyEdit: true })) return;
   currentWorkout = JSON.parse(JSON.stringify(w)); currentWorkout._isEdit = true;
   const nameDisplay = document.getElementById('log-session-name-display'); if (nameDisplay) nameDisplay.textContent = (w.name || 'WORKOUT').toUpperCase();
   const timerEl = document.getElementById('log-timer-display'); if (timerEl) { timerEl.textContent = w.duration ? fmtDuration(w.duration) : '0:00'; timerEl.style.opacity = '0.5'; timerEl.style.pointerEvents = 'none'; }

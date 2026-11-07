@@ -402,6 +402,9 @@ function planRunLoggerLaunch(run, occurrence) {
   // an ordinary legacy workout or an earlier Run-linked one. Declines
   // honestly (zero state change) instead; the person must explicitly Finish
   // or Cancel whatever is already open first.
+  // ACTIVE-WORKOUT RECOVERY: never open a Session while the recovery
+  // question is unanswered (it would replace the recovered draft).
+  if (typeof awDraftBlocksOpeningWorkout === 'function' && awDraftBlocksOpeningWorkout()) return false;
   if (currentWorkout) {
     showToast('Finish or cancel your current workout before starting a new Session.', 'error');
     return false;
@@ -568,13 +571,19 @@ function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
   renderWorkoutExercises();
   showPage('page-log');
   startWorkoutTimer();
+  if (typeof awDraftBeginForCurrentWorkout === 'function') awDraftBeginForCurrentWorkout(); // ACTIVE-WORKOUT RECOVERY
   if (unitMismatch) showToast('A Progression series value is recorded in a different weight unit than your current setting, so it was not filled in.', 'error');
   return true;
 }
 
 // ---- C. FINISH ---------------------------------------------------------------
-// In-memory only (a reload always starts fresh, matching every other
-// Program Run surface's own posture) -- see this file's own header on why
+// Held in memory. After a page reload it starts empty EXCEPT for one case:
+// the active-workout recovery draft (app-core.js) keeps a still-unresolved
+// 'pending'/'uncertain' Finish attempt, and planRunLoggerRestoreFromDraft
+// restores it as 'uncertain' with the SAME prepared package and operationId
+// when the person resumes, so the existing Check Status / Retry finish it
+// (never a new operation). All other phases start fresh after a reload, as
+// on every other Program Run surface -- see this file's own header on why
 // this state survives ordinary navigation away from #page-log (unlike
 // app-plan-run-start-ui.js's own planRunStartClose, which fully discards
 // its state on navigation) but is fully discarded on a real auth change.
@@ -840,6 +849,9 @@ function planRunLoggerFinishCommit(pkg, result) {
   var resultRefs = result.resultRefs || null;
   planRunLoggerFinishState = null;
   planRunLoggerFinishCurrentOperationId = null;
+  // ACTIVE-WORKOUT RECOVERY: the Finish is confirmed committed -- the only
+  // canonical point at which the local draft is removed.
+  if (typeof awDraftClear === 'function') awDraftClear(pkg.ownerUid);
   stopWorkoutTimer();
   // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): currentWorkout
   // is about to be cleared -- any pending debounce timer was already
@@ -965,6 +977,24 @@ function planRunLoggerFinishAbandon() {
   planRunLoggerFinishState = null;
   planRunLoggerFinishCurrentOperationId = null;
   planRunLoggerFinishRender();
+  if (typeof awDraftSaveNow === 'function') awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: attempt no longer kept
+}
+
+// ACTIVE-WORKOUT RECOVERY: puts a recovered workout's still-unresolved
+// Finish attempt (if any) back exactly as the existing protocol holds it --
+// the SAME prepared package and operationId, in the existing 'uncertain'
+// state, so only the existing Retry / Check Status / Abandon apply (a
+// 'pending' attempt's real outcome is unknown after a reload, which is what
+// 'uncertain' means). Called by app-core.js's awDraftRestore after
+// currentWorkout has been set to the recovered workout.
+function planRunLoggerRestoreFromDraft(finishAttempt) {
+  if (finishAttempt && finishAttempt.pkg && currentWorkout && finishAttempt.pkg.workoutId === currentWorkout.id) {
+    planRunLoggerFinishState = { phase: 'uncertain', pkg: finishAttempt.pkg };
+    planRunLoggerFinishCurrentOperationId = finishAttempt.pkg.operationId;
+  } else {
+    planRunLoggerFinishState = null;
+    planRunLoggerFinishCurrentOperationId = null;
+  }
 }
 
 // Real auth-change boundary (app-core.js's onAuthStateChanged calls this
@@ -1009,6 +1039,9 @@ function planRunLoggerFinishResetForAuthChange() {
 function planRunLoggerFinishSetState(next) {
   planRunLoggerFinishState = next;
   planRunLoggerFinishRender();
+  // ACTIVE-WORKOUT RECOVERY: every Finish state change is stored at once --
+  // a 'pending' attempt's package is in the draft BEFORE it is submitted.
+  if (typeof awDraftSaveNow === 'function') awDraftSaveNow();
 }
 
 // ---- Rendering ----------------------------------------------------------
