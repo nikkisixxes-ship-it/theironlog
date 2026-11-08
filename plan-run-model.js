@@ -115,7 +115,7 @@ function planProgressionSeriesFeatureEnabled() {
 //     nothing) any package that carries a Run-level replacement.
 //   - feature build (true): all of the above enabled.
 // =============================================================================
-var PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED = false;
+var PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED = true;
 function planRecommendedReplacementsFeatureEnabled() {
   return (typeof PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED !== 'undefined') && PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED === true;
 }
