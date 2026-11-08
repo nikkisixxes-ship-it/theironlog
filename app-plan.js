@@ -1785,6 +1785,104 @@ function planNormalizeSetPayload(set, prescriptionId, orderKey, fieldPathPrefix)
   return payload;
 }
 
+// =============================================================================
+// RECOMMENDED REPLACEMENTS -- PLAN rule field `recommendedReplacements`:
+//   { sources: [source...], exerciseIds: [id...] }
+// Each source keeps what the author chose AND its own resolved snapshot
+// (`exerciseIds`), taken when it was added or last explicitly Refreshed:
+//   { kind: 'exercise', exerciseId, exerciseIds: [exerciseId] }
+//   { kind: 'filter', categories: [..sorted], movementStructure, executionStyle,
+//     includeSystem, includeCustom, exerciseIds: [...] }
+//   { kind: 'collection', collectionId, collectionName, exerciseIds: [...] }
+// The top-level `exerciseIds` is always re-derived here: every source's
+// snapshot in order, duplicates removed, the Assignment's own exercise
+// removed. Nothing is ever re-resolved silently -- only the explicit Refresh
+// action (planCanonicalEditorHandleRefreshRecommended) re-reads exercise
+// metadata or Collections, and only into the editor, so a saved revision and
+// every Run started from it keep their snapshot. Suggestions only: nothing
+// here ever replaces an exercise automatically.
+// =============================================================================
+var PLAN_REC_FILTER_KEYS = ['kind', 'categories', 'movementStructure', 'executionStyle', 'includeSystem', 'includeCustom', 'exerciseIds'];
+function planRecIsId(v) { return typeof v === 'string' && v.length > 0 && v.length <= 200 && v.indexOf('/') === -1; }
+function planRecDedupe(ids) {
+  var seen = {}, out = [];
+  ids.forEach(function (id) { if (!Object.prototype.hasOwnProperty.call(seen, id)) { seen[id] = true; out.push(id); } });
+  return out;
+}
+function planRecCombine(sources, prescribedExerciseId) {
+  var all = [];
+  sources.forEach(function (src) { all = all.concat(src.exerciseIds); });
+  return planRecDedupe(all).filter(function (id) { return id !== prescribedExerciseId; });
+}
+function planNormalizeRecommendedReplacements(rec, prescribedExerciseId, fieldPath) {
+  if (rec === undefined || rec === null) return undefined;
+  function bad(msg) { throw new PlanCanonicalNormalizationError('planNormalizeRecommendedReplacements: ' + msg + ' at ' + fieldPath, { fieldPath: fieldPath }); }
+  if (typeof rec !== 'object' || !Array.isArray(rec.sources)) bad('malformed');
+  if (rec.sources.length === 0) return undefined;
+  var sources = rec.sources.map(function (src, i) {
+    if (!src || typeof src !== 'object' || !Array.isArray(src.exerciseIds) || !src.exerciseIds.every(planRecIsId)) bad('malformed source ' + i);
+    var ids = planRecDedupe(src.exerciseIds);
+    if (src.kind === 'exercise') {
+      if (!planRecIsId(src.exerciseId)) bad('malformed exercise source ' + i);
+      return { kind: 'exercise', exerciseId: src.exerciseId, exerciseIds: [src.exerciseId] };
+    }
+    if (src.kind === 'filter') {
+      var cats = Array.isArray(src.categories) ? src.categories.slice() : bad('malformed filter ' + i);
+      if (!cats.every(function (c) { return typeof c === 'string' && c.length > 0; })) bad('malformed filter categories ' + i);
+      cats = planRecDedupe(cats).sort();
+      return { kind: 'filter', categories: cats, movementStructure: typeof src.movementStructure === 'string' ? src.movementStructure : '',
+        executionStyle: typeof src.executionStyle === 'string' ? src.executionStyle : '', includeSystem: src.includeSystem !== false,
+        includeCustom: src.includeCustom !== false, exerciseIds: ids };
+    }
+    if (src.kind === 'collection') {
+      if (!planRecIsId(src.collectionId)) bad('malformed collection source ' + i);
+      return { kind: 'collection', collectionId: src.collectionId, collectionName: typeof src.collectionName === 'string' ? src.collectionName : '', exerciseIds: ids };
+    }
+    return bad('unknown source kind ' + i);
+  });
+  return { sources: sources, exerciseIds: planRecCombine(sources, prescribedExerciseId) };
+}
+// Pure resolution of one source against the CURRENT exercise library and
+// Collections (`lib`: { exercises, collections, categoriesOf, movementOf,
+// executionOf }). Deterministic: filter results are ordered by name (plain
+// code-unit comparison, never locale-dependent), then id; Collection members
+// keep the Collection's own stored order. A Collection that no longer exists
+// resolves to nothing (and is reported missing by the editor); Collection
+// members that no longer exist are kept, so they show as unavailable rather
+// than silently disappearing or being swapped for something else.
+var PLAN_REC_HIDDEN_CATEGORIES = ['Cardio', 'Full Body', 'Other'];
+function planRecResolveSource(src, lib) {
+  if (src.kind === 'exercise') return [src.exerciseId];
+  if (src.kind === 'collection') {
+    var c = (lib.collections || []).filter(function (x) { return x && x.id === src.collectionId; })[0];
+    return c && Array.isArray(c.memberIds) ? planRecDedupe(c.memberIds.filter(planRecIsId)) : [];
+  }
+  if (src.kind === 'filter') {
+    var pool = (lib.exercises || []).filter(function (ex) {
+      if (!ex || !planRecIsId(ex.id)) return false;
+      if (ex.custom ? !src.includeCustom : !src.includeSystem) return false;
+      var cats = lib.categoriesOf(ex);
+      if (cats.every(function (c) { return PLAN_REC_HIDDEN_CATEGORIES.indexOf(c) !== -1; })) return false;
+      if (src.categories.length && !src.categories.some(function (c) { return cats.indexOf(c) !== -1; })) return false;
+      if (src.movementStructure && lib.movementOf(ex).indexOf(src.movementStructure) === -1) return false;
+      if (src.executionStyle && lib.executionOf(ex).indexOf(src.executionStyle) === -1) return false;
+      return true;
+    });
+    pool.sort(function (a, b) { var an = String(a.name || ''), bn = String(b.name || ''); return an < bn ? -1 : an > bn ? 1 : (a.id < b.id ? -1 : a.id > b.id ? 1 : 0); });
+    return planRecDedupe(pool.map(function (ex) { return ex.id; }));
+  }
+  return [];
+}
+function planRecLibraryFromApp() {
+  return {
+    exercises: (typeof getAllExercises === 'function') ? getAllExercises() : [],
+    collections: (typeof appDb !== 'undefined' && appDb && Array.isArray(appDb.exerciseCollections)) ? appDb.exerciseCollections : [],
+    categoriesOf: function (ex) { return typeof getExCategories === 'function' ? getExCategories(ex) : []; },
+    movementOf: function (ex) { return typeof getExMovementStructure === 'function' ? getExMovementStructure(ex) : []; },
+    executionOf: function (ex) { return typeof getExExecutionStyle === 'function' ? getExExecutionStyle(ex) : []; }
+  };
+}
+
 function planNormalizeCanonicalGraph(draft) {
   if (!draft || typeof draft !== 'object') {
     throw new Error('planNormalizeCanonicalGraph: draft must be an object');
@@ -1958,7 +2056,10 @@ function planNormalizeCanonicalGraph(draft) {
             // PROGRESSION SERIES FOUNDATION: optional, explicit series link
             // (omitted entirely when absent -- planStripUndefined).
             progressionSeriesId: planNormalizeAbsent(prog.progressionSeriesId),
-            progressionSeriesName: planNormalizeAbsent(prog.progressionSeriesName)
+            progressionSeriesName: planNormalizeAbsent(prog.progressionSeriesName),
+            // RECOMMENDED REPLACEMENTS: optional (omitted when the author
+            // defined none, so older Programs hash byte-identically).
+            recommendedReplacements: planNormalizeRecommendedReplacements(prog.recommendedReplacements, ex.exerciseId, fieldPathBase + '.progression.recommendedReplacements')
           }, []); // Rule carries assignmentId as a back-reference only; Assignment depends on Rule, not vice versa.
         }
       }
@@ -6453,7 +6554,10 @@ var PLAN_READER_SEMANTIC_FIELDS = Object.freeze({
   // exactly as before; present only on a Rule its author explicitly linked
   // into a Progression series. Recognised by BOTH builds so a series-linked
   // Program always reads (and round-trips) intact.
-  planRuleRevision: Object.freeze(['templateId', 'assignmentId', 'ruleId', 'enabled', 'evaluationType', 'gatewaySetIndex', 'adjustmentType', 'loadIncrease', 'tmIncrease', 'failBehavior', 'authority', 'scope', 'effectiveBoundary', 'requiredTracks', 'inputContract', 'outputContract', 'progressionSeriesId', 'progressionSeriesName']),
+  // RECOMMENDED REPLACEMENTS: one more OPTIONAL trailing field,
+  // `recommendedReplacements` -- absent on every Rule saved without
+  // recommendations (those extract and re-hash exactly as before).
+  planRuleRevision: Object.freeze(['templateId', 'assignmentId', 'ruleId', 'enabled', 'evaluationType', 'gatewaySetIndex', 'adjustmentType', 'loadIncrease', 'tmIncrease', 'failBehavior', 'authority', 'scope', 'effectiveBoundary', 'requiredTracks', 'inputContract', 'outputContract', 'progressionSeriesId', 'progressionSeriesName', 'recommendedReplacements']),
   planImplementationRelationshipRevision: Object.freeze(['templateId', 'assignmentId', 'relationshipId', 'exerciseId', 'eligibilityMode', 'sourceRevisionSemantics', 'constraints', 'resolver', 'resolutionTiming', 'permittedBindingScope', 'acceptancePolicy', 'lifecycleInterval'])
 });
 
@@ -8453,7 +8557,10 @@ function planBuildCanonicalTemplateEditSession(input) {
                   // PROGRESSION SERIES FOUNDATION: carried through unchanged
                   // (absent -> undefined -> omitted again on re-normalize).
                   progressionSeriesId: (progressionRule && progressionRule.progressionSeriesId) || undefined,
-                  progressionSeriesName: (progressionRule && progressionRule.progressionSeriesName) || undefined
+                  progressionSeriesName: (progressionRule && progressionRule.progressionSeriesName) || undefined,
+                  // RECOMMENDED REPLACEMENTS: carried through as saved
+                  // (never re-resolved on reopen).
+                  recommendedReplacements: (progressionRule && progressionRule.recommendedReplacements) ? planDeepClonePlain(progressionRule.recommendedReplacements) : undefined
                 }
               };
             })
@@ -8954,6 +9061,8 @@ function planCanonicalAdaptProgressionField(prog) {
   // exactly; it is never created here.
   if (typeof prog.progressionSeriesId === 'string' && prog.progressionSeriesId) out.progressionSeriesId = prog.progressionSeriesId;
   if (typeof prog.progressionSeriesName === 'string' && prog.progressionSeriesName) out.progressionSeriesName = prog.progressionSeriesName;
+  // RECOMMENDED REPLACEMENTS: preserved exactly; never created here.
+  if (prog.recommendedReplacements && typeof prog.recommendedReplacements === 'object') out.recommendedReplacements = planDeepClonePlain(prog.recommendedReplacements);
   return out;
 }
 
@@ -10262,11 +10371,21 @@ function planCanonicalEditorHandleEnableProgression(mi, si, ei) {
   planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
   planCanonicalEditorRender();
 }
-function planCanonicalEditorHandleDisableProgression(mi, si, ei) {
+function planCanonicalEditorHandleDisableProgression(mi, si, ei, opts) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleDisableProgression')) return;
   var ex = planCanonicalEditorState.editorState.microcycles[mi].sessions[si].exercises[ei];
   planCanonicalAdapterRequire(ex, 'planCanonicalEditorHandleDisableProgression: no such exercise at [' + mi + '][' + si + '][' + ei + ']');
-  if (ex.progression) ex.progression.enabled = false;
+  // RECOMMENDED REPLACEMENTS: turning Progression off removes this entry's
+  // authored recommendations, so it needs an explicit confirmation first
+  // (both builds). Nothing changes until the person confirms.
+  var recSources = ex.progression && ex.progression.recommendedReplacements && Array.isArray(ex.progression.recommendedReplacements.sources) ? ex.progression.recommendedReplacements.sources.length : 0;
+  if (recSources > 0 && !(opts && opts.confirmed === true)) {
+    planCanonicalEditorState.pendingProgressionDisable = { mi: mi, si: si, ei: ei };
+    planCanonicalEditorRender();
+    return { status: 'needsConfirmation' };
+  }
+  planCanonicalEditorState.pendingProgressionDisable = null;
+  if (ex.progression) { ex.progression.enabled = false; delete ex.progression.recommendedReplacements; }
   // [Final correction, Finding 1] A disabled Rule is no longer an active
   // canonical graph node (planNormalizeCanonicalGraph's own ruleActive
   // gate), so planCanonicalEditorCollectLiveIds (corrected alongside this
@@ -11161,6 +11280,119 @@ function planCanonicalEditorValidateProgressionSeries(es) {
     }
   }
   return null;
+}
+
+// =============================================================================
+// RECOMMENDED REPLACEMENTS -- editor actions (feature build only; the
+// compatibility build shows a read-only summary and preserves the field).
+// Every action changes only the editor state; a save creates a new revision.
+// =============================================================================
+function planRecommendedReplacementsUiEnabled() {
+  return typeof planRecommendedReplacementsFeatureEnabled === 'function' && planRecommendedReplacementsFeatureEnabled();
+}
+function planCanonicalEditorRecGuard(callerName, mi, si, ei) {
+  if (!planCanonicalEditorGuardMutable(callerName)) return null;
+  var st = planCanonicalEditorState;
+  if (!planRecommendedReplacementsUiEnabled()) {
+    st.validationMessage = 'Recommended Replacements need the newer version of the app.';
+    planCanonicalEditorRender();
+    return null;
+  }
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  if (!ex.progression || !ex.progression.enabled) {
+    st.validationMessage = 'Turn on Progression for this exercise first.';
+    planCanonicalEditorRender();
+    return null;
+  }
+  if (!ex.progression.recommendedReplacements) ex.progression.recommendedReplacements = { sources: [], exerciseIds: [] };
+  return ex;
+}
+function planCanonicalEditorRecRecombine(ex, lib) {
+  var rec = ex.progression.recommendedReplacements;
+  rec.exerciseIds = planRecCombine(rec.sources, ex.exerciseId);
+}
+function planCanonicalEditorRecAddSource(callerName, mi, si, ei, src, lib) {
+  var ex = planCanonicalEditorRecGuard(callerName, mi, si, ei);
+  if (!ex) return { status: 'blocked' };
+  lib = lib || planRecLibraryFromApp();
+  src.exerciseIds = planRecResolveSource(src, lib);
+  ex.progression.recommendedReplacements.sources.push(src);
+  planCanonicalEditorRecRecombine(ex, lib);
+  planCanonicalEditorState.validationMessage = null;
+  planCanonicalEditorRender();
+  return { status: 'added', count: src.exerciseIds.length };
+}
+function planCanonicalEditorHandleAddRecommendedExercise(mi, si, ei, exerciseId, lib) {
+  if (!planRecIsId(exerciseId)) return { status: 'blocked' };
+  return planCanonicalEditorRecAddSource('planCanonicalEditorHandleAddRecommendedExercise', mi, si, ei, { kind: 'exercise', exerciseId: exerciseId }, lib);
+}
+function planCanonicalEditorHandleAddRecommendedFilter(mi, si, ei, filter, lib) {
+  var f = filter || {};
+  var cats = Array.isArray(f.categories) ? f.categories.filter(function (c) { return typeof c === 'string' && c; }) : [];
+  return planCanonicalEditorRecAddSource('planCanonicalEditorHandleAddRecommendedFilter', mi, si, ei, {
+    kind: 'filter', categories: planRecDedupe(cats).sort(), movementStructure: f.movementStructure || '', executionStyle: f.executionStyle || '',
+    includeSystem: f.includeSystem !== false, includeCustom: f.includeCustom !== false
+  }, lib);
+}
+function planCanonicalEditorHandleAddRecommendedCollection(mi, si, ei, collectionId, lib) {
+  lib = lib || planRecLibraryFromApp();
+  var c = (lib.collections || []).filter(function (x) { return x && x.id === collectionId; })[0];
+  if (!c) { planCanonicalEditorState.validationMessage = 'That Collection no longer exists.'; planCanonicalEditorRender(); return { status: 'blocked', reason: 'noSuchCollection' }; }
+  return planCanonicalEditorRecAddSource('planCanonicalEditorHandleAddRecommendedCollection', mi, si, ei, { kind: 'collection', collectionId: c.id, collectionName: c.name || '' }, lib);
+}
+function planCanonicalEditorHandleRemoveRecommendedSource(mi, si, ei, sourceIndex) {
+  var ex = planCanonicalEditorRecGuard('planCanonicalEditorHandleRemoveRecommendedSource', mi, si, ei);
+  if (!ex) return { status: 'blocked' };
+  var rec = ex.progression.recommendedReplacements;
+  if (!rec.sources[sourceIndex]) return { status: 'blocked' };
+  rec.sources.splice(sourceIndex, 1);
+  if (!rec.sources.length) delete ex.progression.recommendedReplacements;
+  else planCanonicalEditorRecRecombine(ex);
+  planCanonicalEditorRender();
+  return { status: 'removed' };
+}
+// Explicit Refresh: re-resolve every source against the CURRENT library and
+// Collections. Changes the editor only; saving makes a new revision.
+function planCanonicalEditorHandleRefreshRecommended(mi, si, ei, lib) {
+  var ex = planCanonicalEditorRecGuard('planCanonicalEditorHandleRefreshRecommended', mi, si, ei);
+  if (!ex) return { status: 'blocked' };
+  lib = lib || planRecLibraryFromApp();
+  var rec = ex.progression.recommendedReplacements;
+  var before = JSON.stringify(rec.exerciseIds);
+  rec.sources.forEach(function (src) {
+    if (src.kind === 'collection') {
+      var c = (lib.collections || []).filter(function (x) { return x && x.id === src.collectionId; })[0];
+      if (c) src.collectionName = c.name || '';   // a deleted Collection keeps its last known name and resolves to nothing
+    }
+    src.exerciseIds = planRecResolveSource(src, lib);
+  });
+  if (!rec.sources.length) { delete ex.progression.recommendedReplacements; planCanonicalEditorRender(); return { status: 'refreshed', changed: false }; }
+  planCanonicalEditorRecRecombine(ex, lib);
+  planCanonicalEditorState.validationMessage = null;
+  planCanonicalEditorRender();
+  return { status: 'refreshed', changed: JSON.stringify(rec.exerciseIds) !== before };
+}
+function planCanonicalEditorHandleCancelDisableProgression() {
+  planCanonicalEditorState.pendingProgressionDisable = null;
+  planCanonicalEditorRender();
+}
+// Inline Add-Filter form state (editor-only, never saved).
+function planCanonicalEditorRecFilterDraft(mi, si, ei) {
+  var st = planCanonicalEditorState;
+  var key = mi + ':' + si + ':' + ei;
+  if (!st._recFilterDraft || st._recFilterDraft.key !== key) st._recFilterDraft = { key: key, category: '', movementStructure: '', executionStyle: '' };
+  return st._recFilterDraft;
+}
+function planCanonicalEditorHandleRecFilterField(mi, si, ei, field, value) {
+  planCanonicalEditorRecFilterDraft(mi, si, ei)[field] = value || '';
+}
+function planCanonicalEditorHandleRecFilterAdd(mi, si, ei) {
+  var d = planCanonicalEditorRecFilterDraft(mi, si, ei);
+  return planCanonicalEditorHandleAddRecommendedFilter(mi, si, ei, { categories: d.category ? [d.category] : [], movementStructure: d.movementStructure, executionStyle: d.executionStyle });
+}
+function planCanonicalEditorHandleRecPickExercise(mi, si, ei) {
+  if (typeof openExBrowser !== 'function') return;
+  openExBrowser('exactSelect', function (exId) { planCanonicalEditorHandleAddRecommendedExercise(mi, si, ei, exId); if (typeof closeModal === 'function') closeModal('modal-ex-browser'); }, 'plan');
 }
 
 // ---- Removal controls (requirement 1: "Add removal controls for sets,
@@ -12545,8 +12777,63 @@ function planCanonicalEditorRender() {
         '<option value="repeat" ' + (prog.failBehavior === 'repeat' ? 'selected' : '') + '>Repeat Prescription</option>' +
         '</select></label>' +
       progressionSeriesHtml(mi, si, ei, ex) +
+      recommendedReplacementsHtml(mi, si, ei, ex) +
+      (st.pendingProgressionDisable && st.pendingProgressionDisable.mi === mi && st.pendingProgressionDisable.si === si && st.pendingProgressionDisable.ei === ei
+        ? '<div data-testid="progression-disable-confirm"' + idx + ' style="margin:6px 0;padding:8px;border:1px solid #b60;border-radius:6px;font-size:12px">Turning Progression off also removes this exercise’s Recommended Replacements. Remove them?' +
+          '<div style="margin-top:6px;display:flex;gap:6px"><button type="button" class="btn btn-danger btn-sm" data-testid="progression-disable-confirm-btn"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ',{confirmed:true})">Turn off and remove</button>' +
+          '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-disable-keep-btn"' + idx + ' onclick="planCanonicalEditorHandleCancelDisableProgression()">Keep</button></div></div>'
+        : '') +
       '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-disable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ')">Disable Progression</button>' +
       '</div>';
+  }
+
+  // RECOMMENDED REPLACEMENTS -- compact panel inside the Progression panel.
+  function recommendedReplacementsHtml(mi, si, ei, ex) {
+    var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
+    var rec = ex.progression.recommendedReplacements;
+    var ids = rec && Array.isArray(rec.exerciseIds) ? rec.exerciseIds : [];
+    var sources = rec && Array.isArray(rec.sources) ? rec.sources : [];
+    var exName = function (id) { var e = (typeof getExercise === 'function') ? getExercise(id) : null; return e ? e.name : null; };
+    var collExists = function (cid) { return typeof appDb !== 'undefined' && appDb && Array.isArray(appDb.exerciseCollections) && appDb.exerciseCollections.some(function (c) { return c && c.id === cid; }); };
+    var srcLabel = function (src) {
+      if (src.kind === 'exercise') return exName(src.exerciseId) ? 'Exercise: ' + exName(src.exerciseId) : 'Exercise: unavailable (no longer exists)';
+      if (src.kind === 'collection') return 'Collection: ' + (src.collectionName || 'Untitled') + (collExists(src.collectionId) ? '' : ' (no longer exists)') + ' — ' + src.exerciseIds.length;
+      var parts = [src.categories.length ? src.categories.join(', ') : 'Any category'];
+      if (src.movementStructure) parts.push(src.movementStructure);
+      if (src.executionStyle) parts.push(src.executionStyle);
+      return 'Filter: ' + parts.join(' · ') + ' — ' + src.exerciseIds.length;
+    };
+    var missing = ids.filter(function (id) { return !exName(id); }).length;
+    var listHtml = ids.length
+      ? '<div data-testid="rec-resolved-list" style="font-size:11px;color:var(--text2);margin:4px 0">' + ids.map(function (id) { return exName(id) ? escapeHtml(exName(id)) : '<span style="color:#b00">Unavailable exercise</span>'; }).join(', ') + '</div>'
+      : '';
+    var wrap = function (inner) { return '<div class="plan-canonical-editor-recommended" data-testid="rec-panel"' + idx + ' style="margin:8px 0;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px">' + inner + '</div>'; };
+    var header = '<div style="font-size:12px;font-weight:600" data-testid="rec-count">Recommended Replacements: ' + ids.length + '</div>' +
+      (missing ? '<div data-testid="rec-missing-warning" style="font-size:11px;color:#b00">' + missing + ' recommended exercise' + (missing === 1 ? '' : 's') + ' no longer exist' + (missing === 1 ? 's' : '') + ' and will show as unavailable.</div>' : '');
+    if (!planRecommendedReplacementsUiEnabled()) {
+      return ids.length || sources.length ? wrap(header + listHtml + '<div style="font-size:11px;color:var(--text3)">Editing Recommended Replacements needs the newer version of the app.</div>') : '';
+    }
+    var sourcesHtml = sources.map(function (src, k) {
+      return '<div data-testid="rec-source"' + idx + ' style="font-size:11px;display:flex;gap:6px;align-items:center;margin:2px 0"><span style="flex:1">' + escapeHtml(srcLabel(src)) + '</span>' +
+        '<button type="button" class="btn btn-ghost btn-sm" data-testid="rec-source-remove"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveRecommendedSource(' + mi + ',' + si + ',' + ei + ',' + k + ')">Remove</button></div>';
+    }).join('');
+    var fd = planCanonicalEditorRecFilterDraft(mi, si, ei);
+    var cats = (typeof LIBRARY_CATEGORIES !== 'undefined') ? LIBRARY_CATEGORIES : [];
+    var opt = function (v, label, cur) { return '<option value="' + escapeHtml(v) + '" ' + (cur === v ? 'selected' : '') + '>' + escapeHtml(label) + '</option>'; };
+    var colls = (typeof appDb !== 'undefined' && appDb && Array.isArray(appDb.exerciseCollections)) ? appDb.exerciseCollections : [];
+    var filterForm = '<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:4px;font-size:11px">' +
+      '<select data-testid="rec-filter-category"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'category\',this.value)">' + opt('', 'Any category', fd.category) + cats.map(function (c) { return opt(c, c, fd.category); }).join('') + '</select>' +
+      '<select data-testid="rec-filter-movement"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'movementStructure\',this.value)">' + opt('', 'Any movement', fd.movementStructure) + opt('Compound', 'Compound', fd.movementStructure) + opt('Isolation', 'Isolation', fd.movementStructure) + '</select>' +
+      '<select data-testid="rec-filter-execution"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'executionStyle\',this.value)">' + opt('', 'Any style', fd.executionStyle) + opt('Bilateral', 'Bilateral', fd.executionStyle) + opt('Unilateral', 'Unilateral', fd.executionStyle) + '</select>' +
+      '<button type="button" class="btn btn-secondary btn-sm" data-testid="rec-add-filter"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRecFilterAdd(' + mi + ',' + si + ',' + ei + ')">Add filter</button></div>';
+    var collForm = colls.length ? '<select style="margin-top:4px;font-size:11px" data-testid="rec-add-collection"' + idx + ' ' + lockedAttr + ' onchange="if(this.value)planCanonicalEditorHandleAddRecommendedCollection(' + mi + ',' + si + ',' + ei + ',this.value)"><option value="">Add a Collection…</option>' + colls.map(function (c) { return '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.name || 'Untitled') + '</option>'; }).join('') + '</select>' : '';
+    return wrap(header +
+      '<div style="font-size:11px;color:var(--text3)">Suggestions shown first when you Change Exercise during a workout. Nothing is ever replaced automatically. Filters and Collections are saved as a fixed list; use Refresh to update it.</div>' +
+      sourcesHtml + listHtml +
+      '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">' +
+      '<button type="button" class="btn btn-secondary btn-sm" data-testid="rec-add-exercise"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRecPickExercise(' + mi + ',' + si + ',' + ei + ')">Add exercise</button>' +
+      (sources.length ? '<button type="button" class="btn btn-ghost btn-sm" data-testid="rec-refresh"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRefreshRecommended(' + mi + ',' + si + ',' + ei + ')">Refresh</button>' : '') +
+      '</div>' + filterForm + collForm);
   }
 
   // PROGRESSION SERIES FOUNDATION -- the explicit series panel. Hidden in the

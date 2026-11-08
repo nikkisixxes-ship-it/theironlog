@@ -26,6 +26,10 @@ let libContext = null;         // 'library' | 'logger' | 'plan' -- tracks which 
 let libBrowseTarget = 'exercises'; // 'exercises' | 'collections'
 let libCollectionDrill = null;     // null | { collectionId } -- focused single-Collection member view (TRAIN/PLAN and Library browser)
 let libShowAllIndividually = false; // Exercises-mode only; when true, fully suspends consolidation collapsing on the default list (Stage 3A)
+// RECOMMENDED REPLACEMENTS: for one Change Exercise open only -- the Run's
+// recommended exercises for that row, shown first as individual exercises
+// (never auto-selected), above the ordinary list. null for every other open.
+let libRecommendedIds = null;
 
 // Active browser root element.
 // Stores the mounted shell so all scoped queries search within it,
@@ -69,9 +73,10 @@ let libState = {
 // context identifies which part of the app is opening the browser:
 // 'library' | 'logger' | 'plan'. Filters reset whenever context changes
 // from the previous open. Sort is the only setting that persists globally.
-function openExBrowser(purpose, onSelectCallback, context) {
+function openExBrowser(purpose, onSelectCallback, context, opts) {
   libPurpose  = purpose || 'browse';
   libOnSelect = onSelectCallback || null;
+  libRecommendedIds = (opts && Array.isArray(opts.recommendedIds) && opts.recommendedIds.length) ? opts.recommendedIds.slice() : null;
 
   const resolvedContext = context || (libPurpose === 'browse' ? 'library' : 'select');
 
@@ -415,8 +420,9 @@ function renderExerciseList() {
   if (!listEl) return;
 
   const rows = libVisibleExerciseProjection();
+  const recHtml = libRecommendedSectionHtml();
 
-  if (!rows.length) {
+  if (!rows.length && !recHtml) {
     const searchEl = _libRoot().querySelector('#lib-search');
     const hasSearch = searchEl && searchEl.value.trim().length > 0;
     listEl.innerHTML = `
@@ -427,7 +433,27 @@ function renderExerciseList() {
     return;
   }
 
-  listEl.innerHTML = rows.map(r => buildExerciseRow(r.ex, r.variantsCount > 0 ? { count: r.variantsCount, collectionId: r.collectionId } : null)).join('');
+  listEl.innerHTML = recHtml +
+    (recHtml ? '<div class="lib-section-label" data-testid="lib-all-exercises-label" style="font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--text3);padding:12px 4px 4px">All Exercises</div>' : '') +
+    rows.map(r => buildExerciseRow(r.ex, r.variantsCount > 0 ? { count: r.variantsCount, collectionId: r.collectionId } : null)).join('');
+}
+
+// RECOMMENDED REPLACEMENTS: the recommended block (search narrows it too).
+// A recommended exercise that no longer exists is shown as unavailable and
+// cannot be chosen -- nothing else is ever substituted for it.
+function libRecommendedSectionHtml() {
+  if (!libRecommendedIds || libPurpose === 'browse') return '';
+  const searchEl = _libRoot().querySelector('#lib-search');
+  const q = searchEl ? searchEl.value.trim().toLowerCase() : '';
+  const items = libRecommendedIds.map(id => ({ id, ex: getExercise(id) }))
+    .filter(r => !q || (r.ex && r.ex.name.toLowerCase().includes(q)));
+  if (!items.length) return '';
+  return '<div data-testid="lib-recommended-section">' +
+    '<div class="lib-section-label" style="font-size:11px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:var(--text3);padding:8px 4px 4px">Recommended Replacements</div>' +
+    items.map(r => r.ex
+      ? buildExerciseRow(r.ex, null).replace('class="ex-row', 'data-testid="lib-recommended-row" data-ex-id="' + escapeHtml(r.id) + '" class="ex-row')
+      : '<div class="ex-row" data-testid="lib-recommended-missing" style="opacity:0.55;cursor:default"><div class="ex-row-main"><div class="ex-row-name">Unavailable exercise</div><div class="ex-row-badges" style="font-size:11px">This recommended exercise no longer exists.</div></div></div>'
+    ).join('') + '</div>';
 }
 
 // -- Single Exercise Row Template --
@@ -592,7 +618,20 @@ function openAddExerciseModal() {
 
 function openChangeExModal(exIdx) {
   changeExTargetIdx = exIdx;
-  openExBrowser('exactSelect', exId => confirmChangeExercise(exId), 'logger');
+  openExBrowser('exactSelect', exId => confirmChangeExercise(exId), 'logger', { recommendedIds: libChangeExRecommendedIds(exIdx) });
+}
+// RECOMMENDED REPLACEMENTS: the Run's frozen recommendations for this row's
+// Assignment (feature build, canonical Run Session, bound row only), without
+// the exercise the row has now.
+function libChangeExRecommendedIds(exIdx) {
+  if (typeof planRecommendedReplacementsFeatureEnabled !== 'function' || !planRecommendedReplacementsFeatureEnabled()) return null;
+  const cr = currentWorkout && currentWorkout.canonicalRun;
+  const ex = currentWorkout && currentWorkout.exercises[exIdx];
+  if (!cr || !ex || ex.origin === 'added' || !cr.recommendedByAssignmentId) return null;
+  const ids = cr.recommendedByAssignmentId[ex.planAssignmentId];
+  if (!Array.isArray(ids)) return null;
+  const seen = {};
+  return ids.filter(id => { if (id === ex.exerciseId || seen[id]) return false; seen[id] = true; return true; });
 }
 
 function renderSessionPicker() {

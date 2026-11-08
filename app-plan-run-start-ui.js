@@ -300,6 +300,10 @@ function planRunStartBuildPackage(profile, planRunId, operationId, progressionIn
           };
           // PROGRESSION SERIES FOUNDATION: snapshot the explicit series link.
           if (r.enabled === true && typeof r.progressionSeriesId === 'string' && r.progressionSeriesId) entry.progressionSeriesId = r.progressionSeriesId;
+          // RECOMMENDED REPLACEMENTS: freeze the saved revision's resolved
+          // recommendation list into this Run (never re-resolved later).
+          var recIds = (r.enabled === true && r.recommendedReplacements && Array.isArray(r.recommendedReplacements.exerciseIds)) ? r.recommendedReplacements.exerciseIds.filter(function (id) { return id !== a.exerciseId; }) : [];
+          if (recIds.length) entry.recommendedExerciseIds = recIds.slice();
           return entry;
         });
         return {

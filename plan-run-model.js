@@ -100,6 +100,26 @@ function planProgressionSeriesFeatureEnabled() {
   return (typeof PLAN_PROGRESSION_SERIES_FEATURE_ENABLED !== 'undefined') && PLAN_PROGRESSION_SERIES_FEATURE_ENABLED === true;
 }
 
+// =============================================================================
+// RECOMMENDED REPLACEMENTS -- build switch (the ONLY difference between the
+// compatibility build and the feature build of this round).
+//   - BOTH builds read, validate, snapshot and preserve every new field:
+//     the PLAN rule's `recommendedReplacements`, a Session rule entry's
+//     `recommendedExerciseIds`, a series state's `activeExerciseId` /
+//     `replacementHistory`, a Finish receipt's `replacedRuleIds`, and the
+//     workout row origin 'runReplacement'. Both builds open and finish a
+//     Session whose series was already replaced.
+//   - compatibility build (false): no Recommended Replacements editor in PLAN
+//     (read-only count instead), no recommended-first list and no "Replace
+//     for this active Run" choice in TRAIN, and Finish refuses (writes
+//     nothing) any package that carries a Run-level replacement.
+//   - feature build (true): all of the above enabled.
+// =============================================================================
+var PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED = false;
+function planRecommendedReplacementsFeatureEnabled() {
+  return (typeof PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED !== 'undefined') && PLAN_RECOMMENDED_REPLACEMENTS_FEATURE_ENABLED === true;
+}
+
 // One `planProgramRunSeriesState` document per (Run, series). Membership is
 // stored as three FLAT maps keyed by occurrenceId -- `memberAssignmentIds`,
 // `memberRuleIds`, `memberRuleRevisionIds` (each occurrenceId -> one id
@@ -255,7 +275,13 @@ var PLAN_RUN_WORKOUT_KEYS = Object.freeze([
 // reproduces every existing document's own real meaning unchanged.
 var PLAN_RUN_WORKOUT_EXERCISE_KEYS = Object.freeze(['exerciseId', 'planAssignmentId', 'planPrescriptionId', 'origin', 'sets', 'perfVideos']);
 var PLAN_RUN_WORKOUT_EXERCISE_KEYS_LEGACY = Object.freeze(['exerciseId', 'planAssignmentId', 'planPrescriptionId', 'sets', 'perfVideos']);
-var PLAN_RUN_WORKOUT_EXERCISE_ORIGINS = Object.freeze(['prescribed', 'substituted', 'added']);
+// RECOMMENDED REPLACEMENTS: a fourth label, 'runReplacement' -- the row
+// performs its Assignment with the exercise the Run's Progression series was
+// durably replaced with (an earlier, confirmed "Replace for this active
+// Run"). Bound to the Assignment like 'prescribed'; its exerciseId must be the
+// series' active exercise for this Session (checked at Finish against the
+// series state, never trusted from the row).
+var PLAN_RUN_WORKOUT_EXERCISE_ORIGINS = Object.freeze(['prescribed', 'substituted', 'added', 'runReplacement']);
 // True for a CURRENT-shape row explicitly stamped origin:'prescribed', and
 // for any LEGACY-shape row (no `origin` field at all -- every legacy row is,
 // and remains, a prescribed row, exactly like planRunWorkoutSetIsSupplemental's
@@ -458,13 +484,31 @@ var PLAN_RUN_RULE_ENTRY_KEYS_WITH_SERIES = Object.freeze(PLAN_RUN_RULE_ENTRY_KEY
 function planRunRuleEntrySeriesId(v) {
   return (planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId')) ? v.progressionSeriesId : null;
 }
+// RECOMMENDED REPLACEMENTS: a Session rule entry may also carry one optional
+// `recommendedExerciseIds` -- the Run's own frozen copy of the PLAN rule's
+// resolved recommendation snapshot (never re-resolved after Start). Non-empty,
+// valid ids, no duplicates. Absent on every pre-existing Session.
+function planRunRuleEntryRecommendedIds(v) {
+  return (planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'recommendedExerciseIds')) ? v.recommendedExerciseIds : null;
+}
+function planRunRecommendedIdListValid(ids) {
+  return Array.isArray(ids) && ids.length > 0 && ids.every(planRunIsId) && !planRunArrayHasDuplicates(ids);
+}
 function planRunRuleEntryValid(v) {
-  if (planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId')) {
-    if (!planRunExactKeys(v, PLAN_RUN_RULE_ENTRY_KEYS_WITH_SERIES)) return false;
+  if (!planRunIsPlainObject(v)) return false;
+  var hasSeries = Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId');
+  var hasRec = Object.prototype.hasOwnProperty.call(v, 'recommendedExerciseIds');
+  var keys = PLAN_RUN_RULE_ENTRY_KEYS.concat(hasSeries ? ['progressionSeriesId'] : []).concat(hasRec ? ['recommendedExerciseIds'] : []);
+  if (!planRunExactKeys(v, keys)) return false;
+  if (hasSeries) {
     if (!planRunIsId(v.progressionSeriesId)) return false;
     // PLAN only ever emits a series link on an enabled Rule.
     if (v.enabled !== true) return false;
-  } else if (!planRunExactKeys(v, PLAN_RUN_RULE_ENTRY_KEYS)) return false;
+  }
+  if (hasRec) {
+    if (!planRunRecommendedIdListValid(v.recommendedExerciseIds)) return false;
+    if (v.enabled !== true) return false;
+  }
   if (!planRunIsId(v.planRuleId) || !planRunIsId(v.ruleRevisionId)) return false;
   if (!['addLoad', 'increaseTM'].includes(v.adjustmentType)) return false;
   if (!['strict', 'volume', 'gateway'].includes(v.evaluationType)) return false;
@@ -651,8 +695,78 @@ function planRunProgressionStateDocValidAnyVersion(v) {
 function planRunValueKindForAdjustment(adjustmentType) {
   return adjustmentType === 'addLoad' ? 'workingLoad' : (adjustmentType === 'increaseTM' ? 'trainingMax' : null);
 }
+// RECOMMENDED REPLACEMENTS: a series state that has been replaced for its
+// Run carries two more keys, always together -- `activeExerciseId` (the
+// exercise the series' current and future members now use) and
+// `replacementHistory` (append-only, one entry per durable replacement). The
+// original `exerciseId` never changes: it stays the PLAN/Session identity.
+var PLAN_RUN_SERIES_STATE_KEYS_REPLACED = Object.freeze(PLAN_RUN_SERIES_STATE_KEYS.concat(['activeExerciseId', 'replacementHistory']));
+var PLAN_RUN_SERIES_REPLACEMENT_ENTRY_KEYS = Object.freeze(['sequence', 'occurrenceId', 'workoutId', 'operationId', 'planRuleId', 'fromExerciseId', 'toExerciseId', 'previousValue', 'finalValue', 'startingValue']);
+var PLAN_RUN_SERIES_REPLACEMENT_SOURCE = 'runReplacement';
+function planRunSeriesResolvedValueValid(v, kind) {
+  return planRunIsPlainObject(v) && planRunExactKeys(v, ['amount', 'kind', 'unit']) && v.kind === kind &&
+    typeof v.amount === 'number' && Number.isFinite(v.amount) && PLAN_RUN_VALUE_UNITS.includes(v.unit);
+}
+function planRunSeriesReplacementHistory(v) {
+  return (planRunIsPlainObject(v) && Array.isArray(v.replacementHistory)) ? v.replacementHistory : [];
+}
+// The exercise a series' members currently use (after any durable replacement).
+function planRunSeriesActiveExerciseId(v) {
+  return (planRunIsPlainObject(v) && typeof v.activeExerciseId === 'string') ? v.activeExerciseId : (v ? v.exerciseId : null);
+}
+// The exercise the series used FOR one member Session: the replacement in
+// effect before that Session finished. A replacement recorded at Session X
+// takes effect for Sessions finished after X (X itself was evaluated with the
+// exercise in effect before it). For a member not yet finished, that is the
+// current active exercise.
+function planRunSeriesActiveExerciseForOccurrence(doc, occurrenceId) {
+  var hist = planRunSeriesReplacementHistory(doc);
+  var applied = Array.isArray(doc.appliedOccurrenceIds) ? doc.appliedOccurrenceIds : [];
+  var pos = applied.indexOf(occurrenceId);
+  if (pos === -1) return planRunSeriesActiveExerciseId(doc);
+  var ex = doc.exerciseId;
+  for (var i = 0; i < hist.length; i++) {
+    var hp = applied.indexOf(hist[i].occurrenceId);
+    if (hp !== -1 && hp < pos) ex = hist[i].toExerciseId;
+  }
+  return ex;
+}
+function planRunSeriesReplacementForOccurrence(doc, occurrenceId, workoutId) {
+  var hist = planRunSeriesReplacementHistory(doc);
+  for (var i = 0; i < hist.length; i++) {
+    if (hist[i].occurrenceId === occurrenceId && (workoutId === undefined || hist[i].workoutId === workoutId)) return hist[i];
+  }
+  return null;
+}
+function planRunSeriesReplacementHistoryValid(v) {
+  var hist = v.replacementHistory;
+  if (!Array.isArray(hist) || hist.length === 0) return false;
+  var applied = v.appliedOccurrenceIds, seenOcc = {}, prevPos = -1, ex = v.exerciseId;
+  for (var i = 0; i < hist.length; i++) {
+    var e = hist[i];
+    if (!planRunIsPlainObject(e) || !planRunExactKeys(e, PLAN_RUN_SERIES_REPLACEMENT_ENTRY_KEYS)) return false;
+    if (e.sequence !== i + 1) return false;
+    var ids = ['occurrenceId', 'workoutId', 'operationId', 'planRuleId', 'fromExerciseId', 'toExerciseId'];
+    for (var k = 0; k < ids.length; k++) if (!planRunIsId(e[ids[k]])) return false;
+    if (seenOcc[e.occurrenceId]) return false;
+    seenOcc[e.occurrenceId] = true;
+    var pos = applied.indexOf(e.occurrenceId);
+    if (pos === -1 || pos <= prevPos) return false;          // recorded at a finished member Session, in Finish order
+    prevPos = pos;
+    if (v.memberRuleIds[e.occurrenceId] !== e.planRuleId) return false;
+    if (e.fromExerciseId !== ex || e.toExerciseId === e.fromExerciseId) return false;
+    ex = e.toExerciseId;
+    if (!planRunCurrentValueValid(e.previousValue) || e.previousValue.kind !== v.valueKind) return false;
+    if (!planRunCurrentValueValid(e.finalValue) || e.finalValue.kind !== v.valueKind) return false;
+    if (!planRunSeriesResolvedValueValid(e.startingValue, v.valueKind)) return false;
+  }
+  return v.activeExerciseId === ex;
+}
+
 function planRunSeriesStateDocValid(v) {
-  if (!planRunExactKeys(v, PLAN_RUN_SERIES_STATE_KEYS)) return false;
+  var isReplaced = planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'replacementHistory');
+  if (!planRunExactKeys(v, isReplaced ? PLAN_RUN_SERIES_STATE_KEYS_REPLACED : PLAN_RUN_SERIES_STATE_KEYS)) return false;
+  if (isReplaced && !planRunIsId(v.activeExerciseId)) return false;
   if (v.recordType !== 'planProgramRunSeriesState' || v.schemaVersion !== 1) return false;
   var ids = ['ownerUid', 'planRunId', 'planTemplateId', 'headRevisionId', 'manifestId', 'seriesId', 'exerciseId'];
   for (var i = 0; i < ids.length; i++) if (!planRunIsId(v[ids[i]])) return false;
@@ -678,7 +792,7 @@ function planRunSeriesStateDocValid(v) {
   if (planRunArrayHasDuplicates(memberRuleIdList)) return false;
   if (!planRunCurrentValueValid(v.currentValue) || v.currentValue.kind !== v.valueKind) return false;
   if (typeof v.isCurrentValueUnresolved !== 'boolean' || v.isCurrentValueUnresolved !== (v.currentValue.amount === null)) return false;
-  if (!PLAN_RUN_VALUE_INITIALIZATION_SOURCES.includes(v.initializationSource)) return false;
+  if (isReplaced ? v.initializationSource !== PLAN_RUN_SERIES_REPLACEMENT_SOURCE : !PLAN_RUN_VALUE_INITIALIZATION_SOURCES.includes(v.initializationSource)) return false;
   if (v.isCurrentValueUnresolved && v.initializationSource !== 'deferred') return false;
   if (v.initializationSource === 'deferred' && !v.isCurrentValueUnresolved) return false;
   if ((v.initializationSource === 'deferred' || v.initializationSource === 'establishedFromLoggedPerformance') && v.valueKind !== 'workingLoad') return false;
@@ -694,6 +808,7 @@ function planRunSeriesStateDocValid(v) {
     if (!planRunIsId(v.lastProcessedWorkoutId) || !planRunIsId(v.lastOperationId) || !planRunIsTimestamp(v.lastEvaluatedAt)) return false;
   }
   if (!planRunIsTimestamp(v.createdAt) || !planRunIsTimestamp(v.updatedAt)) return false;
+  if (isReplaced && !planRunSeriesReplacementHistoryValid(v)) return false;
   return true;
 }
 function planRunSeriesStateIdentityOk(doc, ownerUid, planRunId, seriesId) {
@@ -843,6 +958,21 @@ function planRunOperationResultRefsValid(operationType, refs) {
     // whether the Program Run capability as a whole is enabled. The
     // two-bucket shape remains the oldest tolerated tier, unchanged.
     var finishCurrentKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds', 'notAttemptedRuleIds'];
+    // RECOMMENDED REPLACEMENTS: a current-shape receipt may also carry
+    // `replacedRuleIds` (non-empty; a Finish that applied a Run-level
+    // replacement). It is not a sixth outcome bucket: every id in it must
+    // also be in exactly one of the five buckets above.
+    if (Object.prototype.hasOwnProperty.call(refs, 'replacedRuleIds')) {
+      if (!planRunExactKeys(refs, finishCurrentKeys.concat(['replacedRuleIds']))) return false;
+      var rr = refs.replacedRuleIds;
+      if (!Array.isArray(rr) || rr.length === 0 || !rr.every(planRunIsId) || planRunArrayHasDuplicates(rr)) return false;
+      var restRefs = {};
+      finishCurrentKeys.forEach(function (k) { restRefs[k] = refs[k]; });
+      if (!planRunOperationResultRefsValid('runFinish', restRefs)) return false;
+      var inBucket = {};
+      ['appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds', 'notAttemptedRuleIds'].forEach(function (b) { refs[b].forEach(function (id) { inBucket[id] = b; }); });
+      return rr.every(function (id) { return Object.prototype.hasOwnProperty.call(inBucket, id) && inBucket[id] !== 'needsManualReviewRuleIds'; });
+    }
     var finishLegacyKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds', 'establishedRuleIds', 'stillUnresolvedRuleIds'];
     var finishOldestLegacyKeys = ['workoutId', 'occurrenceId', 'planRunId', 'appliedRuleIds', 'needsManualReviewRuleIds'];
     var isCurrentShape = planRunExactKeys(refs, finishCurrentKeys);
@@ -1417,8 +1547,17 @@ function planRunClassifyWorkoutDiscriminator(v) {
 // Canonical-context match (spec §8's "Workout creation contract"): the
 // workout's own stamped identity must agree EXACTLY with the occurrence's
 // own snapshot identity -- never a soft/partial match (spec §10 step 10).
-function planRunWorkoutContextMatchesOccurrence(workoutDoc, occurrenceDoc) {
+// RECOMMENDED REPLACEMENTS: `activeExerciseByAssignmentId` (optional) maps an
+// Assignment whose series was durably replaced for this Run to the exercise
+// the series used for THIS Session. For such an Assignment the effective
+// exercise is that one: a 'runReplacement' row must use it, a 'substituted'
+// row must differ from it, and a 'prescribed' row is not allowed (it would
+// mislabel the original exercise as the Run's current one). Without the map
+// (or for any other Assignment) the rules are exactly as before, and a
+// 'runReplacement' row is rejected.
+function planRunWorkoutContextMatchesOccurrence(workoutDoc, occurrenceDoc, activeExerciseByAssignmentId) {
   if (!planRunWorkoutDocValid(workoutDoc) || !planRunOccurrenceDocValid(occurrenceDoc)) return false;
+  var activeMap = planRunIsPlainObject(activeExerciseByAssignmentId) ? activeExerciseByAssignmentId : {};
   if (workoutDoc.ownerUid !== occurrenceDoc.ownerUid) return false;
   if (workoutDoc.planRunId !== occurrenceDoc.planRunId) return false;
   if (workoutDoc.planOccurrenceId !== occurrenceDoc.occurrenceId) return false;
@@ -1459,7 +1598,14 @@ function planRunWorkoutContextMatchesOccurrence(workoutDoc, occurrenceDoc) {
     }
     var a = byAssignmentId[ex.planAssignmentId];
     if (!a || a.planPrescriptionId !== ex.planPrescriptionId) return false;
-    if (planRunWorkoutExerciseIsPrescribedOrigin(ex)) {
+    var replacedEx = Object.prototype.hasOwnProperty.call(activeMap, a.planAssignmentId) ? activeMap[a.planAssignmentId] : null;
+    if (replacedEx !== null) {
+      if (ex.origin === 'runReplacement') { if (ex.exerciseId !== replacedEx) return false; }
+      else if (ex.origin === 'substituted') { if (ex.exerciseId === replacedEx) return false; }
+      else return false;
+    } else if (ex.origin === 'runReplacement') {
+      return false;
+    } else if (planRunWorkoutExerciseIsPrescribedOrigin(ex)) {
       if (a.exerciseId !== ex.exerciseId) return false;
     } else {
       // 'substituted' -- must genuinely differ from what was prescribed;
@@ -1720,7 +1866,22 @@ function planRunOccurrenceEligibleForCompletion(occurrenceDoc, workoutDoc) {
 // `notEvaluable` semantic-review reason, exactly as the real evaluator's own
 // contract already specifies (basis validation failing IS one of its own
 // named review triggers, not a distinct corruption mode -- see the report).
-function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, workoutDoc, workoutId) {
+// RECOMMENDED REPLACEMENTS: `evaluatedExerciseId` (optional) is the exercise
+// the Rule's series used for this Session. When it differs from the
+// Assignment's own (snapshot) exercise, the series was replaced for this Run:
+// ONLY 'runReplacement' rows for exactly that exercise are evidence, and the
+// basis/evidence name that exercise. Otherwise unchanged.
+// `substitutedAsUnperformed` (optional, series-linked Rules only): a
+// prescribed Set of this Assignment that the workout carries ONLY on a
+// 'substituted' row (it was moved to the swapped-in exercise) is evidence
+// that the series' own exercise did NOT perform it -- recorded as
+// {completed:false, reps:null, seconds:null} -- instead of a missing Set. So
+// a swap that left the series' exercise untouched is the neutral
+// 'notAttempted' outcome (never "needs review"), and work done before a swap
+// is judged on its own. Rules without a series keep the existing behavior.
+function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, workoutDoc, workoutId, evaluatedExerciseId, substitutedAsUnperformed) {
+  var replaced = typeof evaluatedExerciseId === 'string' && evaluatedExerciseId !== assignment.exerciseId;
+  var evalExerciseId = replaced ? evaluatedExerciseId : assignment.exerciseId;
   var basis = {
     ownerUid: occurrenceDoc.ownerUid,
     planTemplateId: occurrenceDoc.planTemplateId,
@@ -1729,7 +1890,7 @@ function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, wor
     planAssignmentId: assignment.planAssignmentId,
     planRuleId: ruleEntry.planRuleId,
     ruleRevisionId: ruleEntry.ruleRevisionId,
-    exerciseId: assignment.exerciseId,
+    exerciseId: evalExerciseId,
     planPrescriptionId: assignment.planPrescriptionId,
     adjustmentType: ruleEntry.adjustmentType,
     orderedSets: assignment.orderedSets.map(function (os) {
@@ -1757,7 +1918,10 @@ function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, wor
     // ever contributes evidence here. This is a no-op for every row that
     // existed before this correction, since every such row already had
     // exerciseId === assignment.exerciseId unconditionally.
-    if (ex.planAssignmentId === assignment.planAssignmentId && planRunWorkoutExerciseIsPrescribedOrigin(ex)) {
+    var isEvidenceRow = replaced
+      ? (ex.origin === 'runReplacement' && ex.exerciseId === evalExerciseId)
+      : planRunWorkoutExerciseIsPrescribedOrigin(ex);
+    if (ex.planAssignmentId === assignment.planAssignmentId && isEvidenceRow) {
       // Amended-shape adapter (spec §3A.6.4) -- see the identical comment
       // in planRunOccurrenceEligibleForCompletion above.
       ex.sets.forEach(function (s) { performedBySetId[s.planSetId] = { completed: s.completed, reps: s.reps, seconds: s.time }; });
@@ -1772,6 +1936,15 @@ function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, wor
   // step 11) maps ANY such failure to the `notEvaluable` semantic-review
   // reason, per spec §8's "reuses planValidateProgressionEvaluationInput's
   // existing rejection reasons ... unchanged."
+  if (substitutedAsUnperformed === true) {
+    (workoutDoc.exercises || []).forEach(function (ex) {
+      if (ex.planAssignmentId !== assignment.planAssignmentId || ex.origin !== 'substituted') return;
+      ex.sets.forEach(function (st) {
+        if (st.isSupplemental === true || typeof st.planSetId !== 'string') return;
+        if (!Object.prototype.hasOwnProperty.call(performedBySetId, st.planSetId)) performedBySetId[st.planSetId] = { completed: false, reps: null, seconds: null };
+      });
+    });
+  }
   var setPairs = [];
   for (var i = 0; i < basis.orderedSets.length; i++) {
     var performed = performedBySetId[basis.orderedSets[i].planSetId];
@@ -1779,7 +1952,7 @@ function planRunBuildProgressionTriple(ruleEntry, assignment, occurrenceDoc, wor
     setPairs.push({ planSetId: basis.orderedSets[i].planSetId, prescribed: basis.orderedSets[i].prescribed, performed: { completed: performed.completed, reps: performed.reps, seconds: performed.seconds } });
   }
   var evidence = {
-    exerciseId: assignment.exerciseId, headRevisionId: occurrenceDoc.headRevisionId, ownerUid: occurrenceDoc.ownerUid,
+    exerciseId: evalExerciseId, headRevisionId: occurrenceDoc.headRevisionId, ownerUid: occurrenceDoc.ownerUid,
     planAssignmentId: assignment.planAssignmentId, planRuleId: ruleEntry.planRuleId, planSessionId: occurrenceDoc.planSessionId,
     planTemplateId: occurrenceDoc.planTemplateId, setPairs: setPairs, workoutId: workoutId
   };
@@ -2105,12 +2278,19 @@ function planRunClassifyFinishOccurrence(p) {
       var claimedEstablished = (p.receipt.establishedRuleIds || []).slice().sort();
       var claimedNotAttempted = (p.receipt.notAttemptedRuleIds || []).slice().sort();
       var claimedStillUnresolved = (p.receipt.stillUnresolvedRuleIds || []).slice().sort();
+      // RECOMMENDED REPLACEMENTS: the receipt's replacedRuleIds must match
+      // the replacements the series states actually recorded for this exact
+      // occurrence and workout (p.actualReplacedRuleIds, from the caller's
+      // own validated series reads) -- both directions.
+      var actualReplaced = (p.actualReplacedRuleIds || []).slice().sort();
+      var claimedReplaced = (p.receipt.replacedRuleIds || []).slice().sort();
       if (JSON.stringify(actualApplied) === JSON.stringify(claimedApplied) &&
           JSON.stringify(actualReviewed) === JSON.stringify(claimedReviewed) &&
           JSON.stringify(actualEstablished) === JSON.stringify(claimedEstablished) &&
           JSON.stringify(actualNotAttempted) === JSON.stringify(claimedNotAttempted) &&
-          JSON.stringify(actualStillUnresolved) === JSON.stringify(claimedStillUnresolved)) {
-        return {
+          JSON.stringify(actualStillUnresolved) === JSON.stringify(claimedStillUnresolved) &&
+          JSON.stringify(actualReplaced) === JSON.stringify(claimedReplaced)) {
+        var committedRefs = {
           branch: 'a', outcome: 'alreadyCommitted', packageHashVerified: !!p.haveFullPackage,
           resultRefs: {
             workoutId: p.requestedWorkoutId, occurrenceId: p.occurrenceId, planRunId: p.planRunId,
@@ -2118,6 +2298,8 @@ function planRunClassifyFinishOccurrence(p) {
             establishedRuleIds: claimedEstablished, notAttemptedRuleIds: claimedNotAttempted, stillUnresolvedRuleIds: claimedStillUnresolved
           }
         };
+        if (claimedReplaced.length) committedRefs.resultRefs.replacedRuleIds = claimedReplaced;
+        return committedRefs;
       }
     }
     return { branch: 'a', outcome: 'integrityConflict', reason: slotFailureReason(okANonSlot, 'receiptEvidenceMismatch') };
@@ -2128,7 +2310,11 @@ function planRunClassifyFinishOccurrence(p) {
     var okBNonSlot = !!(p.matchingWorkout && p.matchingWorkout.exists && p.matchingWorkout.contextMatches) &&
       !p.occurrenceInRemaining && everyExpectedHasValidRecord(p.perRuleAtRequested);
     var okB = okBNonSlot && terminalSlotOk && activeSlotOk;
-    if (okB) return { branch: 'b', outcome: 'alreadyCommitted', resultRefs: reconstructResultRefs(p.perRuleAtRequested, p.requestedWorkoutId) };
+    if (okB) {
+      var refsB = reconstructResultRefs(p.perRuleAtRequested, p.requestedWorkoutId);
+      if (p.actualReplacedRuleIds && p.actualReplacedRuleIds.length) refsB.replacedRuleIds = p.actualReplacedRuleIds.slice().sort();
+      return { branch: 'b', outcome: 'alreadyCommitted', resultRefs: refsB };
+    }
     return { branch: 'b', outcome: 'integrityConflict', reason: slotFailureReason(okBNonSlot, 'selfCommitEvidenceMismatch') };
   }
 
@@ -2560,8 +2746,32 @@ function planRunValidateStartSeries(pkg, hasSeriesKey) {
   return { ok: true, seriesRuleIds: coveredRules };
 }
 
+// RECOMMENDED REPLACEMENTS: an optional seventh key, `runReplacements` -- the
+// person's explicit, confirmed "Replace for this active Run" choices for this
+// Session, applied ONLY if this Finish commits. Each entry names the series
+// member Rule on this Session, the replacement exercise, and the fresh
+// starting value the person typed (never copied or converted). Present only
+// when non-empty, so every other Finish package (and its hash) is unchanged.
+var PLAN_RUN_RUN_REPLACEMENT_KEYS = Object.freeze(['planRuleId', 'toExerciseId', 'amount', 'unit']);
+function planRunRunReplacementsValid(list) {
+  if (!Array.isArray(list) || list.length === 0) return false;
+  var seen = {};
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i];
+    if (!planRunIsPlainObject(e) || !planRunExactKeys(e, PLAN_RUN_RUN_REPLACEMENT_KEYS)) return false;
+    if (!planRunIsId(e.planRuleId) || !planRunIsId(e.toExerciseId)) return false;
+    if (typeof e.amount !== 'number' || !Number.isFinite(e.amount) || e.amount < 0) return false;
+    if (!PLAN_RUN_VALUE_UNITS.includes(e.unit)) return false;
+    if (seen[e.planRuleId]) return false;
+    seen[e.planRuleId] = true;
+  }
+  return true;
+}
 function planRunValidateFinishPackage(pkg) {
-  if (!planRunExactKeys(pkg, ['operationId', 'ownerUid', 'planRunId', 'occurrenceId', 'workoutId', 'workout'])) return { ok: false, reason: 'malformedPackageShape' };
+  var finishKeys = ['operationId', 'ownerUid', 'planRunId', 'occurrenceId', 'workoutId', 'workout'];
+  var hasRepl = planRunIsPlainObject(pkg) && Object.prototype.hasOwnProperty.call(pkg, 'runReplacements');
+  if (!planRunExactKeys(pkg, hasRepl ? finishKeys.concat(['runReplacements']) : finishKeys)) return { ok: false, reason: 'malformedPackageShape' };
+  if (hasRepl && !planRunRunReplacementsValid(pkg.runReplacements)) return { ok: false, reason: 'malformedRunReplacements' };
   var idFields = ['operationId', 'ownerUid', 'planRunId', 'occurrenceId', 'workoutId'];
   if (idFields.some(function (k) { return !planRunIsId(pkg[k]); })) return { ok: false, reason: 'malformedPackageShape' };
   if (!planRunWorkoutDocValid(pkg.workout)) return { ok: false, reason: 'malformedWorkoutShape' };
@@ -2917,7 +3127,13 @@ var PLAN_RUN_SAFETY_CAPS = Object.freeze({
   // 400 members; measured by the emulator suite's 400-member case), so
   // 256 KiB -- the same cap as a Run document, far under Firestore's 1 MiB
   // document limit -- never limits a valid Run.
-  maxSeriesStateDocumentBytes: 256 * 1024,
+  // RECOMMENDED REPLACEMENTS: a durable Run-level replacement appends one
+  // history entry (~0.5 KB) per replacement, at most one per member Session.
+  // Measured (probes/measure-series-history-size.js): a 400-member series
+  // replaced at EVERY Session is ~394 KB (~473 KB with the 1.2 margin), so the
+  // cap is raised to 768 KiB (the Session-document cap) -- still under
+  // Firestore's 1 MiB -- so it never limits how often a series is replaced.
+  maxSeriesStateDocumentBytes: 768 * 1024,
   // OPTIONAL PROGRESSION STARTING VALUES spec Round 2 SS5.9 (unchanged
   // through Round 6): the explicit training-max establishment operation's
   // own budget -- up to 3 reads (progressionState, this operation's own

@@ -2010,6 +2010,12 @@ function openExerciseMenu(e, idx) {
     ...(hasTM ? [{ label: 'Set / Edit Training Max', icon: '⚖', action: `openActiveTMEditModal(${idx})` }] : []),
     ...(has1RM ? [{ label: 'Set / Edit 1RM', icon: '◉', action: `openActive1RMEditModal(${idx})` }] : []),
     ...(hasWL ? [{ label: 'Set / Edit Working Load', icon: '➕', action: `openActiveWorkingLoadEditModal(${idx})` }] : []),
+    // RECOMMENDED REPLACEMENTS: a pending (not yet durable) Run-level
+    // replacement can be edited or cancelled until Finish.
+    ...(planRunPendingReplacementForRow(idx) && planRunSeriesForRow(idx) ? [
+      { label: 'Edit Run Replacement Value', icon: '✎', action: `planRunEditPendingReplacement(${idx})` },
+      { label: 'Cancel Run Replacement', icon: '↺', action: `planRunCancelPendingReplacement(${idx})` }
+    ] : []),
     { divider: true }, { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true },
   ];
   if (items.length === 0) return;
@@ -2161,10 +2167,179 @@ function removePerfVideo(viIdx) { if (!currentWorkout || videosExIdx === null) r
 // exerciseId is still Finish-valid, whereas a wrongly-'prescribed' row
 // would not be.
 function planRunResolveChangeExerciseOrigin(ex, newExId) {
-  const map = currentWorkout && currentWorkout.canonicalRun && currentWorkout.canonicalRun.prescribedExerciseByAssignmentId;
+  const cr = currentWorkout && currentWorkout.canonicalRun;
+  const map = cr && cr.prescribedExerciseByAssignmentId;
   const trueExId = map ? map[ex.planAssignmentId] : undefined;
+  // RECOMMENDED REPLACEMENTS: when the Run's series for this Assignment was
+  // durably replaced, the exercise this Session opened with is the
+  // replacement; returning to IT is 'runReplacement', and anything else --
+  // including the original PLAN exercise -- is a substitution.
+  const eff = cr && cr.effectiveExerciseByAssignmentId ? cr.effectiveExerciseByAssignmentId[ex.planAssignmentId] : undefined;
+  if (eff !== undefined && trueExId !== undefined && eff !== trueExId) return newExId === eff ? 'runReplacement' : 'substituted';
   if (trueExId !== undefined && trueExId === newExId) return 'prescribed';
   return 'substituted';
+}
+
+// ==================== RUN-LEVEL REPLACEMENT (pending until Finish) ====================
+// A "Replace for this active Run" choice is held ONLY in this open Session
+// (currentWorkout.canonicalRun.pendingRunReplacements, keyed by Assignment,
+// kept in the local recovery draft like every other in-progress edit). It is
+// never written anywhere until a Finish commits; then the same transaction
+// applies it to the Run's series. It stays valid only while this workout
+// still has the replacement exercise's row for that Assignment.
+function planRunPendingReplacements() {
+  const cr = currentWorkout && currentWorkout.canonicalRun;
+  if (!cr) return null;
+  if (!cr.pendingRunReplacements || typeof cr.pendingRunReplacements !== 'object') cr.pendingRunReplacements = {};
+  return cr.pendingRunReplacements;
+}
+// Drops any pending replacement whose row is gone (deleted, or changed back).
+// Returns how many were dropped.
+function planRunReconcilePendingReplacements() {
+  const pend = planRunPendingReplacements();
+  if (!pend) return 0;
+  let dropped = 0;
+  Object.keys(pend).forEach(asg => {
+    const p = pend[asg];
+    const hasRow = currentWorkout.exercises.some(ex => ex.origin === 'substituted' && ex.planAssignmentId === asg && ex.exerciseId === p.toExerciseId);
+    if (!hasRow) { delete pend[asg]; dropped++; }
+  });
+  return dropped;
+}
+function planRunClearPendingReplacement(asg) {
+  const pend = planRunPendingReplacements();
+  if (pend && pend[asg]) { delete pend[asg]; return true; }
+  return false;
+}
+// Finish package entries, in a fixed order (sorted by Rule id).
+function planRunPendingReplacementsForFinish() {
+  if (!planRunPendingReplacements()) return [];
+  planRunReconcilePendingReplacements();
+  const pend = planRunPendingReplacements();
+  return Object.keys(pend).map(asg => pend[asg])
+    .map(p => ({ planRuleId: p.planRuleId, toExerciseId: p.toExerciseId, amount: p.amount, unit: p.unit }))
+    .sort((a, b) => (a.planRuleId < b.planRuleId ? -1 : a.planRuleId > b.planRuleId ? 1 : 0));
+}
+// The pending replacement whose row is `idx`, if any.
+function planRunPendingReplacementForRow(idx) {
+  const pend = planRunPendingReplacements();
+  const ex = currentWorkout && currentWorkout.exercises[idx];
+  if (!pend || !ex || ex.origin !== 'substituted') return null;
+  const p = pend[ex.planAssignmentId];
+  return (p && p.toExerciseId === ex.exerciseId) ? p : null;
+}
+// The series facts for row `idx` when Change Exercise must ask which scope
+// the person means (feature build, canonical Run Session, a row bound to a
+// series-linked Assignment). null otherwise -- existing behavior applies.
+function planRunSeriesForRow(idx) {
+  if (typeof planRecommendedReplacementsFeatureEnabled !== 'function' || !planRecommendedReplacementsFeatureEnabled()) return null;
+  const cr = currentWorkout && currentWorkout.canonicalRun;
+  const ex = currentWorkout && currentWorkout.exercises[idx];
+  if (!cr || !ex || ex.origin === 'added' || !cr.seriesByAssignmentId) return null;
+  return cr.seriesByAssignmentId[ex.planAssignmentId] || null;
+}
+
+let planRunReplaceUi = null; // { idx, newExId, series, step: 'choose'|'value', amount, error }
+function planRunReplaceClose() {
+  planRunReplaceUi = null;
+  const el = document.getElementById('run-replace-overlay');
+  if (el && el.parentNode) el.remove();
+}
+function planRunReplaceOpen(idx, newExId, series, startAtValue) {
+  const existing = planRunPendingReplacementForRow(idx);
+  planRunReplaceUi = { idx, newExId, series, step: startAtValue ? 'value' : 'choose', amount: startAtValue && existing ? String(existing.amount) : '', error: null };
+  planRunReplaceRender();
+}
+function planRunReplaceRender() {
+  const u = planRunReplaceUi;
+  const old = document.getElementById('run-replace-overlay'); if (old && old.parentNode) old.remove();
+  if (!u) return;
+  const exData = getExercise(u.newExId);
+  const name = exData ? exData.name : 'this exercise';
+  const unit = appDb.unit === 'kg' ? 'kg' : 'lb';
+  const kindLabel = u.series.valueKind === 'trainingMax' ? 'Training Max' : 'Working Load';
+  const btn = (action, label, cls, testid, disabled) => `<button class="btn ${cls}" style="${u.step === 'choose' ? 'width:100%' : 'flex:1 1 130px;min-width:0'};white-space:normal" data-rr-action="${action}" data-testid="${testid}" ${disabled ? 'disabled' : ''}>${label}</button>`;
+  let body;
+  if (u.step === 'choose') {
+    const canRun = u.series.hasFutureMember === true;
+    body = `<h3 style="font-family:var(--font-display);font-size:20px;font-weight:800;text-transform:uppercase;margin-bottom:8px">Change to ${escapeHtml(name)}</h3>
+      <p style="font-size:14px;color:var(--text2);margin-bottom:14px;line-height:1.5">This exercise is part of the Progression series “${escapeHtml(u.series.seriesName || '')}”. How long should the change last?</p>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        ${btn('workout', 'This workout only', 'btn-secondary', 'rr-workout-only-btn', false)}
+        ${btn('run', 'Replace for this active Run', 'btn-secondary', 'rr-run-btn', !canRun)}
+        ${canRun ? '' : '<div data-testid="rr-run-unavailable" style="font-size:12px;color:var(--text3)">No later Session in this Run uses this series, so there is nothing to replace beyond this workout.</div>'}
+        ${btn('cancel', 'Cancel', 'btn-ghost', 'rr-cancel-btn', false)}
+      </div>
+      <p style="font-size:12px;color:var(--text3);margin-top:12px;line-height:1.4">“This workout only” never affects the series. “Replace for this active Run” changes this and later Sessions of this Run only (never your Program), and takes effect when this workout is finished.</p>`;
+  } else {
+    body = `<h3 style="font-family:var(--font-display);font-size:20px;font-weight:800;text-transform:uppercase;margin-bottom:8px">Starting ${kindLabel}</h3>
+      <p style="font-size:14px;color:var(--text2);margin-bottom:10px;line-height:1.5">Enter a starting ${kindLabel} for ${escapeHtml(name)}. It is not copied from the previous exercise.</p>
+      <label style="font-size:13px;display:block;margin-bottom:6px">${kindLabel} (${unit})
+        <input type="number" step="any" min="0" inputmode="decimal" data-testid="rr-value-input" id="rr-value-input" value="${escapeHtml(u.amount)}" style="width:100%;margin-top:4px"></label>
+      ${u.error ? `<div data-testid="rr-value-error" style="color:var(--red);font-size:13px;margin-bottom:8px">${escapeHtml(u.error)}</div>` : ''}
+      <div style="display:flex;flex-wrap:wrap;gap:10px;margin-top:8px">
+        ${btn('back', 'Cancel', 'btn-ghost', 'rr-value-cancel-btn', false)}
+        ${btn('confirm', 'Confirm Replacement', 'btn-primary', 'rr-value-confirm-btn', false)}
+      </div>`;
+  }
+  const el = document.createElement('div');
+  el.id = 'run-replace-overlay';
+  el.setAttribute('data-testid', 'run-replace-overlay');
+  el.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.8);z-index:300;display:flex;align-items:center;justify-content:center;padding:20px';
+  el.innerHTML = `<div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:22px;width:100%;max-width:360px">${body}</div>`;
+  el.addEventListener('click', ev => {
+    const b = ev.target.closest ? ev.target.closest('[data-rr-action]') : null;
+    if (!b || b.disabled) return;
+    planRunReplaceAction(b.getAttribute('data-rr-action'));
+  });
+  document.body.appendChild(el);
+  const inp = document.getElementById('rr-value-input'); if (inp) inp.focus();
+}
+function planRunReplaceAction(action) {
+  const u = planRunReplaceUi; if (!u || !currentWorkout) { planRunReplaceClose(); return; }
+  if (action === 'cancel') { planRunReplaceClose(); return; }
+  if (action === 'workout') {
+    planRunReplaceClose();
+    const cleared = planRunClearPendingReplacement(currentWorkout.exercises[u.idx].planAssignmentId);
+    changeExTargetIdx = u.idx;
+    confirmChangeExerciseApply(u.newExId);
+    if (cleared) showToast('Exercise changed for this workout only. The pending Run replacement was cancelled.', 'success');
+    return;
+  }
+  if (action === 'run') { if (u.series.hasFutureMember !== true) return; u.step = 'value'; u.error = null; planRunReplaceRender(); return; }
+  if (action === 'back') { planRunReplaceClose(); return; }
+  if (action === 'confirm') {
+    const inp = document.getElementById('rr-value-input');
+    const raw = inp ? inp.value.trim() : '';
+    const amount = raw === '' ? NaN : Number(raw);
+    if (!Number.isFinite(amount) || amount < 0) { u.amount = raw; u.error = 'Enter a number of 0 or more.'; planRunReplaceRender(); return; }
+    const unit = appDb.unit === 'kg' ? 'kg' : 'lb';
+    const row = currentWorkout.exercises[u.idx];
+    const asg = row.planAssignmentId;
+    const editingExisting = planRunPendingReplacementForRow(u.idx);
+    planRunReplaceClose();
+    if (!(editingExisting && editingExisting.toExerciseId === u.newExId)) {
+      changeExTargetIdx = u.idx;
+      confirmChangeExerciseApply(u.newExId);
+    }
+    const pend = planRunPendingReplacements();
+    pend[asg] = { planRuleId: u.series.planRuleId, seriesId: u.series.seriesId, valueKind: u.series.valueKind, toExerciseId: u.newExId, amount: amount, unit: unit };
+    if (planRunReconcilePendingReplacements() > 0) { showToast('The replacement row is missing, so nothing was set.', 'error'); return; }
+    if (typeof awDraftSaveNow === 'function') awDraftSaveNow();
+    showToast('Replacement set for this Run. It takes effect when you finish this workout.', 'success');
+  }
+}
+function planRunEditPendingReplacement(idx) {
+  const p = planRunPendingReplacementForRow(idx); const series = planRunSeriesForRow(idx);
+  if (!p || !series) return;
+  planRunReplaceOpen(idx, p.toExerciseId, series, true);
+}
+function planRunCancelPendingReplacement(idx) {
+  const p = planRunPendingReplacementForRow(idx);
+  if (!p) return;
+  planRunClearPendingReplacement(currentWorkout.exercises[idx].planAssignmentId);
+  if (typeof awDraftSaveNow === 'function') awDraftSaveNow();
+  showToast('Run replacement cancelled. This change now applies to this workout only.', 'success');
 }
 // WORKOUT-FLEXIBILITY CORRECTION ROUND 2: a single fresh, blank,
 // model-valid supplemental Set (plan-run-model.js's own
@@ -2177,6 +2352,28 @@ function planRunFreshSupplementalSet() {
   return { planSetId: null, weight: '', reps: '', time: '', rpe: '', completed: false, isPR: false, isNew1RM: false, isSupplemental: true };
 }
 function confirmChangeExercise(newExId) {
+  if (changeExTargetIdx === null || !currentWorkout) return;
+  // RECOMMENDED REPLACEMENTS: a row bound to a Progression series asks which
+  // scope the person means; nothing is applied or preselected until they
+  // choose. Returning to the exercise the series uses now needs no question
+  // (it simply restores the row, and cancels any pending replacement).
+  const sIdx = changeExTargetIdx;
+  const series = planRunSeriesForRow(sIdx);
+  const sRow = currentWorkout.exercises[sIdx];
+  if (series && sRow && newExId !== sRow.exerciseId) {
+    if (newExId === series.activeExerciseId) {
+      const cleared = planRunClearPendingReplacement(sRow.planAssignmentId);
+      confirmChangeExerciseApply(newExId);
+      if (cleared) showToast('Original exercise restored. The pending Run replacement was cancelled.', 'success');
+      return;
+    }
+    closeModal('modal-ex-browser');
+    planRunReplaceOpen(sIdx, newExId, series, false);
+    return;
+  }
+  confirmChangeExerciseApply(newExId);
+}
+function confirmChangeExerciseApply(newExId) {
   if (changeExTargetIdx === null || !currentWorkout) return;
   const idx = changeExTargetIdx;
   const ex = currentWorkout.exercises[idx];
@@ -2695,6 +2892,11 @@ function getProgramSessionName(progId, mi, si) { const prog = appDb.programs.fin
 // ==================== RENDER WORKOUT ====================
 function renderWorkoutExercises() {
   const c = document.getElementById('workout-exercises');
+  // RECOMMENDED REPLACEMENTS: a pending Run-level replacement whose row was
+  // deleted or changed away is cancelled here -- never left as hidden state.
+  if (currentWorkout && currentWorkout.canonicalRun && currentWorkout.canonicalRun.pendingRunReplacements && planRunReconcilePendingReplacements() > 0) {
+    showToast('The pending Run replacement was cancelled.', '');
+  }
   if (!currentWorkout?.exercises.length) {
     c.innerHTML = '<div style="text-align:center;padding:30px 0;color:var(--text3);font-size:15px">Add exercises below to begin logging</div>';
     if (typeof awDraftSaveNow === 'function') awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY (review finding 2): deleting the last exercise is stored at once

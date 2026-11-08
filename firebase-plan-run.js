@@ -794,7 +794,9 @@
           // compare the stored receipt's notAttemptedRuleIds as always-empty
           // against the correctly-reconstructed actual bucket, and never
           // match -- a real, caught defect, not a hypothetical.
-          notAttemptedRuleIds: receiptSnap.data.resultRefs.notAttemptedRuleIds
+          notAttemptedRuleIds: receiptSnap.data.resultRefs.notAttemptedRuleIds,
+          // RECOMMENDED REPLACEMENTS: optional; absent on every other receipt.
+          replacedRuleIds: receiptSnap.data.resultRefs.replacedRuleIds || []
         };
       }
 
@@ -920,8 +922,16 @@
         requestedFlags[rid] = classifyDocFlags(requestedRecRaw[rid], M('planRunApplicationDocValid'), M('planRunApplicationIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid, pkg.workoutId]);
         if (winningRecRaw) winningFlags[rid] = classifyDocFlags(winningRecRaw[rid], M('planRunApplicationDocValid'), M('planRunApplicationIdentityOk'), [pkg.ownerUid, pkg.planRunId, rid, winningWorkoutId]);
         var sd = stateRaw[rid] && stateRaw[rid].exists ? stateRaw[rid].data : null;
+        // RECOMMENDED REPLACEMENTS: a Run-level replacement gives an
+        // unresolved series a fresh value, so "still unresolved now" is no
+        // longer the only evidence -- the replacement entry recorded at this
+        // occurrence keeps the value the original segment ended this Finish
+        // with (finalValue); amount null there means this Rule was still
+        // unresolved (no record written) when the replacement was applied.
+        var sRepl = (sd && Object.prototype.hasOwnProperty.call(seriesIdByRuleId, rid) && Array.isArray(sd.replacementHistory))
+          ? M('planRunSeriesReplacementForOccurrence')(sd, pkg.occurrenceId, pkg.workoutId) : null;
         perRuleStillUnresolved[rid] = Object.prototype.hasOwnProperty.call(seriesIdByRuleId, rid)
-          ? !!(sd && sd.currentValue && sd.currentValue.amount === null)
+          ? !!(sd && sd.currentValue && (sd.currentValue.amount === null || (sRepl && sRepl.finalValue && sRepl.finalValue.amount === null)))
           : !!(sd && sd.schemaVersion === 2 && sd.currentValue && sd.currentValue.amount === null);
       });
       var boundaryOk = M('planRunFinishStructuralBoundaryOk')({
@@ -930,6 +940,23 @@
       });
       if (!boundaryOk) return { terminal: { outcome: 'integrityConflict', reason: 'perRuleStructuralBoundary' } };
 
+      // RECOMMENDED REPLACEMENTS: for each series-linked Rule (all states are
+      // now known valid), the exercise the series used for THIS Session --
+      // the replacement in effect before this Session finished. Assignments
+      // whose series was replaced get an entry in activeByAssignmentId (used
+      // by the workout context check); replacements actually recorded at
+      // this occurrence+workout are the evidence for receipt reconciliation.
+      var activeByAssignmentId = {}, activeByRuleId = {}, actualReplacedRuleIds = [];
+      enabledRules.forEach(function (er) {
+        var rid2 = er.ruleEntry.planRuleId;
+        if (!Object.prototype.hasOwnProperty.call(seriesIdByRuleId, rid2)) return;
+        var sdoc = stateRaw[rid2].data;
+        var act = M('planRunSeriesActiveExerciseForOccurrence')(sdoc, pkg.occurrenceId);
+        activeByRuleId[rid2] = act;
+        if (act !== er.assignment.exerciseId) activeByAssignmentId[er.assignment.planAssignmentId] = act;
+        if (M('planRunSeriesReplacementForOccurrence')(sdoc, pkg.occurrenceId, pkg.workoutId)) actualReplacedRuleIds.push(rid2);
+      });
+
       // Step 8. FOUNDATION SLICE CORRECTION (spec §3A.6.7) -- a document
       // sitting at the requested/winning workout path is only genuine
       // Finish-time evidence when it is a genuine, completed canonical
@@ -937,8 +964,8 @@
       // conjunct closes the gap where a structurally-valid `historyOnly`
       // document at that exact path would otherwise pass `contextMatches`
       // exactly as readily as a real committed workout.
-      var matchingWorkoutFlag = matchingWorkoutRaw ? { exists: matchingWorkoutRaw.exists, contextMatches: matchingWorkoutRaw.exists && matchingWorkoutRaw.data.completionState === 'sessionCompleted' && M('planRunWorkoutContextMatchesOccurrence')(matchingWorkoutRaw.data, occurrenceDoc) } : null;
-      var differingWorkoutFlag = differingWorkoutRaw ? { exists: differingWorkoutRaw.exists, contextMatches: differingWorkoutRaw.exists && differingWorkoutRaw.data.completionState === 'sessionCompleted' && M('planRunWorkoutContextMatchesOccurrence')(differingWorkoutRaw.data, occurrenceDoc) } : null;
+      var matchingWorkoutFlag = matchingWorkoutRaw ? { exists: matchingWorkoutRaw.exists, contextMatches: matchingWorkoutRaw.exists && matchingWorkoutRaw.data.completionState === 'sessionCompleted' && M('planRunWorkoutContextMatchesOccurrence')(matchingWorkoutRaw.data, occurrenceDoc, activeByAssignmentId) } : null;
+      var differingWorkoutFlag = differingWorkoutRaw ? { exists: differingWorkoutRaw.exists, contextMatches: differingWorkoutRaw.exists && differingWorkoutRaw.data.completionState === 'sessionCompleted' && M('planRunWorkoutContextMatchesOccurrence')(differingWorkoutRaw.data, occurrenceDoc, activeByAssignmentId) } : null;
 
       // FOUNDATION SLICE ADDITION (spec §3A.6.9) -- terminal (Run complete)
       // and non-final/active (Run still active, occurrence already
@@ -1007,14 +1034,16 @@
         terminalSlotOk: terminalSlotOk, terminalSlotReason: terminalSlotFlag ? terminalSlotFlag.reason : null,
         activeSlotOk: activeSlotOk, activeSlotReason: activeSlotFlag ? activeSlotFlag.reason : null,
         requestedWorkoutCollision: requestedWorkoutCollision,
-        perRuleStillUnresolved: perRuleStillUnresolved
+        perRuleStillUnresolved: perRuleStillUnresolved,
+        actualReplacedRuleIds: actualReplacedRuleIds
       });
 
       return {
         decision: decision, runDoc: runDoc, occurrenceDoc: occurrenceDoc, enabledRules: enabledRules, expectedIds: expectedIds,
         stateRaw: stateRaw, requestedRecRaw: requestedRecRaw, runPath: runPath, occPath: occPath, receiptPath: receiptPath,
         slotSnap: slotSnap, slotPath: slotPath, wouldBeLast: wouldBeLast,
-        seriesIdByRuleId: seriesIdByRuleId, seriesPathByRuleId: seriesPathByRuleId
+        seriesIdByRuleId: seriesIdByRuleId, seriesPathByRuleId: seriesPathByRuleId,
+        activeByAssignmentId: activeByAssignmentId, activeByRuleId: activeByRuleId
       };
     }
 
@@ -1056,8 +1085,27 @@
           var runDoc = r.runDoc, occurrenceDoc = r.occurrenceDoc;
           // Step 9.
           if (runDoc.status !== 'active') return { outcome: 'integrityConflict', reason: 'terminalRunWithUnfinishedOccurrence' };
+          // RECOMMENDED REPLACEMENTS: a Run-level replacement is applied only
+          // by the feature build, only to a series-linked Rule of THIS
+          // Session, only to a different exercise than the one the series
+          // uses now, and only when the workout really carries that
+          // exercise for that Assignment. Anything else is refused here,
+          // before any write.
+          var replByRuleId = {};
+          if (Object.prototype.hasOwnProperty.call(pkg, 'runReplacements')) {
+            if (!M('planRecommendedReplacementsFeatureEnabled')()) return { outcome: 'invalidInput', reason: 'runReplacementRequiresFeatureBuild' };
+            for (var rpi = 0; rpi < pkg.runReplacements.length; rpi++) {
+              var rp = pkg.runReplacements[rpi];
+              if (!Object.prototype.hasOwnProperty.call(r.seriesIdByRuleId, rp.planRuleId)) return { outcome: 'invalidInput', reason: 'runReplacementNotSeriesMember' };
+              var rpAsg = r.enabledRules.filter(function (er) { return er.ruleEntry.planRuleId === rp.planRuleId; })[0].assignment;
+              if (rp.toExerciseId === r.activeByRuleId[rp.planRuleId]) return { outcome: 'invalidInput', reason: 'runReplacementSameExercise' };
+              var rpRow = pkg.workout.exercises.some(function (ex) { return ex.origin === 'substituted' && ex.planAssignmentId === rpAsg.planAssignmentId && ex.exerciseId === rp.toExerciseId; });
+              if (!rpRow) return { outcome: 'invalidInput', reason: 'runReplacementRowMissing' };
+              replByRuleId[rp.planRuleId] = rp;
+            }
+          }
           // Step 10.
-          if (!M('planRunWorkoutContextMatchesOccurrence')(pkg.workout, occurrenceDoc)) return { outcome: 'integrityConflict', reason: 'workoutContextMismatch' };
+          if (!M('planRunWorkoutContextMatchesOccurrence')(pkg.workout, occurrenceDoc, r.activeByAssignmentId)) return { outcome: 'integrityConflict', reason: 'workoutContextMismatch' };
           // FOUNDATION SLICE ADDITION -- the amended shape's own
           // completionState discriminator now makes it structurally
           // possible for a caller to pass a `historyOnly`-flagged workout
@@ -1072,6 +1120,7 @@
           // Step 11 -- pure computation only; nothing is written to `tx` yet.
           var now = deps.timestamp();
           var appliedIds = [], reviewedIds = [], establishedIds = [], stillUnresolvedIds = [], notAttemptedIds = [], stagedStateWrites = [], stagedRecordWrites = [];
+          var replacedIds = [];
           // PROGRESSION SERIES FOUNDATION: series updates staged by this Finish.
           var stagedSeriesWrites = [];
           var seriesServerTs = deps.serverTimestamp ? deps.serverTimestamp() : now;
@@ -1100,7 +1149,7 @@
               var sUnresolved = !sReview && sDoc.currentValue.amount === null;
               var sDecision = null, sEstAmount = null, sEstUnit = null;
               if (!sReview && !sUnresolved) {
-                var sTriple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, occurrenceDoc, pkg.workout, pkg.workoutId);
+                var sTriple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, occurrenceDoc, pkg.workout, pkg.workoutId, r.activeByRuleId[rid], true);
                 var sValidation = M('planValidateProgressionEvaluationInput')(sTriple.rule, sTriple.evidence, sTriple.basis);
                 if (!sValidation.ok) { sReview = 'notEvaluable'; }
                 else {
@@ -1142,6 +1191,30 @@
                 establishedIds.push(rid);
               } else {
                 stillUnresolvedIds.push(rid);
+              }
+              // RECOMMENDED REPLACEMENTS: apply the person's confirmed
+              // Run-level replacement in this SAME update. The original
+              // segment's outcome above is recorded first (finalValue); then
+              // the series switches to the new exercise at the fresh value
+              // the person typed. Never applied over a review case.
+              if (Object.prototype.hasOwnProperty.call(replByRuleId, rid)) {
+                if (sReview) return { outcome: 'invalidInput', reason: 'runReplacementBlockedByReview' };
+                var rpE = replByRuleId[rid];
+                var priorHist = Array.isArray(sDoc.replacementHistory) ? sDoc.replacementHistory : [];
+                var startingValue = { kind: sDoc.valueKind, amount: rpE.amount, unit: rpE.unit };
+                sPatch.replacementHistory = priorHist.concat([{
+                  sequence: priorHist.length + 1, occurrenceId: pkg.occurrenceId, workoutId: pkg.workoutId, operationId: pkg.operationId,
+                  planRuleId: rid, fromExerciseId: r.activeByRuleId[rid], toExerciseId: rpE.toExerciseId,
+                  previousValue: sDoc.currentValue,
+                  finalValue: Object.prototype.hasOwnProperty.call(sPatch, 'currentValue') ? sPatch.currentValue : sDoc.currentValue,
+                  startingValue: startingValue
+                }]);
+                sPatch.activeExerciseId = rpE.toExerciseId;
+                sPatch.currentValue = startingValue;
+                sPatch.isCurrentValueUnresolved = false;
+                sPatch.initializationSource = M('PLAN_RUN_SERIES_REPLACEMENT_SOURCE');
+                sPatch.status = 'active'; sPatch.needsManualReviewReason = null;
+                replacedIds.push(rid);
               }
               stagedSeriesWrites.push({ path: r.seriesPathByRuleId[rid], ruleId: rid, patch: sPatch });
               continue;
@@ -1312,6 +1385,9 @@
           // planRunOperationResultRefsValid duplicate check, widened
           // alongside this).
           var resultRefs = { workoutId: pkg.workoutId, occurrenceId: pkg.occurrenceId, planRunId: pkg.planRunId, appliedRuleIds: appliedIds, needsManualReviewRuleIds: reviewedIds, establishedRuleIds: establishedIds, stillUnresolvedRuleIds: stillUnresolvedIds, notAttemptedRuleIds: notAttemptedIds };
+          // RECOMMENDED REPLACEMENTS: only when one was applied, so every
+          // other receipt keeps its exact existing shape.
+          if (replacedIds.length) resultRefs.replacedRuleIds = replacedIds;
           var receiptData2 = { ownerUid: pkg.ownerUid, operationId: pkg.operationId, operationType: 'runFinish', preparedPackageHash: packageHash(pkg), outcome: 'committed', resultRefs: resultRefs, createdAt: now };
           // PROGRESSION SERIES FOUNDATION: when this Finish updates any series,
           // the receipt and each series update carry the SERVER timestamp, so
@@ -2201,6 +2277,12 @@
         }
         valuesByRuleId[L.rule.planRuleId] = {
           seriesId: raw.data.seriesId, seriesName: raw.data.seriesName, valueKind: raw.data.valueKind,
+          // RECOMMENDED REPLACEMENTS: the exercise this Session opens with for
+          // the series (the Run's replacement, if one is durable), and whether
+          // any LATER member Session is still unfinished (only then is
+          // "Replace for this active Run" meaningful).
+          activeExerciseId: M('planRunSeriesActiveExerciseId')(raw.data),
+          hasFutureMember: raw.data.memberOccurrenceIds.some(function (o) { return o !== occ.occurrenceId && raw.data.appliedOccurrenceIds.indexOf(o) === -1; }),
           currentValue: { kind: raw.data.currentValue.kind, amount: raw.data.currentValue.amount, unit: raw.data.currentValue.unit },
           status: raw.data.status, needsManualReviewReason: raw.data.needsManualReviewReason
         };

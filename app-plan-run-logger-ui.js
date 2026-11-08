@@ -492,20 +492,39 @@ function planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId) {
 function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
   var seriesResolution = {};
   var unitMismatch = false;
+  // RECOMMENDED REPLACEMENTS (in-memory, per open Session; saved only in the
+  // local recovery draft, never in the workout document):
+  //   effectiveExerciseByAssignmentId -- the exercise each Assignment opens
+  //     with (the Run's durable series replacement, if any);
+  //   seriesByAssignmentId -- the series facts Change Exercise needs;
+  //   recommendedByAssignmentId -- the Run's frozen recommendation snapshot;
+  //   pendingRunReplacements -- the person's not-yet-durable "Replace for
+  //     this active Run" choices, applied only by a committed Finish.
+  var effectiveExerciseByAssignmentId = {}, seriesByAssignmentId = {}, recommendedByAssignmentId = {};
   var exercises = occurrence.assignments.map(function (a) {
     var sv = planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId);
     var activeCtx = null, progressionCtx = null;
+    var rowExerciseId = a.exerciseId;
+    (a.rules || []).forEach(function (rl) {
+      var rec = (typeof planRunRuleEntryRecommendedIds === 'function') ? planRunRuleEntryRecommendedIds(rl) : null;
+      if (rl.enabled && rec) recommendedByAssignmentId[a.planAssignmentId] = rec.slice();
+    });
+    if (sv) {
+      if (typeof sv.value.activeExerciseId === 'string') rowExerciseId = sv.value.activeExerciseId;
+      seriesByAssignmentId[a.planAssignmentId] = { planRuleId: sv.rule.planRuleId, seriesId: sv.value.seriesId, seriesName: sv.value.seriesName, valueKind: sv.value.valueKind, activeExerciseId: rowExerciseId, hasFutureMember: sv.value.hasFutureMember === true };
+    }
+    effectiveExerciseByAssignmentId[a.planAssignmentId] = rowExerciseId;
     if (sv) {
       seriesResolution[a.planAssignmentId] = { planRuleId: sv.rule.planRuleId, seriesId: sv.value.seriesId, seriesName: sv.value.seriesName, valueKind: sv.value.valueKind, amount: sv.value.currentValue.amount, unit: sv.value.currentValue.unit, used: sv.usable };
       if (sv.value.currentValue.amount !== null && !sv.usable) unitMismatch = true;
       if (sv.usable) {
-        var holder = {}; holder[a.exerciseId] = { value: sv.value.currentValue.amount };
+        var holder = {}; holder[rowExerciseId] = { value: sv.value.currentValue.amount };
         activeCtx = sv.value.valueKind === 'workingLoad' ? { workingLoads: holder } : { trainingMaxes: holder };
         progressionCtx = { enabled: true, adjustmentType: sv.rule.adjustmentType };
       }
     }
     var sets = (a.orderedSets || []).map(function (os) {
-      var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, a.exerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
+      var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, rowExerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
       loggerSet.planSetId = os.planSetId;
       loggerSet.isPR = false;
       loggerSet.isNew1RM = false;
@@ -523,7 +542,10 @@ function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
     // (app-core.js's confirmChangeExercise) may relabel it 'substituted';
     // Add Exercise (app-core.js's addExToWorkout) stamps a brand-new row
     // 'added' -- neither is ever decided here, at launch.
-    return { exerciseId: a.exerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, origin: 'prescribed', sets: sets, perfVideos: [] };
+    // RECOMMENDED REPLACEMENTS: a series durably replaced for this Run opens
+    // with its replacement exercise, labeled 'runReplacement' (Finish checks
+    // it against the series state, never trusts the label).
+    return { exerciseId: rowExerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, origin: rowExerciseId === a.exerciseId ? 'prescribed' : 'runReplacement', sets: sets, perfVideos: [] };
   });
   // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): this function
   // already refuses above (`if (currentWorkout) { ... return false; }`)
@@ -557,7 +579,11 @@ function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
     canonicalRun: {
       planRunId: occurrence.planRunId, occurrenceId: occurrence.occurrenceId, planTemplateId: occurrence.planTemplateId,
       headRevisionId: occurrence.headRevisionId, planMicrocycleId: occurrence.planMicrocycleId, planSessionId: occurrence.planSessionId,
-      prescribedExerciseByAssignmentId: prescribedExerciseByAssignmentId
+      prescribedExerciseByAssignmentId: prescribedExerciseByAssignmentId,
+      effectiveExerciseByAssignmentId: effectiveExerciseByAssignmentId,
+      seriesByAssignmentId: seriesByAssignmentId,
+      recommendedByAssignmentId: recommendedByAssignmentId,
+      pendingRunReplacements: {}
     }
   };
   // In-memory only (never part of the persisted workout document): which
@@ -699,6 +725,11 @@ function finishCanonicalRunWorkout() {
     operationId: operationId, ownerUid: ownerUid, planRunId: currentWorkout.canonicalRun.planRunId,
     occurrenceId: currentWorkout.canonicalRun.occurrenceId, workoutId: currentWorkout.id, workout: built.workout
   };
+  // RECOMMENDED REPLACEMENTS: carry the person's still-pending Run-level
+  // replacements (re-checked against the rows first) inside this one
+  // prepared package, so Retry / Check Status / recovery reuse exactly it.
+  var runReplacements = (typeof planRunPendingReplacementsForFinish === 'function') ? planRunPendingReplacementsForFinish() : [];
+  if (runReplacements.length) pkg.runReplacements = runReplacements;
   planRunLoggerFinishCurrentOperationId = operationId;
   planRunLoggerFinishAttempt(pkg, ownerUid);
 }
