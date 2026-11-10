@@ -2067,3 +2067,13 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 
 
 
+
+/* ===== TRAIN — ACTIVE PROGRAMS CAROUSEL INTEGRATION ===== */
+/* Canonical Program Run cards share the carousel card shell, but only their
+   own buttons act: the card surface itself is not a tap target. */
+.prog-carousel-card.planrun-carousel-card { cursor: default; }
+.prog-carousel-card.planrun-carousel-card:active { border-color: var(--border); }
+.planrun-carousel-card .prog-card-dots { justify-content: flex-end; }
+/* Dots stay 6px to the eye but take taps over a larger area. */
+.home-carousel-dot[data-carousel-dot] { position: relative; cursor: pointer; }
+.home-carousel-dot[data-carousel-dot]::after { content: ''; position: absolute; top: -10px; bottom: -10px; left: -3px; right: -3px; }

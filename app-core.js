@@ -203,6 +203,9 @@ function resetLegacyProgramsForAuthChange() {
   appDb.programs = [];
   homeCarouselIdx = 0;
   homeCarouselProgs = [];
+  homeCarouselItems = [];
+  homeCarouselSelectedKey = null;
+  homeCarouselSuppressClick = false;
   currentProgramId = null;
   currentMicrocycleIdx = null;
   currentSessionIdx = null;
@@ -699,6 +702,20 @@ let homeCarouselIdx = 0;
 let homeCarouselProgs = [];
 let homeCarouselStartX = 0;
 let homeCarouselDragging = false;
+// TRAIN ACTIVE PROGRAMS CAROUSEL INTEGRATION -- one carousel for BOTH kinds
+// of active program: canonical Program Runs (cards rendered by
+// app-plan-run-ui.js) first, in the order the Run list returned them, then
+// legacy active Programs, in their existing order. Every slide carries a
+// TYPED identity -- 'run:<planRunId>' or 'legacy:<programId>' -- and nothing
+// is ever merged or de-duplicated by name, dates, order, contents or
+// similarity. The selected card is remembered by that identity (not by
+// position), so a card keeps its place when canonical Runs reload, when
+// "Load more" appends Runs ahead of the legacy cards, or when a Finish
+// advances a Run. Only a swipe or a dot tap changes the selection.
+let homeCarouselItems = [];          // [{ key, kind: 'run'|'legacy', run|prog }]
+let homeCarouselSelectedKey = null;  // typed identity of the card the person chose
+let homeCarouselSuppressClick = false;
+let homeCarouselSuppressTimer = null;
 
 function getActivePrograms() {
   return appDb.programs.filter(p => p.recordType === 'activeProgram' && p.status === 'active');
@@ -706,16 +723,13 @@ function getActivePrograms() {
 
 function renderHome() {
   renderHomeCarousel();
-  // SLICE 1 ADDITION -- additive canonical Program Run section. Guarded by
-  // typeof so this call is a harmless no-op if app-plan-run-ui.js is ever
-  // absent from a page load; the function itself checks the (disabled)
-  // capability flag and renders nothing when it is off, which is its real
-  // state today -- this line changes nothing a real user sees.
+  // SLICE 1 ADDITION -- canonical Program Runs. Since the carousel
+  // integration this starts (or refreshes) the canonical Run list; its
+  // cards are shown INSIDE the Active Programs carousel above (see
+  // renderHomeCarousel), never in a separate section.
   if (typeof planRunUiRenderHomeSection === 'function') planRunUiRenderHomeSection();
   // OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
   // additive "Needs Attention" section (app-plan-run-training-max-ui.js).
-  // Same guarded, no-op-when-absent, disabled-renders-nothing posture as
-  // the Program Run section immediately above.
   if (typeof planRunTmRenderHomeSection === 'function') planRunTmRenderHomeSection();
   const sorted = [...appDb.workouts].slice(0, 3);
   document.getElementById('home-recent').innerHTML = sorted.length
@@ -723,34 +737,28 @@ function renderHome() {
     : '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 6h18M3 12h18M3 18h18"/></svg><h3>No workouts yet</h3><p>Tap New Workout to get started</p></div>';
 }
 
-function renderHomeCarousel() {
-  homeCarouselProgs = getActivePrograms().filter(prog => !!planGetFirstUnfinishedSession(prog));
-  const carousel = document.getElementById('home-program-carousel');
-  const dotsEl   = document.getElementById('home-carousel-dots');
-  if (!carousel) return;
-  if (homeCarouselIdx >= homeCarouselProgs.length) homeCarouselIdx = 0;
-  if (!homeCarouselProgs.length) {
-    carousel.innerHTML = `<div class="prog-card-empty" onclick="showPage('page-programs')">
-      <div class="prog-card-empty-label">No Active Programs</div>
-      <div class="prog-card-empty-sub">Go to Plan to create and start a program</div>
-    </div>`;
-    dotsEl.innerHTML = '';
-    return;
+// Dots for slide i of n: one per loaded card (never for "Load more"), each a
+// tap target that moves the carousel to that card. Shown only for 2+ cards.
+function homeCarouselDotsHtml(i, n) {
+  if (n < 2) return '';
+  let html = '';
+  for (let di = 0; di < n; di++) {
+    html += `<div class="home-carousel-dot ${di === i ? 'active' : ''}" data-carousel-dot="${di}" role="button" aria-label="Show active program ${di + 1} of ${n}"></div>`;
   }
-  carousel.innerHTML = homeCarouselProgs.map((prog, i) => {
-    const next = planGetFirstUnfinishedSession(prog);
-    const totalSessions = planCountActiveSessions(prog);
-    const completed = (prog.completedSessionKeys || []).length;
-    const pct = totalSessions > 0 ? Math.round((completed / totalSessions) * 100) : 0;
-    const mc = prog.microcycles[next.microcycleIdx];
-    const sess = mc.sessions[next.sessionIdx];
-    const mcName = mc.name || `Micro ${next.microcycleIdx + 1}`;
-    const sessName = sess.name || `Session ${next.sessionIdx + 1}`;
-    const sessionLabel = `${mcName} • ${sessName}`;
-    const dotsHtml = homeCarouselProgs.length > 1
-      ? homeCarouselProgs.map((_, di) => `<div class="home-carousel-dot ${di === i ? 'active' : ''}"></div>`).join('')
-      : '';
-    return `<div class="prog-carousel-card" onclick="startWorkoutFromActiveCard('${prog.id}')">
+  return html;
+}
+
+function homeCarouselLegacyCardHtml(prog, i, n) {
+  const next = planGetFirstUnfinishedSession(prog);
+  const totalSessions = planCountActiveSessions(prog);
+  const completed = (prog.completedSessionKeys || []).length;
+  const pct = totalSessions > 0 ? Math.round((completed / totalSessions) * 100) : 0;
+  const mc = prog.microcycles[next.microcycleIdx];
+  const sess = mc.sessions[next.sessionIdx];
+  const mcName = mc.name || `Micro ${next.microcycleIdx + 1}`;
+  const sessName = sess.name || `Session ${next.sessionIdx + 1}`;
+  const sessionLabel = `${mcName} • ${sessName}`;
+  return `<div class="prog-carousel-card" data-testid="legacy-carousel-card" data-carousel-key="${escapeHtml('legacy:' + prog.id)}" onclick="startWorkoutFromActiveCard('${prog.id}')">
       <div style="display:flex;align-items:flex-start;justify-content:space-between">
         <div style="flex:1;min-width:0">
           <div class="prog-card-session">${sessionLabel}</div>
@@ -761,11 +769,40 @@ function renderHomeCarousel() {
       <div class="prog-card-progress-label">${pct}% Complete</div>
       <div class="prog-card-bar-row">
         <div class="prog-card-bar-track"><div class="prog-card-bar-fill" style="width:${pct}%"></div></div>
-        <div class="prog-card-dots">${dotsHtml}</div>
+        <div class="prog-card-dots">${homeCarouselDotsHtml(i, n)}</div>
       </div>
     </div>`;
-  }).join('');
-  dotsEl.innerHTML = '';
+}
+
+function renderHomeCarousel() {
+  homeCarouselProgs = getActivePrograms().filter(prog => !!planGetFirstUnfinishedSession(prog));
+  const runs = (typeof planRunUiCarouselRuns === 'function') ? planRunUiCarouselRuns() : [];
+  homeCarouselItems = runs.map(run => ({ key: 'run:' + run.planRunId, kind: 'run', run }))
+    .concat(homeCarouselProgs.map(prog => ({ key: 'legacy:' + prog.id, kind: 'legacy', prog })));
+  const carousel = document.getElementById('home-program-carousel');
+  const dotsEl   = document.getElementById('home-carousel-dots');
+  if (typeof planRunUiRenderCarouselStatus === 'function') planRunUiRenderCarouselStatus();
+  if (!carousel) return;
+  const n = homeCarouselItems.length;
+  const keyIdx = homeCarouselSelectedKey ? homeCarouselItems.findIndex(it => it.key === homeCarouselSelectedKey) : -1;
+  homeCarouselIdx = keyIdx !== -1 ? keyIdx : Math.max(0, Math.min(homeCarouselIdx, n - 1));
+  if (!n) {
+    // "No Active Programs" only once BOTH sources are known to be empty --
+    // never while canonical Runs are still loading or failed to load (the
+    // status line under the carousel says which, with Retry).
+    const canonicalSettled = (typeof planRunUiCarouselSettled === 'function') ? planRunUiCarouselSettled() : true;
+    carousel.innerHTML = canonicalSettled ? `<div class="prog-card-empty" onclick="showPage('page-programs')">
+      <div class="prog-card-empty-label">No Active Programs</div>
+      <div class="prog-card-empty-sub">Go to Plan to create and start a program</div>
+    </div>` : '';
+    if (dotsEl) dotsEl.innerHTML = '';
+    updateCarouselPosition(false);
+    return;
+  }
+  carousel.innerHTML = homeCarouselItems.map((it, i) => it.kind === 'run'
+    ? planRunUiRenderRunCard(it.run, homeCarouselDotsHtml(i, n))
+    : homeCarouselLegacyCardHtml(it.prog, i, n)).join('');
+  if (dotsEl) dotsEl.innerHTML = '';
   updateCarouselPosition(false);
   initCarouselSwipe();
 }
@@ -775,28 +812,62 @@ function updateCarouselPosition(animate) {
   if (!carousel) return;
   carousel.style.transition = animate ? 'transform 0.3s ease' : 'none';
   carousel.style.transform  = `translateX(-${homeCarouselIdx * 100}%)`;
+  const n = homeCarouselItems.length;
   document.querySelectorAll('.home-carousel-dot').forEach((d, i) => {
-    d.classList.toggle('active', (i % homeCarouselProgs.length) === homeCarouselIdx);
+    d.classList.toggle('active', n > 0 && (i % n) === homeCarouselIdx);
   });
 }
 
-function goToCarouselSlide(i) { homeCarouselIdx = i; updateCarouselPosition(true); }
+function goToCarouselSlide(i) {
+  if (!homeCarouselItems.length) return;
+  homeCarouselIdx = Math.max(0, Math.min(i, homeCarouselItems.length - 1));
+  homeCarouselSelectedKey = homeCarouselItems[homeCarouselIdx].key;
+  updateCarouselPosition(true);
+}
 
+// Wired ONCE per page load (the wrap element is static markup; only its
+// contents are re-rendered), so repeated renders never add handlers.
 function initCarouselSwipe() {
   const wrap = document.getElementById('home-program-carousel-wrap');
   if (!wrap || wrap._swipeInit) return;
   wrap._swipeInit = true;
-  wrap.addEventListener('touchstart', e => { homeCarouselStartX = e.touches[0].clientX; homeCarouselDragging = true; }, { passive: true });
+  // A new touch is a new gesture: any click-suppression left over from an
+  // earlier swipe (one whose click the browser never sent) is dropped here,
+  // so a real tap right after a swipe always works.
+  wrap.addEventListener('touchstart', e => { homeCarouselStartX = e.touches[0].clientX; homeCarouselDragging = true; homeCarouselSuppressClick = false; }, { passive: true });
   wrap.addEventListener('touchend', e => {
     if (!homeCarouselDragging) return;
     homeCarouselDragging = false;
     const diff = homeCarouselStartX - e.changedTouches[0].clientX;
+    // A horizontal drag is a swipe, never a tap: the click the browser may
+    // still fire at the end of it is swallowed below, so a swipe that starts
+    // on a button (Start Session, •••, a legacy card) never triggers it.
+    if (Math.abs(diff) > 10) {
+      homeCarouselSuppressClick = true;
+      clearTimeout(homeCarouselSuppressTimer);
+      homeCarouselSuppressTimer = setTimeout(() => { homeCarouselSuppressClick = false; }, 700);
+    }
     if (Math.abs(diff) > 40) {
-      if (diff > 0 && homeCarouselIdx < homeCarouselProgs.length - 1) homeCarouselIdx++;
-      else if (diff < 0 && homeCarouselIdx > 0) homeCarouselIdx--;
-      updateCarouselPosition(true);
+      if (diff > 0 && homeCarouselIdx < homeCarouselItems.length - 1) goToCarouselSlide(homeCarouselIdx + 1);
+      else if (diff < 0 && homeCarouselIdx > 0) goToCarouselSlide(homeCarouselIdx - 1);
+      else updateCarouselPosition(true);
     }
   }, { passive: true });
+  // Capture phase: runs before any card's own handler. Swallows the click
+  // that ends a swipe, and handles dot taps without letting them reach the
+  // card underneath (a legacy card's whole surface starts a workout).
+  wrap.addEventListener('click', e => {
+    if (homeCarouselSuppressClick) {
+      homeCarouselSuppressClick = false;
+      e.stopPropagation(); e.preventDefault();
+      return;
+    }
+    const dot = e.target && e.target.closest ? e.target.closest('[data-carousel-dot]') : null;
+    if (dot) {
+      e.stopPropagation(); e.preventDefault();
+      goToCarouselSlide(Number(dot.getAttribute('data-carousel-dot')));
+    }
+  }, true);
 }
 
 function startWorkoutFromCard(progId) {

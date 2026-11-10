@@ -135,6 +135,18 @@
 // fsPlanRunEnd/fsPlanRunPreflightEnd/fsPlanRunCheckEndStatus, and still
 // never reads app-plan-run-end-ui.js's own `planRunEndStateByRunId`
 // directly -- only through that file's one exported read-only check.
+//
+// TRAIN ACTIVE PROGRAMS CAROUSEL INTEGRATION (this round): the temporary
+// "Started From Plan" section (#planrun-home-section) is gone. Each active
+// Run's card is now one slide of the established Active Programs carousel
+// (app-core.js renderHomeCarousel), ahead of the legacy active-Program cards,
+// identified by its own typed key 'run:<planRunId>'. This file still owns
+// everything about a Run card -- its markup (planRunUiRenderRunCard), the
+// Run list and its paging, the post-Finish guards, Start Session/Resume,
+// Retry -- unchanged; only WHERE it is drawn moved. The list's loading /
+// error / Retry / "Load more" line is drawn under the carousel in
+// #planrun-carousel-status (never a card, never a dot). Clicks are still
+// delegated, now from #home-program-section, which holds both.
 // =============================================================================
 
 // ---- Capability gate -------------------------------------------------------
@@ -449,15 +461,22 @@ function planRunUiResetState() {
 function planRunUiResetForOwner(uid) {
   planRunUiLastKnownOwnerUid = uid;
   planRunUiResetState();
-  var homeEl = (typeof document !== 'undefined') ? document.getElementById('planrun-home-section') : null;
-  if (homeEl) homeEl.innerHTML = '';
+  // CAROUSEL INTEGRATION: Run cards now live in the shared carousel, so the
+  // carousel's cards and dots are blanked here too, together with the
+  // status line (app-core.js's resetLegacyProgramsForAuthChange, called in
+  // the same synchronous auth step, clears the legacy side and the
+  // remembered selection).
+  ['planrun-carousel-status', 'home-program-carousel', 'home-carousel-dots'].forEach(function (id) {
+    var homeEl = (typeof document !== 'undefined') ? document.getElementById(id) : null;
+    if (homeEl) homeEl.innerHTML = '';
+  });
 }
 
 // ---- Entry point, called additively from renderHome() (app-core.js). -----
 function planRunUiRenderHomeSection() {
-  var el = document.getElementById('planrun-home-section');
+  var el = document.getElementById('planrun-carousel-status');
   if (!el) return; // markup absent (e.g. an older cached page) -- fail silent, never throw from a render hook
-  planRunUiWireHomeSectionEvents(el);
+  planRunUiWireHomeSectionEvents(document.getElementById('home-program-section'));
   var ownerUid = planRunUiCurrentUid();
   if (ownerUid !== planRunUiLastKnownOwnerUid) {
     // DEFENSIVE BACKSTOP ONLY -- the primary auth boundary is
@@ -471,6 +490,7 @@ function planRunUiRenderHomeSection() {
     planRunUiLastKnownOwnerUid = ownerUid;
     planRunUiResetState();
     el.innerHTML = '';
+    planRunUiRenderSection();
   }
   if (!planRunUiCapabilityEnabled()) {
     // Disabled: render nothing, and -- critically -- never call
@@ -479,6 +499,7 @@ function planRunUiRenderHomeSection() {
     // off again) so a disabled reload never shows stale rows.
     el.innerHTML = '';
     planRunUiResetState();
+    planRunUiRenderSection();
     return;
   }
   planRunUiFetchFirstPage();
@@ -665,64 +686,79 @@ function planRunUiRetry() {
   planRunUiFetchFirstPage();
 }
 
-// ---- Rendering: the Home-screen section -----------------------------------
+// ---- Rendering: Run cards inside the Active Programs carousel ------------
+// Every state change in this file still calls planRunUiRenderSection(); it
+// now repaints the shared carousel (app-core.js renderHomeCarousel), which
+// asks this file for the Run cards to show (planRunUiCarouselRuns) and to
+// draw the list's status line (planRunUiRenderCarouselStatus).
 function planRunUiRenderSection() {
-  var el = document.getElementById('planrun-home-section');
+  planRunUiWireHomeSectionEvents(document.getElementById('home-program-section'));
+  if (typeof renderHomeCarousel === 'function') renderHomeCarousel();
+  else planRunUiRenderCarouselStatus();
+}
+
+// The Runs to show as cards: only an accepted list ('ok' -- every post-Finish
+// guard already proven), only for the owner this state belongs to. While
+// loading, after an error, or on an integrity conflict, none are shown (no
+// stale cards); the status line explains instead.
+function planRunUiCarouselRuns() {
+  if (!planRunUiCapabilityEnabled()) return [];
+  if (planRunUiCurrentUid() !== planRunUiLastKnownOwnerUid) return [];
+  return planRunUiState.phase === 'ok' ? planRunUiState.runs.slice() : [];
+}
+
+// True once the Run list is known (or the capability is off), so the
+// carousel may honestly say "No Active Programs" when nothing is active.
+function planRunUiCarouselSettled() {
+  if (!planRunUiCapabilityEnabled()) return true;
+  return planRunUiState.phase === 'ok' || planRunUiState.phase === 'empty';
+}
+
+// The Run list's own loading / error / Retry / integrity / "Load more" line,
+// under the carousel. Not a card and not a dot.
+function planRunUiRenderCarouselStatus() {
+  var el = document.getElementById('planrun-carousel-status');
   if (!el) return;
-  planRunUiWireHomeSectionEvents(el);
-  if (!planRunUiCapabilityEnabled()) { el.innerHTML = ''; return; }
-
-  var html = '<div class="planrun-section" style="padding:0 16px 4px">';
-  // DUPLICATE-PRESENTATION USABILITY CORRECTION (Round 2, Approach 4) --
-  // label text only, changed from "Program Run (Preview)" to the
-  // user-facing wording approved in the Round 2 specification ("Started
-  // From Plan"), tying this section to the already user-facing "Plan" nav
-  // tab instead of internal engineering terms. No markup structure,
-  // handler, data fetch, or action in this section changes.
-  html += '<div class="home-section-label" style="margin:6px 0 8px">Started From Plan</div>';
-
+  if (!planRunUiCapabilityEnabled() || planRunUiCurrentUid() !== planRunUiLastKnownOwnerUid) { el.innerHTML = ''; return; }
+  var html = '';
   if (planRunUiState.phase === 'loading') {
-    html += '<div class="planrun-loading" style="padding:14px;color:var(--text2)">Loading active Program Runs…</div>';
+    html += '<div class="planrun-loading" style="padding:10px 2px;color:var(--text2)">Loading active Program Runs…</div>';
   } else if (planRunUiState.phase === 'error') {
-    html += '<div class="planrun-error" style="padding:14px;border:1px solid var(--border,#ccc);border-radius:8px">'
+    html += '<div class="planrun-error" style="padding:12px 14px;margin-top:8px;border:1px solid var(--border,#ccc);border-radius:8px">'
       + '<div style="margin-bottom:8px">Couldn’t load your active Program Runs.</div>'
       + '<button class="btn-secondary" data-planrun-action="retry">Retry</button>'
       + '</div>';
   } else if (planRunUiState.phase === 'integrityConflict') {
-    html += '<div class="planrun-integrity-conflict" style="padding:14px;border:1px solid var(--border,#ccc);border-radius:8px">'
+    html += '<div class="planrun-integrity-conflict" style="padding:12px 14px;margin-top:8px;border:1px solid var(--border,#ccc);border-radius:8px">'
       + '<div style="margin-bottom:8px">We found a problem with your active Program data and can’t show it safely right now.</div>'
       + '<button class="btn-secondary" data-planrun-action="retry">Retry</button>'
       + '</div>';
-  } else if (planRunUiState.phase === 'empty') {
-    html += '<div class="planrun-empty" style="padding:14px;color:var(--text2)">No active canonical Program Runs.</div>';
-  } else if (planRunUiState.phase === 'ok') {
-    html += planRunUiState.runs.map(planRunUiRenderRunCard).join('');
-    if (planRunUiState.hasMore) {
-      html += '<div style="padding:6px 0">';
-      if (planRunUiState.loadingMore) {
-        html += '<span style="color:var(--text2)">Loading more…</span>';
-      } else {
-        html += '<button class="btn-secondary" data-planrun-action="load-more">Load more</button>';
-        if (planRunUiState.loadMoreError) {
-          html += ' <span style="color:#b00">Couldn’t load more, try again.</span>';
-        }
+  } else if (planRunUiState.phase === 'ok' && planRunUiState.hasMore) {
+    html += '<div style="padding:8px 2px 0">';
+    if (planRunUiState.loadingMore) {
+      html += '<span style="color:var(--text2)">Loading more…</span>';
+    } else {
+      html += '<button class="btn-secondary" data-planrun-action="load-more">Load more</button>';
+      if (planRunUiState.loadMoreError) {
+        html += ' <span style="color:#b00">Couldn’t load more, try again.</span>';
       }
-      html += '</div>';
     }
+    html += '</div>';
   }
-  // phase === 'idle': render nothing yet (initial state before the first
-  // fetch resolves) -- avoids a flash of empty-state copy before loading.
-
-  html += '</div>';
+  // 'idle' and 'empty': nothing here (the carousel itself shows any cards,
+  // or "No Active Programs" when there are none of either kind).
   el.innerHTML = html;
 }
 
-function planRunUiRenderRunCard(run) {
+function planRunUiRenderRunCard(run, dotsHtml) {
   var detail = planRunUiState.detailByRunId[run.planRunId];
   var isOpen = planRunUiState.expandedRunId === run.planRunId;
   var menuOpen = planRunUiState.menuOpenRunId === run.planRunId;
   var name = escapeHtml(run.nameSnapshot || run.planTemplateId || 'Program Run');
-  var card = '<div class="planrun-card" style="border:1px solid var(--border,#ccc);border-radius:8px;padding:10px 12px;margin-bottom:8px">';
+  // CAROUSEL INTEGRATION: the card is now a carousel slide (the established
+  // .prog-carousel-card shell) with its own typed identity. Unlike a legacy
+  // card, its surface has no tap action -- only its own buttons act.
+  var card = '<div class="prog-carousel-card planrun-card planrun-carousel-card" data-testid="planrun-carousel-card" data-carousel-key="' + escapeHtml('run:' + run.planRunId) + '" data-planrun-run-id="' + escapeHtml(run.planRunId) + '">';
 
   // END RUN SLICE ADDITION, kept as the SAME call with the SAME unmodified
   // side effects (see app-plan-run-end-ui.js's own header -- that file is
@@ -771,6 +807,7 @@ function planRunUiRenderRunCard(run) {
   } else if (endHtml) {
     card += endHtml;
   }
+  if (dotsHtml) card += '<div class="prog-card-dots" style="margin-top:10px">' + dotsHtml + '</div>';
   card += '</div>';
   return card;
 }

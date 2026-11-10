@@ -107,20 +107,14 @@
           <div id="home-program-carousel" style="display:flex;transition:transform 0.3s ease"></div>
         </div>
         <div id="home-carousel-dots" style="display:none"></div>
+        <!-- TRAIN ACTIVE PROGRAMS CAROUSEL INTEGRATION -- canonical Program
+             Run cards are slides of the carousel above (ahead of legacy
+             active-Program cards); the temporary "Started From Plan"
+             section is removed. This line holds only the Run list's own
+             loading / error / Retry / "Load more" state, filled by
+             app-plan-run-ui.js (planRunUiRenderCarouselStatus). -->
+        <div id="planrun-carousel-status" data-testid="planrun-carousel-status"></div>
       </div>
-
-      <!-- SLICE 1 ADDITION -- canonical Program Run section. Empty container,
-           additive: filled by app-plan-run-ui.js's own capability-gated
-           renderer (planRunUiRenderHomeSection), which would leave this
-           empty and issue zero Run I/O if the canonical Run capability were
-           disabled -- it is not. ROUND 5 CORRECTION: this comment
-           previously called the disabled state "its real, hardcoded-false
-           state today" -- stale/wrong. The capability is hardcoded `true`
-           (deliberately reactivated during Stage 6 and still enabled
-           through the supplemental-set deployment, a confirmed baseline
-           fact for this round, not a new finding), so this container is
-           actively filled with real content for a real user today. -->
-      <div id="planrun-home-section"></div>
 
       <!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
            "Needs Attention" section (unresolved training-max Rules). Empty
@@ -129,8 +123,8 @@
            (planRunTmRenderHomeSection). ROUND 5 CORRECTION: this previously
            said this container "issues zero Run I/O whenever the canonical
            Run capability is disabled (its real, hardcoded-false state
-           today)" -- stale/wrong, same correction as planrun-home-section
-           immediately above: the capability is hardcoded `true` and has
+           today)" -- stale/wrong, same correction as the former planrun-home-section
+           container (now removed): the capability is hardcoded `true` and has
            been enabled since Stage 6, so this container is actively filled
            today. -->
       <div id="planrun-needs-attention-section"></div>
