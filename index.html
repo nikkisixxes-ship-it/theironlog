@@ -116,18 +116,6 @@
         <div id="planrun-carousel-status" data-testid="planrun-carousel-status"></div>
       </div>
 
-      <!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
-           "Needs Attention" section (unresolved training-max Rules). Empty
-           container, additive: filled by app-plan-run-training-max-
-           ui.js's own capability-gated renderer
-           (planRunTmRenderHomeSection). ROUND 5 CORRECTION: this previously
-           said this container "issues zero Run I/O whenever the canonical
-           Run capability is disabled (its real, hardcoded-false state
-           today)" -- stale/wrong, same correction as the former planrun-home-section
-           container (now removed): the capability is hardcoded `true` and has
-           been enabled since Stage 6, so this container is actively filled
-           today. -->
-      <div id="planrun-needs-attention-section"></div>
 
       <!-- START BLANK WORKOUT -->
       <div style="padding:10px 16px 4px">
@@ -384,6 +372,17 @@
   <div class="modal">
     <div class="modal-header"><div class="modal-title" id="session-modal-title">Session</div><button class="btn-icon" onclick="closeModal('modal-session')">✕</button></div>
     <div id="session-modal-body"></div>
+  </div>
+</div>
+
+<!-- VISUAL-ALIGNMENT CORRECTION -- contextual Training Max prompt (replaces
+     the permanent "Needs Attention" section on TRAIN). Filled by
+     app-plan-run-training-max-ui.js when a Session being started or resumed
+     needs a Training Max that was left blank at Run Start. -->
+<div class="modal-overlay" id="modal-planrun-tm" data-testid="tm-prompt">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Training Max Needed</div><button class="btn-icon" data-planrun-tm-action="cancel" aria-label="Cancel">✕</button></div>
+    <div id="planrun-tm-prompt-body"></div>
   </div>
 </div>
 
@@ -647,7 +646,8 @@
      ENABLED is separately, explicitly activated" -- stale/wrong, same
      correction as the SLICE 1 ADDITION comment above: the capability has
      been enabled since Stage 6, so this DOES change what a real user sees
-     today. -->
+     today. VISUAL-ALIGNMENT CORRECTION: this file is now the contextual
+     Training Max prompt (#modal-planrun-tm), not a TRAIN section. -->
 <script src="app-plan-run-training-max-ui.js"></script>
 <!-- LOGGER-FINISH SLICE ADDITION -- Run-aware real logger launch + Finish
      (see this file's own header). ROUND 5 CORRECTION: this previously said

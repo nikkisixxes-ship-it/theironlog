@@ -2068,12 +2068,24 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 
 
 
-/* ===== TRAIN — ACTIVE PROGRAMS CAROUSEL INTEGRATION ===== */
-/* Canonical Program Run cards share the carousel card shell, but only their
-   own buttons act: the card surface itself is not a tap target. */
-.prog-carousel-card.planrun-carousel-card { cursor: default; }
-.prog-carousel-card.planrun-carousel-card:active { border-color: var(--border); }
-.planrun-carousel-card .prog-card-dots { justify-content: flex-end; }
-/* Dots stay 6px to the eye but take taps over a larger area. */
+/* ===== TRAIN — ACTIVE PROGRAMS CAROUSEL ===== */
+/* One card template for legacy Programs AND Program Runs
+   (homeCarouselCardHtml in app-core.js). These two rules replace the inline
+   styles the legacy card used to carry, with the same values. */
+.prog-card-head { display: flex; align-items: flex-start; justify-content: space-between; }
+.prog-card-head-text { flex: 1; min-width: 0; }
+/* A Program Run card with no action available right now (loading, or the
+   Session can't be shown) is not a tap target. */
+.prog-carousel-card.planrun-carousel-card:not([data-planrun-action]) { cursor: default; }
+.prog-carousel-card.planrun-carousel-card:not([data-planrun-action]):active { border-color: var(--border); }
+/* Many cards: the dot row wraps inside the card instead of widening it (a
+   wider card would push the carousel out of step with its slides). Applies
+   to both kinds of card alike. */
+.prog-carousel-card { flex: 0 0 100%; max-width: 100%; }
+.prog-card-dots { flex-wrap: wrap; min-width: 0; row-gap: 6px; }
+/* End Run recovery states that must stay visible inside a Run card. */
+.prog-card-extra { margin-top: 10px; }
+/* Dots stay 6px to the eye; each takes taps over a 12px square that never
+   overlaps a neighbour, including when the dot row wraps. */
 .home-carousel-dot[data-carousel-dot] { position: relative; cursor: pointer; }
-.home-carousel-dot[data-carousel-dot]::after { content: ''; position: absolute; top: -10px; bottom: -10px; left: -3px; right: -3px; }
+.home-carousel-dot[data-carousel-dot]::after { content: ''; position: absolute; top: -3px; bottom: -3px; left: -3px; right: -3px; }

@@ -1129,8 +1129,10 @@ function planRunStartRenderRuleRow(row, disabled) {
   // weight resolves itself automatically the first time a qualifying set is
   // logged; a blank training max must be entered later, by hand, from the
   // Needs Attention list (app-plan-run-training-max-ui.js).
+  // VISUAL-ALIGNMENT CORRECTION: the Needs Attention list is gone; the value
+  // is asked for when a Session that needs it is started or resumed.
   var deferredExplainer = row.kind === 'trainingMax'
-    ? 'You can set this later from the Needs Attention list once the Program is running.'
+    ? 'You’ll be asked for this when you start a Session that uses it.'
     : 'This will be filled in automatically the first time you log a qualifying set.';
   var amountUnitDisabled = disabled || row.deferred;
   var ad = amountUnitDisabled ? 'disabled' : '';

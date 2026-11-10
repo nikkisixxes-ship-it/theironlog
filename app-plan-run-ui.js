@@ -170,7 +170,7 @@ function planRunUiHandleHomeSectionClick(event) {
   if (action === 'retry') { planRunUiRetry(); }
   else if (action === 'load-more') { planRunUiFetchNextPage(); }
   else if (action === 'toggle-run') { planRunUiToggleRunDetail(btn.getAttribute('data-planrun-run-id')); }
-  else if (action === 'resume') { planRunUiOpenSessionPreview(btn.getAttribute('data-planrun-run-id'), btn.getAttribute('data-planrun-occurrence-id')); }
+  else if (action === 'resume') { planRunUiResumeSession(btn.getAttribute('data-planrun-run-id'), btn.getAttribute('data-planrun-occurrence-id')); }
   else if (action === 'start-session') { planRunUiStartSession(btn.getAttribute('data-planrun-run-id'), btn.getAttribute('data-planrun-occurrence-id')); }
   // END RUN SLICE ADDITION -- routed to app-plan-run-end-ui.js's own
   // functions, the same cross-file hand-off pattern "open-logger" already
@@ -187,6 +187,8 @@ function planRunUiHandleHomeSectionClick(event) {
   // USABILITY CORRECTION ADDITION (independent-review finding, this round):
   // the card's own secondary overflow menu (hosts "End Run" when idle).
   else if (action === 'toggle-menu') { planRunUiToggleRunMenu(btn.getAttribute('data-planrun-run-id')); }
+  // VISUAL-ALIGNMENT CORRECTION: the card's ••• opens the shared dropdown.
+  else if (action === 'open-menu') { planRunUiOpenRunMenu(btn, btn.getAttribute('data-planrun-run-id')); }
 }
 function planRunUiWireHomeSectionEvents(el) {
   if (!el || el.__planRunUiWired) return;
@@ -197,7 +199,7 @@ function planRunUiHandlePreviewClick(event) {
   var btn = event.target.closest ? event.target.closest('[data-planrun-action]') : null;
   if (!btn) return;
   var action = btn.getAttribute('data-planrun-action');
-  if (action === 'back') { showPage('page-home'); return; }
+  if (action === 'back') { if (typeof planRunTmDropGate === 'function') planRunTmDropGate(); showPage('page-home'); return; }
   if (action === 'open-logger') {
     // Hands the SAME already-verified run/occurrence this screen already
     // has (planRunUiLastPreviewRunOccurrence, stamped by
@@ -427,6 +429,7 @@ function planRunUiResetState() {
   planRunUiListEpoch++;
   planRunUiPreviewEpoch++;
   planRunUiLastPreviewRunOccurrence = null;
+  planRunUiMenuRunId = null;
   var previewEl = (typeof document !== 'undefined') ? document.getElementById('page-run-session-preview') : null;
   if (previewEl) previewEl.innerHTML = '';
 }
@@ -726,19 +729,19 @@ function planRunUiRenderCarouselStatus() {
   } else if (planRunUiState.phase === 'error') {
     html += '<div class="planrun-error" style="padding:12px 14px;margin-top:8px;border:1px solid var(--border,#ccc);border-radius:8px">'
       + '<div style="margin-bottom:8px">Couldn’t load your active Program Runs.</div>'
-      + '<button class="btn-secondary" data-planrun-action="retry">Retry</button>'
+      + '<button class="btn btn-secondary btn-sm" data-planrun-action="retry">Retry</button>'
       + '</div>';
   } else if (planRunUiState.phase === 'integrityConflict') {
     html += '<div class="planrun-integrity-conflict" style="padding:12px 14px;margin-top:8px;border:1px solid var(--border,#ccc);border-radius:8px">'
       + '<div style="margin-bottom:8px">We found a problem with your active Program data and can’t show it safely right now.</div>'
-      + '<button class="btn-secondary" data-planrun-action="retry">Retry</button>'
+      + '<button class="btn btn-secondary btn-sm" data-planrun-action="retry">Retry</button>'
       + '</div>';
   } else if (planRunUiState.phase === 'ok' && planRunUiState.hasMore) {
     html += '<div style="padding:8px 2px 0">';
     if (planRunUiState.loadingMore) {
       html += '<span style="color:var(--text2)">Loading more…</span>';
     } else {
-      html += '<button class="btn-secondary" data-planrun-action="load-more">Load more</button>';
+      html += '<button class="btn btn-secondary btn-sm" data-planrun-action="load-more">Load more</button>';
       if (planRunUiState.loadMoreError) {
         html += ' <span style="color:#b00">Couldn’t load more, try again.</span>';
       }
@@ -750,66 +753,108 @@ function planRunUiRenderCarouselStatus() {
   el.innerHTML = html;
 }
 
+// VISUAL-ALIGNMENT CORRECTION: a Run card is drawn with the SAME template as
+// a legacy active-Program card (app-core.js homeCarouselCardHtml) -- same
+// classes, same structure, no inline card styles of its own:
+//   session label  -- the Run's next Session ("Week 2 • Bench Day")
+//   program name   -- the Run's own name
+//   •••            -- the same menu button and the same dropdown menu
+//                     (End Run lives there, as before in the ⋯ menu)
+//   progress       -- "N% Complete" + bar, from the Run's own counts
+//                     (totalOccurrenceCount / remainingOccurrenceIds), with
+//                     "In Progress" appended while its Session is open
+//   dots           -- the same dot row
+// The card's primary action is the legacy card's: tapping the card opens the
+// next Session -- Start Session (pending) or Resume (in progress) -- through
+// the SAME unchanged entry points (data-planrun-action="start-session" /
+// "resume", routed by planRunUiHandleHomeSectionClick). While the Session
+// is loading, can't be shown safely, or Start is blocked by an End attempt,
+// the card has no action. End Run recovery states (pending, uncertain,
+// rejected, blocked by an open Session...) stay visible inside the card,
+// exactly as before -- never behind a menu.
+function planRunUiRunCardSessionLabel(occ) {
+  var ns = occ && occ.nameSnapshot;
+  if (typeof ns === 'string' && ns) return ns;
+  var mc = (ns && typeof ns.microcycleName === 'string' && ns.microcycleName) ? ns.microcycleName : '';
+  var sess = (ns && typeof ns.sessionName === 'string' && ns.sessionName) ? ns.sessionName : '';
+  if (mc && sess) return mc + ' • ' + sess;
+  return sess || mc || 'Next Session';
+}
 function planRunUiRenderRunCard(run, dotsHtml) {
   var detail = planRunUiState.detailByRunId[run.planRunId];
-  var isOpen = planRunUiState.expandedRunId === run.planRunId;
-  var menuOpen = planRunUiState.menuOpenRunId === run.planRunId;
+  var runIdAttr = escapeHtml(run.planRunId);
   var name = escapeHtml(run.nameSnapshot || run.planTemplateId || 'Program Run');
-  // CAROUSEL INTEGRATION: the card is now a carousel slide (the established
-  // .prog-carousel-card shell) with its own typed identity. Unlike a legacy
-  // card, its surface has no tap action -- only its own buttons act.
-  var card = '<div class="prog-carousel-card planrun-card planrun-carousel-card" data-testid="planrun-carousel-card" data-carousel-key="' + escapeHtml('run:' + run.planRunId) + '" data-planrun-run-id="' + escapeHtml(run.planRunId) + '">';
+  var total = Number.isInteger(run.totalOccurrenceCount) && run.totalOccurrenceCount > 0 ? run.totalOccurrenceCount : 0;
+  var remaining = Array.isArray(run.remainingOccurrenceIds) ? run.remainingOccurrenceIds.length : total;
+  var pct = total > 0 ? Math.max(0, Math.min(100, Math.round(((total - remaining) / total) * 100))) : 0;
 
-  // END RUN SLICE ADDITION, kept as the SAME call with the SAME unmodified
-  // side effects (see app-plan-run-end-ui.js's own header -- that file is
-  // not touched by this round). USABILITY CORRECTION (independent-review
-  // finding, this round) -- only WHERE this returned markup is placed
-  // changes: the plain, steady-state "End Run" entry point (no attempt in
-  // flight, nothing blocking it) is no longer a prominent, always-visible
-  // top-row button sitting above the actual workout action -- it moves
-  // into this card's own secondary overflow area, opened via the "⋯"
-  // control below. Any OTHER state this returns (pending, competing
-  // elsewhere, blocked by an open Session, uncertain, or rejected) is a
-  // real recovery/safety state, not idle chrome, and stays exactly where
-  // it already rendered: inline and unmissable, never behind a menu. The
-  // distinction is made by checking this control's own public data-testid
-  // contract, never by reading app-plan-run-end-ui.js's internal state.
+  // END RUN (app-plan-run-end-ui.js, untouched): the plain idle "End Run"
+  // control moves into the ••• dropdown; every other state it returns is a
+  // real recovery/safety state and stays inline, inside the card.
   var endHtml = (typeof planRunEndRenderControl === 'function') ? planRunEndRenderControl(run) : '';
   var endIsPlainIdleButton = endHtml.indexOf('data-testid="planrun-end-run-btn"') !== -1;
 
-  card += '<div style="display:flex;justify-content:space-between;align-items:center">';
-  card += '<div><div style="font-weight:600">' + name + '</div>'
-    + '<div style="font-size:12px;color:var(--text2)">' + escapeHtml(run.status || '') + '</div></div>';
-  card += '<div>';
-  if (endIsPlainIdleButton) {
-    card += '<button class="btn-secondary" data-testid="planrun-overflow-btn" data-planrun-action="toggle-menu" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" title="Program Run options" aria-label="Program Run options">⋯</button> ';
-  }
-  card += '<button class="btn-secondary" data-planrun-action="toggle-run" data-planrun-run-id="' + escapeHtml(run.planRunId) + '">' + (isOpen ? 'Hide' : 'View') + '</button>';
-  card += '</div>';
-  card += '</div>';
-
-  // USABILITY CORRECTION (independent-review finding, this round): the
-  // next Session, its status, and the Start Session/Resume action are now
-  // always rendered -- never gated behind the "View" expansion click.
-  // planRunUiEnsureRunDetailLoaded already kicked off this Run's own
-  // detail read automatically when the list itself loaded (see the fetch
-  // handlers above), so `detail` is populated (or honestly still
-  // "Loading Session…") without the person ever having to click anything.
-  // "View"/"Hide" still exists, but now only ever gates genuinely OPTIONAL
-  // extra detail (see planRunUiRenderRunDetail's own isOpen parameter) --
-  // never the primary workout action.
-  card += planRunUiRenderRunDetail(run, detail, isOpen);
-
-  if (endIsPlainIdleButton) {
-    if (menuOpen) {
-      card += '<div class="planrun-card-menu" data-testid="planrun-overflow-menu" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border,#eee)">' + endHtml + '</div>';
+  var sessionLabel, action = null, occId = '', inProgress = false, extra = '';
+  if (!detail || detail.phase === 'loading') {
+    sessionLabel = 'Loading Session…';
+  } else if (detail.phase === 'noNextOccurrence') {
+    sessionLabel = 'No upcoming Session';
+  } else if (detail.phase === 'error' || detail.phase === 'unverified') {
+    sessionLabel = 'Session unavailable';
+    extra += '<div data-testid="planrun-session-unavailable" style="font-size:13px;color:#b00">This Session can’t be shown safely right now.</div>';
+  } else {
+    var occ = detail.occurrence;
+    occId = occ.occurrenceId || '';
+    sessionLabel = escapeHtml(planRunUiRunCardSessionLabel(occ));
+    if (occ.status === 'inProgress') { action = 'resume'; inProgress = true; }
+    else if (occ.status === 'pending') {
+      // SAFETY CORRECTION (unchanged rule): never offer Start Session while
+      // an End attempt for this SAME Run is pending/uncertain;
+      // planRunUiStartSession enforces this independently too.
+      if (typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId)) {
+        extra += '<div data-testid="planrun-start-session-blocked" data-planrun-run-id="' + runIdAttr + '" style="font-size:13px;color:var(--text2)">This Program Run is being ended — Start Session is unavailable until that finishes.</div>';
+      } else {
+        action = 'start-session';
+      }
     }
-  } else if (endHtml) {
-    card += endHtml;
   }
-  if (dotsHtml) card += '<div class="prog-card-dots" style="margin-top:10px">' + dotsHtml + '</div>';
-  card += '</div>';
-  return card;
+  if (endHtml && !endIsPlainIdleButton) extra += endHtml;
+
+  var cardAttrs = 'data-testid="planrun-carousel-card" data-carousel-key="' + escapeHtml('run:' + run.planRunId) + '" data-planrun-run-id="' + runIdAttr + '"';
+  if (action) {
+    cardAttrs += ' data-planrun-action="' + action + '" data-planrun-occurrence-id="' + escapeHtml(occId) + '" role="button" aria-label="' + (action === 'resume' ? 'Resume Session' : 'Start Session') + ': ' + name + '"';
+  }
+  var menuButton = endIsPlainIdleButton
+    ? '<button class="prog-card-menu-btn" data-testid="planrun-overflow-btn" data-planrun-action="open-menu" data-planrun-run-id="' + runIdAttr + '" title="Program options">•••</button>'
+    : '';
+  return homeCarouselCardHtml({
+    extraClass: 'planrun-card planrun-carousel-card',
+    cardAttrs: cardAttrs,
+    sessionLabel: sessionLabel,
+    name: name,
+    menuButton: menuButton,
+    progressPct: pct,
+    progressLabel: pct + '% Complete' + (inProgress ? ' • In Progress' : ''),
+    dotsHtml: dotsHtml || '',
+    extraHtml: extra ? '<div class="prog-card-extra">' + extra + '</div>' : ''
+  });
+}
+
+// The Run card's ••• opens the SAME dropdown the legacy card's ••• opens
+// (app-core.js showDropdown). The dropdown's item markup is built from
+// executable strings, so a Run id (which may legally contain quotes) is
+// never written into it: the id is held here and the item calls a fixed,
+// argument-free function.
+var planRunUiMenuRunId = null;
+function planRunUiOpenRunMenu(btn, planRunId) {
+  if (typeof showDropdown !== 'function') return;
+  planRunUiMenuRunId = planRunId;
+  showDropdown(btn, [{ label: 'End Run', icon: '✕', action: 'planRunUiMenuEndRun()', danger: true }]);
+}
+function planRunUiMenuEndRun() {
+  var id = planRunUiMenuRunId;
+  planRunUiMenuRunId = null;
+  if (id && typeof planRunEndRequestConfirm === 'function') planRunEndRequestConfirm(id);
 }
 
 // USABILITY CORRECTION ADDITION (independent-review finding, this round):
@@ -994,88 +1039,10 @@ function planRunUiFormatOccurrenceName(nameSnapshot, fallback) {
   return sess || mc || fallback || '';
 }
 
-// USABILITY CORRECTION (independent-review finding, this round): this is
-// now called UNCONDITIONALLY for every rendered Run card (see
-// planRunUiRenderRunCard above), never gated behind "View" -- every branch
-// below was already safe to render without any detail-specific precondition
-// other than `detail` itself existing, so the only real change is that
-// `detail` now gets populated automatically (planRunUiEnsureRunDetailLoaded)
-// instead of only after a click. The new third parameter, `isOpen`, governs
-// ONLY the genuinely optional extra identifying detail appended at the end
-// for a verified Session -- never the Session name/status/action above it,
-// which stays visible regardless of isOpen.
-function planRunUiRenderRunDetail(run, detail, isOpen) {
-  if (!detail || detail.phase === 'loading') {
-    return '<div style="padding:8px 0;color:var(--text2)">Loading Session…</div>';
-  }
-  if (detail.phase === 'noNextOccurrence') {
-    return '<div style="padding:8px 0;color:var(--text2)">No upcoming Session found for this active Run.</div>';
-  }
-  if (detail.phase === 'error' || detail.phase === 'unverified') {
-    return '<div style="padding:8px 0;color:#b00">This Session can’t be shown safely right now.</div>';
-  }
-  // detail.phase === 'verified'
-  var occ = detail.occurrence;
-  // DEFENSIVE ADDITION (independent-review finding, this round): every
-  // `occ.occurrenceId || ''` below (mirroring this function's own
-  // pre-existing `occ.status || ''` convention two lines down) guards
-  // against a test fixture built for an unrelated scenario (several exist
-  // across the End-recovery suites) that stubs only the `status` field --
-  // never reachable before because detail rendering was gated behind
-  // "View" and those fixtures' Runs were never expanded. A real production
-  // occurrence always has a real, id-validated occurrenceId, so this
-  // changes no real call's output.
-  var occId = occ.occurrenceId || '';
-  var isInProgress = occ.status === 'inProgress';
-  var isPending = occ.status === 'pending';
-  var label = isInProgress ? 'In Progress' : (isPending ? 'Not Started' : escapeHtml(occ.status || ''));
-  var html = '<div style="padding:8px 0;border-top:1px solid var(--border,#eee);margin-top:6px">';
-  html += '<div style="font-size:13px;margin-bottom:4px"><strong>Next Session:</strong> ' + escapeHtml(planRunUiFormatOccurrenceName(occ.nameSnapshot, occId)) + ' &mdash; <em>' + label + '</em></div>';
-  if (isInProgress) {
-    html += '<button class="btn-secondary" data-planrun-action="resume" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" data-planrun-occurrence-id="' + escapeHtml(occId) + '">Resume (view only)</button>';
-  } else if (isPending) {
-    // SAFETY CORRECTION (this round): never render Start Session as a
-    // working control while a DIFFERENT file's End attempt for this SAME
-    // Run is pending/uncertain -- see this file's own header. The entry
-    // point (planRunUiStartSession) enforces this independently too; this
-    // is the rendered-control half of that same guard, never a substitute
-    // for it.
-    if (typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId)) {
-      // DEFENSIVE ADDITION (independent-review finding, this round): a
-      // data-planrun-run-id attribute, matching every other per-Run control
-      // in this file, now that this div can co-exist on-screen with
-      // OTHER Runs' own cards (detail renders unconditionally for every
-      // Run now, not just whichever one was expanded) -- lets a query
-      // scope to this specific Run rather than matching the first such
-      // div anywhere on the page.
-      html += '<div data-testid="planrun-start-session-blocked" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" style="font-size:13px;color:var(--text2)">This Program Run is being ended — Start Session is unavailable until that finishes.</div>';
-    } else {
-      // SLICE 2 addition: a real action, gated entirely on the persistence
-      // layer's own honest confirmation (planRunUiStartSession below) --
-      // merely rendering this button, or merely opening the preview
-      // afterward, never itself marks anything in progress.
-      html += '<button class="btn-secondary" data-planrun-action="start-session" data-planrun-run-id="' + escapeHtml(run.planRunId) + '" data-planrun-occurrence-id="' + escapeHtml(occId) + '">Start Session</button>';
-    }
-  }
-  // USABILITY CORRECTION ADDITION (independent-review finding, this round):
-  // "View"/"Hide" still exists, now gating only this genuinely optional
-  // extra identifying detail -- every value here is a real stored field
-  // off the already-fetched, already-verified occurrence (PLAN_RUN_
-  // OCCURRENCE_KEYS), never a fabricated or display-name-derived value.
-  // Defensive `|| ''`/`Number.isInteger` guards match occId above, for the
-  // same pre-existing-fixture reason.
-  if (isOpen) {
-    var assignCount = Array.isArray(occ.assignments) ? occ.assignments.length : 0;
-    var mcOrdinal = Number.isInteger(occ.microcycleOrdinal) ? occ.microcycleOrdinal : '?';
-    var sessOrdinal = Number.isInteger(occ.sessionOrdinal) ? occ.sessionOrdinal : '?';
-    html += '<div style="padding:6px 0;margin-top:4px;font-size:12px;color:var(--text2)">'
-      + 'Occurrence: ' + escapeHtml(occId) + ' &middot; Microcycle ' + escapeHtml(String(mcOrdinal))
-      + ', Session ' + escapeHtml(String(sessOrdinal)) + ' &middot; ' + assignCount + ' exercise' + (assignCount === 1 ? '' : 's')
-      + '</div>';
-  }
-  html += '</div>';
-  return html;
-}
+// VISUAL-ALIGNMENT CORRECTION: the former in-card Session detail block
+// (planRunUiRenderRunDetail -- "Next Session: … — Not Started" + Start
+// Session / Resume buttons + the View/Hide occurrence line) is replaced by
+// the shared card template (planRunUiRenderRunCard above).
 
 // ---- SLICE 2 addition: mark the next pending occurrence in progress, then
 // (and ONLY then, gated on the persistence layer's own honest outcome) open
@@ -1086,7 +1053,43 @@ function planRunUiRenderRunDetail(run, detail, isOpen) {
 // the preview fetch it may lead into are one continuous logical request to
 // the same screen, and an owner change or a newer request for that screen
 // must invalidate both halves identically.
-function planRunUiStartSession(planRunId, occurrenceId) {
+// VISUAL-ALIGNMENT CORRECTION -- contextual Training Max (see
+// app-plan-run-training-max-ui.js planRunTmGateSession). Both Session entry
+// points ask that file first; it returns false at once (no read, no prompt)
+// for a Session with no non-series Training Max Rule. Otherwise it shows
+// "Checking…" on the Session screen and either continues, or asks for the
+// missing value(s) before ANYTHING else happens -- for Start Session that
+// means before the Mark-In-Progress write, so Cancel leaves the Session
+// untouched -- and Cancel returns to TRAIN.
+function planRunUiCachedOccurrence(planRunId, occurrenceId) {
+  var d = planRunUiState.detailByRunId[planRunId];
+  return (d && d.phase === 'verified' && d.occurrence && d.occurrence.occurrenceId === occurrenceId) ? d.occurrence : null;
+}
+function planRunUiTrainingMaxGate(planRunId, occurrenceId, proceed) {
+  if (typeof planRunTmGateSession !== 'function') return false;
+  return planRunTmGateSession({
+    planRunId: planRunId, occurrenceId: occurrenceId, occurrence: planRunUiCachedOccurrence(planRunId, occurrenceId), proceed: proceed,
+    onChecking: function () {
+      // Same screen Start Session / Resume already go to; any older preview
+      // request is superseded so it can never paint over this.
+      planRunUiPreviewEpoch++;
+      planRunUiLastPreviewRunOccurrence = null;
+      var container = document.getElementById('page-run-session-preview');
+      planRunUiWirePreviewEvents(container);
+      if (container) container.innerHTML = '<div data-testid="planrun-tm-checking" style="padding:16px;color:var(--text2)">Checking this Session…</div>'
+        + '<div style="padding:0 16px"><button class="btn-secondary" data-planrun-action="back">Back</button></div>';
+      showPage('page-run-session-preview');
+    },
+    onCancel: function () { showPage('page-home'); }
+  });
+}
+function planRunUiResumeSession(planRunId, occurrenceId) {
+  if (!planRunUiCapabilityEnabled()) return;
+  if (planRunUiTrainingMaxGate(planRunId, occurrenceId, function () { planRunUiOpenSessionPreview(planRunId, occurrenceId); })) return;
+  planRunUiOpenSessionPreview(planRunId, occurrenceId);
+}
+
+function planRunUiStartSession(planRunId, occurrenceId, trainingMaxChecked) {
   if (!planRunUiCapabilityEnabled()) return;
   // SAFETY CORRECTION (this round) -- see this file's own header and
   // app-plan-run-end-ui.js's for the full trace: never attempt the real
@@ -1099,6 +1102,7 @@ function planRunUiStartSession(planRunId, occurrenceId) {
   var run = planRunUiState.runs.filter(function (r) { return r.planRunId === planRunId; })[0];
   var ownerUid = planRunUiCurrentUid();
   if (!run || !ownerUid) return;
+  if (trainingMaxChecked !== true && planRunUiTrainingMaxGate(planRunId, occurrenceId, function () { planRunUiStartSession(planRunId, occurrenceId, true); })) return;
   var epoch = ++planRunUiPreviewEpoch;
   var expectedUid = ownerUid;
   var container = document.getElementById('page-run-session-preview');

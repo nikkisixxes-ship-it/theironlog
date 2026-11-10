@@ -728,9 +728,11 @@ function renderHome() {
   // cards are shown INSIDE the Active Programs carousel above (see
   // renderHomeCarousel), never in a separate section.
   if (typeof planRunUiRenderHomeSection === 'function') planRunUiRenderHomeSection();
-  // OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION --
-  // additive "Needs Attention" section (app-plan-run-training-max-ui.js).
-  if (typeof planRunTmRenderHomeSection === 'function') planRunTmRenderHomeSection();
+  // VISUAL-ALIGNMENT CORRECTION: the permanent "Needs Attention (Preview)"
+  // section is removed from TRAIN (and TRAIN no longer runs its owner-wide
+  // discovery query). A Training Max left blank at Run Start is asked for
+  // when the Session that needs it is started or resumed
+  // (app-plan-run-training-max-ui.js planRunTmGateSession).
   const sorted = [...appDb.workouts].slice(0, 3);
   document.getElementById('home-recent').innerHTML = sorted.length
     ? sorted.map(w => workoutHistoryCard(w, true)).join('')
@@ -748,6 +750,38 @@ function homeCarouselDotsHtml(i, n) {
   return html;
 }
 
+// VISUAL-ALIGNMENT CORRECTION: the ONE Active Programs card template, used by
+// BOTH legacy active-Program cards (below) and canonical Program Run cards
+// (app-plan-run-ui.js planRunUiRenderRunCard), so the two can never drift
+// apart. Every visual property lives in styles.css (.prog-carousel-card,
+// .prog-card-head, .prog-card-session, .prog-card-name, .prog-card-menu-btn,
+// .prog-card-progress-label, .prog-card-bar-*, .prog-card-dots). Callers pass
+// already-safe HTML strings / attribute strings:
+//   cardAttrs    -- extra attributes on the card element (identity, action)
+//   sessionLabel -- the next Session ("Week 1 • Day A")
+//   name         -- the Program's name
+//   menuButton   -- the ••• button (its own action attributes)
+//   progressPct  -- 0..100; progressLabel -- text under the name
+//   dotsHtml     -- homeCarouselDotsHtml(i, n)
+//   extraHtml    -- content-specific controls that must stay visible (End
+//                   Run recovery states); empty for every ordinary card
+function homeCarouselCardHtml(c) {
+  return `<div class="prog-carousel-card${c.extraClass ? ' ' + c.extraClass : ''}" ${c.cardAttrs}>
+      <div class="prog-card-head">
+        <div class="prog-card-head-text">
+          <div class="prog-card-session">${c.sessionLabel}</div>
+          <div class="prog-card-name">${c.name}</div>
+        </div>
+        ${c.menuButton}
+      </div>
+      <div class="prog-card-progress-label">${c.progressLabel}</div>
+      <div class="prog-card-bar-row">
+        <div class="prog-card-bar-track"><div class="prog-card-bar-fill" style="width:${c.progressPct}%"></div></div>
+        <div class="prog-card-dots">${c.dotsHtml}</div>
+      </div>${c.extraHtml || ''}
+    </div>`;
+}
+
 function homeCarouselLegacyCardHtml(prog, i, n) {
   const next = planGetFirstUnfinishedSession(prog);
   const totalSessions = planCountActiveSessions(prog);
@@ -757,21 +791,15 @@ function homeCarouselLegacyCardHtml(prog, i, n) {
   const sess = mc.sessions[next.sessionIdx];
   const mcName = mc.name || `Micro ${next.microcycleIdx + 1}`;
   const sessName = sess.name || `Session ${next.sessionIdx + 1}`;
-  const sessionLabel = `${mcName} • ${sessName}`;
-  return `<div class="prog-carousel-card" data-testid="legacy-carousel-card" data-carousel-key="${escapeHtml('legacy:' + prog.id)}" onclick="startWorkoutFromActiveCard('${prog.id}')">
-      <div style="display:flex;align-items:flex-start;justify-content:space-between">
-        <div style="flex:1;min-width:0">
-          <div class="prog-card-session">${sessionLabel}</div>
-          <div class="prog-card-name">${prog.name}</div>
-        </div>
-        <button class="prog-card-menu-btn" onclick="openActiveProgCardMenu(event,'${prog.id}')" title="Program options">•••</button>
-      </div>
-      <div class="prog-card-progress-label">${pct}% Complete</div>
-      <div class="prog-card-bar-row">
-        <div class="prog-card-bar-track"><div class="prog-card-bar-fill" style="width:${pct}%"></div></div>
-        <div class="prog-card-dots">${homeCarouselDotsHtml(i, n)}</div>
-      </div>
-    </div>`;
+  return homeCarouselCardHtml({
+    cardAttrs: `data-testid="legacy-carousel-card" data-carousel-key="${escapeHtml('legacy:' + prog.id)}" onclick="startWorkoutFromActiveCard('${prog.id}')"`,
+    sessionLabel: `${mcName} • ${sessName}`,
+    name: prog.name,
+    menuButton: `<button class="prog-card-menu-btn" onclick="openActiveProgCardMenu(event,'${prog.id}')" title="Program options">•••</button>`,
+    progressPct: pct,
+    progressLabel: `${pct}% Complete`,
+    dotsHtml: homeCarouselDotsHtml(i, n)
+  });
 }
 
 function renderHomeCarousel() {
