@@ -1119,15 +1119,63 @@ function planRunUiOpenSessionPreview(planRunId, occurrenceId) {
   }
   p.then(function (result) {
     if (!planRunUiIsPreviewResponseCurrent(epoch, expectedUid)) return; // superseded/owner changed -- drop silently
-    if (result && result.outcome === 'verified') {
-      planRunUiRenderSessionPreviewContent(result.run, result.occurrence);
-    } else {
-      planRunUiRenderSessionPreviewError();
-    }
+    if (!(result && result.outcome === 'verified')) { planRunUiRenderSessionPreviewError(); return; }
+    // SESSION-PREVIEW CORRECTION: show the SAME exercise the logger will open
+    // with. A series-linked assignment whose Run series was durably replaced
+    // ("Replace for this active Run") opens in the logger with the series'
+    // activeExerciseId; the preview reads that from the very same verified,
+    // read-only series read the logger uses (fsPlanRunReadSeriesForOccurrence:
+    // owner, Run, series identity, membership of THIS occurrence/assignment/
+    // rule and value kind all checked; zero writes). A Session with no
+    // series-linked Rule ('noSeries') costs no extra read and renders exactly
+    // as before. Anything else -- missing, malformed, foreign or mismatched
+    // series state, a failed read -- shows the existing "can't be shown
+    // safely" screen rather than a possibly stale original exercise.
+    return planRunUiReadPreviewSeries(expectedUid, result.occurrence).then(function (seriesValuesByRuleId) {
+      if (!planRunUiIsPreviewResponseCurrent(epoch, expectedUid)) return;
+      if (seriesValuesByRuleId === false) { planRunUiRenderSessionPreviewError(); return; }
+      planRunUiRenderSessionPreviewContent(result.run, result.occurrence, seriesValuesByRuleId);
+    });
   }).catch(function (err) {
     if (!planRunUiIsPreviewResponseCurrent(epoch, expectedUid)) return;
     planRunUiRenderSessionPreviewError();
   });
+}
+
+// SESSION-PREVIEW CORRECTION -- resolves to:
+//   null  -- the Session has no series-linked Rule (render as before);
+//   { planRuleId: verified series values } -- from the logger's own read;
+//   false -- the series state could not be verified (render the safe error).
+// Only the next unfinished Session (pending/inProgress) reaches this screen;
+// for any other status the CURRENT series exercise may not be the one that
+// Session used, so a series-linked Session in any other status is refused
+// rather than guessed.
+function planRunUiReadPreviewSeries(ownerUid, occurrence) {
+  var linked = (occurrence.assignments || []).some(function (a) {
+    return (a.rules || []).some(function (rl) { return rl.enabled && typeof planRunRuleEntrySeriesId === 'function' && planRunRuleEntrySeriesId(rl) !== null; });
+  });
+  if (!linked) return Promise.resolve(null);
+  if (occurrence.status !== 'pending' && occurrence.status !== 'inProgress') return Promise.resolve(false);
+  if (typeof planRunLoggerSeriesValueForAssignment !== 'function') return Promise.resolve(false);
+  var p;
+  try {
+    p = Promise.resolve(fsPlanRunPersistence.fsPlanRunReadSeriesForOccurrence({ ownerUid: ownerUid, planRunId: occurrence.planRunId, occurrence: occurrence }));
+  } catch (err) {
+    return Promise.resolve(false);
+  }
+  return p.then(function (r) {
+    return (r && r.outcome === 'verified' && r.valuesByRuleId) ? r.valuesByRuleId : false;
+  }, function () { return false; });
+}
+
+// The exercise the logger opens an assignment with: the series'
+// activeExerciseId when the assignment's enabled Rule is linked to a verified
+// series (via the logger's own planRunLoggerSeriesValueForAssignment), else
+// the assignment's own prescribed exercise.
+function planRunUiPreviewEffectiveExerciseId(a, seriesValuesByRuleId) {
+  if (!seriesValuesByRuleId) return a.exerciseId;
+  var sv = planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId);
+  return (sv && typeof sv.value.activeExerciseId === 'string' && sv.value.activeExerciseId) ? sv.value.activeExerciseId : a.exerciseId;
 }
 
 function planRunUiRenderSessionPreviewError() {
@@ -1139,7 +1187,7 @@ function planRunUiRenderSessionPreviewError() {
     + '<div style="padding:0 16px"><button class="btn-secondary" data-planrun-action="back">Back</button></div>';
 }
 
-function planRunUiRenderSessionPreviewContent(run, occurrence) {
+function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRuleId) {
   planRunUiLastPreviewRunOccurrence = { run: run, occurrence: occurrence };
   var container = document.getElementById('page-run-session-preview');
   if (!container) return;
@@ -1163,8 +1211,9 @@ function planRunUiRenderSessionPreviewContent(run, occurrence) {
   }
   html += '<div style="padding:0 16px 16px">';
   (occurrence.assignments || []).forEach(function (a) {
-    var exName = (typeof planCanonicalGetExerciseName === 'function') ? planCanonicalGetExerciseName(a.exerciseId) : a.exerciseId;
-    html += '<div style="margin-bottom:12px"><div style="font-weight:600;margin-bottom:4px">' + escapeHtml(exName) + '</div>';
+    var effectiveExerciseId = planRunUiPreviewEffectiveExerciseId(a, seriesValuesByRuleId);
+    var exName = (typeof planCanonicalGetExerciseName === 'function') ? planCanonicalGetExerciseName(effectiveExerciseId) : effectiveExerciseId;
+    html += '<div style="margin-bottom:12px" data-testid="planrun-preview-exercise" data-exercise-id="' + escapeHtml(effectiveExerciseId) + '"><div style="font-weight:600;margin-bottom:4px">' + escapeHtml(exName) + '</div>';
     (a.orderedSets || []).forEach(function (s) {
       // planFormatSetSummary is the existing, UNMODIFIED descriptive-text
       // formatter (app-plan.js) -- it needs only the prescribed sub-object
