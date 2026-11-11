@@ -4065,7 +4065,7 @@ function openExHistoryModal(exId) {
   body.innerHTML = workoutsWithEx.map(w => {
     const ex = w.exercises.find(e => e.exerciseId === exId); const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
     const performedSets = ex.sets.filter(planRunSetHasRecordedPerformance);
-    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${performedSets.map((s,i)=>{ let line=`Set ${i+1}: `; if(s.weight&&+s.weight>0)line+=`${s.weight}${appDb.unit} × ${s.reps||s.time||'—'}`; else if(s.reps)line+=`BW × ${s.reps}`; else if(s.time)line+=`${s.time}s`; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
+    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${performedSets.map((s,i)=>{ const line=`Set ${i+1}: ${formatPerformedSetLine(s)}`; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
   }).join('');
   openModal('modal-ex-history');
 }

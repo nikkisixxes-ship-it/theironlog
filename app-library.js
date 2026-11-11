@@ -654,10 +654,18 @@ function openCustomExFromSessionPicker() { openCreateCustomExercise('plan'); }
 let profileExId = null;
 let profileChart = null;
 
+// SET HISTORY: workout groups shown per page. A display page size only --
+// "Load more" always reaches every eligible workout; nothing is capped.
+// Mirrors History's own slice-and-"Show More" idiom (historyPageSize /
+// showMoreHistory, app-core.js), smaller because this sits inside a modal.
+const PROFILE_SET_HISTORY_PAGE_SIZE = 10;
+let profileSetHistoryShown = PROFILE_SET_HISTORY_PAGE_SIZE;
+
 function openExerciseProfile(exId) {
   profileExId = exId;
   const ex = getExercise(exId);
   if (!ex) return;
+  profileSetHistoryShown = PROFILE_SET_HISTORY_PAGE_SIZE;
   renderProfilePage(ex);
   openModal('modal-ex-profile');
 }
@@ -748,6 +756,14 @@ function renderProfilePage(ex) {
 
     <div class="prof-divider"></div>
 
+    <!-- Set History (read-only) -->
+    <div class="prof-section" data-testid="prof-set-history-section">
+      <div class="prof-section-label">Set History</div>
+      <div id="prof-set-history" data-testid="prof-set-history">${buildProfileSetHistoryHtml(ex.id)}</div>
+    </div>
+
+    <div class="prof-divider"></div>
+
     <!-- Notes -->
     <div class="prof-section">
       <div class="prof-section-label">Notes</div>
@@ -772,6 +788,36 @@ function renderProfilePage(ex) {
   if (hasGraph) {
     setTimeout(() => renderE1RMChart(e1rmHistory), 50);
   }
+}
+
+// SET HISTORY -- read-only. Groups come from getExerciseSetHistory
+// (app-data.js); each set's text from formatPerformedSetLine and
+// formatSetRpeSuffix. The whole visible list is rebuilt on every render, so
+// Load more can never duplicate a group, and order is always newest first.
+function buildProfileSetHistoryHtml(exId) {
+  const groups = getExerciseSetHistory(exId);
+  if (!groups.length) return `<div class="prof-empty-state">No completed sets logged yet</div>`;
+  const visible = groups.slice(0, profileSetHistoryShown);
+  const groupsHtml = visible.map(g => {
+    const d = new Date(g.date).toLocaleDateString('en-US', { weekday:'short', month:'short', day:'numeric', year:'numeric' });
+    const setsHtml = g.sets.map((s, i) => `
+        <div class="prof-sethist-set"><span class="prof-sethist-num">${i + 1}</span><span class="prof-sethist-val">${escapeHtml(formatPerformedSetLine(s) + formatSetRpeSuffix(s))}</span></div>`).join('');
+    return `
+      <div class="prof-sethist-group" data-testid="prof-set-history-group" data-workout-id="${escapeHtml(String(g.workoutId))}">
+        <div class="prof-sethist-head"><span class="prof-sethist-name">${escapeHtml(String(g.name || 'Workout'))}</span><span class="prof-sethist-date">${d}</span></div>
+        ${setsHtml}
+      </div>`;
+  }).join('');
+  const moreHtml = groups.length > visible.length
+    ? `<div class="prof-sethist-more"><button type="button" class="btn btn-secondary btn-sm" data-testid="prof-set-history-load-more" onclick="showMoreProfileSetHistory()">Load more</button></div>`
+    : '';
+  return groupsHtml + moreHtml;
+}
+
+function showMoreProfileSetHistory() {
+  profileSetHistoryShown += PROFILE_SET_HISTORY_PAGE_SIZE;
+  const el = document.getElementById('prof-set-history');
+  if (el && profileExId) el.innerHTML = buildProfileSetHistoryHtml(profileExId);
 }
 
 function renderE1RMChart(history) {

@@ -455,6 +455,55 @@ function getExerciseStats(exId) {
   return { bestWeight: bestW || null, best1rm: best1 ? Math.round(best1) : null, totalSets: all.length, recentSets: recent };
 }
 
+// ==================== SET HISTORY (Exercise Profile) ====================
+// Read-only. Nothing below writes, saves, or changes any workout.
+//
+// formatPerformedSetLine -- the ONE text form of a single performed set,
+// lifted unchanged from openExHistoryModal's row renderer (app-core.js,
+// which now calls this too): weight > 0 -> "135lbs × 5" (or "70lbs × 40"
+// for weight + time); otherwise reps -> "BW × 12"; otherwise time -> "60s".
+// Callers pass only sets that already passed planRunSetHasRecordedPerformance.
+function formatPerformedSetLine(s) {
+  if (s.weight && +s.weight > 0) return `${s.weight}${appDb.unit} × ${s.reps||s.time||'—'}`;
+  if (s.reps) return `BW × ${s.reps}`;
+  if (s.time) return `${s.time}s`;
+  return '—';
+}
+
+// " @ RPE 8" only when an RPE was actually recorded (the same " @ RPE "
+// wording getExerciseStats uses). Blank, null, zero or non-numeric -> ''.
+// Never derived or guessed.
+function formatSetRpeSuffix(s) {
+  const r = s ? s.rpe : null;
+  if (r === null || r === undefined || r === '') return '';
+  return Number.isFinite(+r) && +r > 0 ? ` @ RPE ${r}` : '';
+}
+
+// Every saved workout holding genuinely completed work for exId, newest
+// first, one group per workout. A set qualifies only through the shared
+// planRunSetHasRecordedPerformance predicate (the same gate used by History,
+// PR/E1RM, search and export): unchecked prefilled, blank, or planned-only
+// sets never appear; a workout with no qualifying set is left out entirely.
+// Rows are matched on the exerciseId actually saved, so substituted work is
+// listed under the exercise performed. When one workout has several rows for
+// exId (e.g. a Program Run split or an added row), all of their qualifying
+// sets are kept, in saved order, under that one workout. Same-date ties keep
+// appDb.workouts order (stable sort).
+function getExerciseSetHistory(exId) {
+  const groups = [];
+  appDb.workouts.forEach((w, order) => {
+    if (!w || !Array.isArray(w.exercises)) return;
+    const sets = [];
+    w.exercises.forEach(e => {
+      if (!e || e.exerciseId !== exId || !Array.isArray(e.sets)) return;
+      e.sets.forEach(s => { if (planRunSetHasRecordedPerformance(s)) sets.push(s); });
+    });
+    if (sets.length) groups.push({ workoutId: w.id, date: w.date, name: w.name, sets, order });
+  });
+  groups.sort((a, b) => ((+b.date || 0) - (+a.date || 0)) || (a.order - b.order));
+  return groups;
+}
+
 // ==================== UTILITIES ====================
 function uid() { return 'id' + Date.now() + Math.random().toString(36).slice(2,7); }
 

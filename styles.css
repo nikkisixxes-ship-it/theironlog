@@ -1315,6 +1315,51 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
   position: relative;
   height: 160px;
 }
+/* Set History (Exercise Profile, read-only) */
+.prof-sethist-group {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  min-width: 0;
+}
+.prof-sethist-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 2px 10px;
+  margin-bottom: 6px;
+}
+.prof-sethist-name {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.prof-sethist-date {
+  font-size: 12px;
+  color: var(--text3);
+  white-space: nowrap;
+}
+.prof-sethist-set {
+  display: flex;
+  gap: 10px;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text2);
+  min-width: 0;
+}
+.prof-sethist-num {
+  flex: 0 0 18px;
+  color: var(--text3);
+  font-size: 12px;
+  text-align: right;
+}
+.prof-sethist-val { min-width: 0; overflow-wrap: anywhere; }
+.prof-sethist-more { text-align: center; padding: 4px 0 2px; }
 .prof-notes-text {
   font-size: 14px;
   color: var(--text2);
