@@ -3210,7 +3210,7 @@ function computeSetPRFlags(s, exerciseId, excludeId) {
 // marks the MOMENT a completed set establishes a new maximum weight -- not
 // every later repetition of that maximum. computeSetPRFlags above still
 // answers the per-set question "is this set heavier than every OTHER
-// saved workout?", and stays the source of isNew1RM (unchanged). Its
+// saved workout?" (its isNew1RM likewise for estimated 1RM). Its
 // isPR answer alone, though, cannot see earlier sets of the SAME workout,
 // which is why four completed 70 lb sets each used to show "PR: 70". The
 // rule below is the ONE definition of which sets are weight PRs; every
@@ -3247,28 +3247,50 @@ function workoutExerciseSetSequences(workout) {
 // is a PR and raises it; an equal or lower set is not. With
 // `requireStoredFlag`, a set must ALSO already carry a stored isPR:true
 // (History's read-side mode -- see storedWorkoutPRSets).
-function firstNewMaximumPRSets(orderedSets, startingMax, requireStoredFlag) {
-  const prs = new Set();
+// DUPLICATE E1RM CORRECTION: the walk now takes WHAT it measures
+// (valueOf) and which stored flag History requires (storedFlagKey), so the
+// estimated-1RM badge uses this same machinery instead of a second system.
+function firstNewMaximumSets(orderedSets, valueOf, startingMax, storedFlagKey) {
+  const hits = new Set();
   let runningMax = startingMax;
   orderedSets.forEach(s => {
-    const w = prSetWeight(s);
-    if (w === null || !(w > runningMax)) return;
-    if (!requireStoredFlag || s.isPR === true) prs.add(s);
-    runningMax = w;
+    const v = valueOf(s);
+    if (v === null || !(v > runningMax)) return;
+    if (!storedFlagKey || s[storedFlagKey] === true) hits.add(s);
+    runningMax = v;
   });
-  return prs;
+  return hits;
+}
+// Weight PRs -- unchanged behavior (same gate, same comparison).
+function firstNewMaximumPRSets(orderedSets, startingMax, requireStoredFlag) {
+  return firstNewMaximumSets(orderedSets, prSetWeight, startingMax, requireStoredFlag ? 'isPR' : null);
+}
+// Estimated-1RM badges (isNew1RM): the set's E1RM by the existing calc1RM
+// (same formula/setting, same rounding), over exactly the same
+// participation gate as weight PRs and computeSetPRFlags -- completed,
+// positive finite weight and reps. Anything else never takes part.
+function prSetE1RM(s) {
+  const weight = prSetWeight(s);
+  return weight === null ? null : calc1RM(weight, coercePositiveFiniteNumber(s.reps));
+}
+function firstNewMaximumE1RMSets(orderedSets, startingMax, requireStoredFlag) {
+  return firstNewMaximumSets(orderedSets, prSetE1RM, startingMax, requireStoredFlag ? 'isNew1RM' : null);
 }
 // Logger: the running maximum starts at the genuine historical best from
 // every OTHER saved workout -- exactly getBestWeight(exerciseId, workout.id),
 // the same self-excluding comparison the app has always used. Sets isPR on
-// every set of the workout; isNew1RM is not touched here.
+// every set of the workout. DUPLICATE E1RM CORRECTION: isNew1RM is settled
+// here too, by the same walk over the set's estimated 1RM, starting at the
+// existing self-excluding getBest1RM(exerciseId, workout.id).
 function applyWorkoutPRFlags(workout) {
   if (!workout || !Array.isArray(workout.exercises)) return;
   const prs = new Set();
+  const e1rms = new Set();
   workoutExerciseSetSequences(workout).forEach((sets, exerciseId) => {
     firstNewMaximumPRSets(sets, getBestWeight(exerciseId, workout.id), false).forEach(s => prs.add(s));
+    firstNewMaximumE1RMSets(sets, getBest1RM(exerciseId, workout.id), false).forEach(s => e1rms.add(s));
   });
-  workout.exercises.forEach(e => (e.sets || []).forEach(s => { s.isPR = prs.has(s); }));
+  workout.exercises.forEach(e => (e.sets || []).forEach(s => { s.isPR = prs.has(s); s.isNew1RM = e1rms.has(s); }));
 }
 // History (read-only): which stored sets display/count as a PR. A stored
 // isPR:true already means "heavier than the earlier best when it was
@@ -3284,6 +3306,19 @@ function storedWorkoutPRSets(workout) {
     firstNewMaximumPRSets(sets, 0, true).forEach(s => prs.add(s));
   });
   return prs;
+}
+// DUPLICATE E1RM CORRECTION -- History/Export (read-only): the same
+// read-side normalization for stored isNew1RM flags. A stored true means
+// "estimated 1RM above the earlier best when saved"; keeping it only where
+// the set's E1RM also beats every earlier participating set of that
+// exercise in this workout gives the Logger's answer. Only ever hides a
+// stored flag, never adds one, never writes.
+function storedWorkoutNew1RMSets(workout) {
+  const hits = new Set();
+  workoutExerciseSetSequences(workout).forEach(sets => {
+    firstNewMaximumE1RMSets(sets, 0, true).forEach(s => hits.add(s));
+  });
+  return hits;
 }
 // Logger badge refresh: one set's PR/1RM badge area, exactly as the
 // previous per-set patch did (same HTML, same grid-column handling).
@@ -3328,7 +3363,7 @@ function recomputeAllSetPRFlags(workout) {
   });
   // Duplicate weight-PR correction: isPR is then settled by the one
   // first-new-maximum rule, so what is saved is exactly what the Logger
-  // shows. isNew1RM above is unchanged.
+  // shows. DUPLICATE E1RM CORRECTION: isNew1RM is settled the same way.
   applyWorkoutPRFlags(workout);
 }
 // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (this round, Round 8, Finding
@@ -4360,7 +4395,8 @@ function workoutHistoryCard(w, compact=false) {
   // the one first-new-maximum rule (storedWorkoutPRSets, read-only), so an
   // older workout saved with four PR:70 flags counts one PR.
   const prSets = storedWorkoutPRSets(w);
-  const prs = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>planRunSetHasRecordedPerformance(s) && prSets.has(s)).length,0); const new1rms = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>planRunSetHasRecordedPerformance(s) && s.isNew1RM).length,0);
+  const new1rmSets = storedWorkoutNew1RMSets(w); // duplicate E1RM correction (read-only)
+  const prs = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>planRunSetHasRecordedPerformance(s) && prSets.has(s)).length,0); const new1rms = w.exercises.reduce((a,e)=>a+e.sets.filter(s=>planRunSetHasRecordedPerformance(s) && new1rmSets.has(s)).length,0);
   const wid = w.id;
   const prBadge = prs > 0 ? `<span class="recent-badge recent-badge-pr">${prs} PR'S</span>` : '';
   const e1rmBadge = new1rms > 0 ? `<span class="recent-badge recent-badge-1rm">${new1rms} New E1RM${new1rms > 1 ? "'S" : ''}</span>` : '';
@@ -4397,6 +4433,7 @@ function toggleRecentCard(wid) {
 function buildRecentExpandedHtml(wid) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return '';
   const prSets = storedWorkoutPRSets(w); // duplicate weight-PR correction (read-only)
+  const new1rmSets = storedWorkoutNew1RMSets(w); // duplicate E1RM correction (read-only)
   // UNPERFORMED-EXERCISE HISTORY CORRECTION: an exercise with no
   // genuinely performed Set (shared predicate) is no longer rendered at all
   // -- previously its name row still appeared with an empty set list (the
@@ -4435,7 +4472,7 @@ function buildRecentExpandedHtml(wid) {
       // stale flag and a visible badge.
       const qualifiesForBadge = planRunSetHasRecordedPerformance(s);
       const prBadge = qualifiesForBadge && prSets.has(s) ? `<span class="recent-badge recent-badge-pr" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">PR: ${s.weight}</span>` : `<span style="display:inline-block;min-width:72px"></span>`;
-      const e1rmBadge = qualifiesForBadge && s.isNew1RM && s.weight && s.reps ? `<span class="recent-badge recent-badge-1rm" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">E1RM: ${Math.round(calc1RM(+s.weight,+s.reps))}</span>` : (qualifiesForBadge && s.isPR ? `<span style="display:inline-block;min-width:72px"></span>` : '');
+      const e1rmBadge = qualifiesForBadge && new1rmSets.has(s) && s.weight && s.reps ? `<span class="recent-badge recent-badge-1rm" style="font-size:10px;padding:1px 6px;display:inline-block;min-width:72px;text-align:center">E1RM: ${Math.round(calc1RM(+s.weight,+s.reps))}</span>` : (qualifiesForBadge && s.isPR ? `<span style="display:inline-block;min-width:72px"></span>` : '');
       return `<div class="recent-set-row"><span class="recent-set-weight">${weightStr}</span><span class="recent-set-x">${xStr}</span><span class="recent-set-reps">${repsStr}</span><span class="recent-set-badges">${prBadge}${e1rmBadge}</span></div>`;
     }).join('');
     return `<div class="recent-ex-block"><div class="recent-ex-name-row"><span class="recent-ex-num">${shownNum}</span><span class="recent-ex-name">${name}</span>${videoIcon}</div><div class="recent-ex-sets">${setsHtml}</div></div>`;
@@ -4632,6 +4669,7 @@ function updateCopyBtns(){document.getElementById('copy-btn-txt').className=`btn
 function renderCopyOutput(){
   const w=appDb.workouts.find(x=>x.id===copyWorkoutId);if(!w)return;
   const prSets=storedWorkoutPRSets(w); // duplicate weight-PR correction: Export reads PRs through the same rule (read-only)
+  const new1rmSets=storedWorkoutNew1RMSets(w); // duplicate E1RM correction: same, for New E1RM (read-only)
   const d=new Date(w.date).toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
   let out='';
   // PARTIAL-WORKOUT CORRECTION ROUND 4 (finding 1) -- both branches
@@ -4650,10 +4688,10 @@ function renderCopyOutput(){
   // (previously its name heading was still printed with nothing under it).
   if(copyFormat==='txt'){
     out+=`${w.name.toUpperCase()}\n${d}\n`;if(w.duration)out+=`Duration: ${fmtDuration(w.duration)}\n`;out+='─'.repeat(40)+'\n\n';
-    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>prSets.has(s)?s:Object.assign({},s,{isPR:false}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>Object.assign({},s,{isPR:prSets.has(s),isNew1RM:new1rmSets.has(s)}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   } else {
     out+=`[u][size=200]${w.name}[/size][/u]\n[i]${d}[/i]\n`;if(w.duration)out+=`[i]Duration: ${fmtDuration(w.duration)}[/i]\n`;out+='\n';
-    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>prSets.has(s)?s:Object.assign({},s,{isPR:false}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>Object.assign({},s,{isPR:prSets.has(s),isNew1RM:new1rmSets.has(s)}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   }
   document.getElementById('copy-output').textContent=out;
 }
