@@ -106,7 +106,7 @@ function signOut() {
     firestoreListeners.forEach(unsub => unsub());
     firestoreListeners = [];
     auth.signOut();
-  });
+  }, 'Sign Out'); // confirm button says SIGN OUT (was inheriting confirm2's 'Delete' default); style unchanged
 }
 
 // ==================== SETTINGS ====================
