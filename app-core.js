@@ -2221,7 +2221,20 @@ function saveNotesFromModal() {
 function openVideosModal(exIdx) {
   videosExIdx = exIdx; const ex = currentWorkout.exercises[exIdx]; const exData = getExercise(ex.exerciseId);
   document.getElementById('ex-videos-modal-title').textContent = exData ? exData.name : 'Videos';
-  renderVideosModalBody(); openModal('modal-ex-videos');
+  renderVideosModalBody();
+  // VIDEO-URL ENTRY (phone): this is the entry screen, so mark it for the
+  // phone-only top-anchored layout (styles.css). History's read-only viewer
+  // (openExpandedVideosModal) reuses this modal and removes the mark.
+  document.getElementById('modal-ex-videos').classList.add('video-entry');
+  openModal('modal-ex-videos');
+  // Focus the URL field now, inside the same tap that opened the dialog, so
+  // a phone opens its keyboard once and the user can paste straight away.
+  // A delayed focus would fall outside the tap and iOS would not open the
+  // keyboard. Phone width only; desktop keeps its existing behavior.
+  if (window.matchMedia && window.matchMedia('(max-width: 599px)').matches) {
+    const input = document.getElementById('perf-vid-modal-input');
+    if (input) input.focus({ preventScroll: true });
+  }
 }
 function renderVideosModalBody() {
   if (videosExIdx === null) return;
@@ -4496,6 +4509,7 @@ function openExpandedVideosModal(wid, exIdx) {
   const refHtml = refVideos.length ? `<div style="margin-bottom:12px"><div class="video-section-label">Reference Videos</div>${refVideos.map(v => `<div class="video-link-row"><a class="video-link" href="${v}" target="_blank">${v}</a></div>`).join('')}</div>` : '';
   const perfHtml = perfVideos.length ? `<div><div class="video-section-label">This Session</div>${perfVideos.map(v => `<div class="video-link-row"><a class="video-link" href="${v}" target="_blank">${v}</a></div>`).join('')}</div>` : '';
   document.getElementById('ex-videos-modal-body').innerHTML = refHtml + perfHtml || '<div style="color:var(--text3);font-size:14px">No videos found.</div>';
+  document.getElementById('modal-ex-videos').classList.remove('video-entry'); // read-only viewer keeps its existing layout
   openModal('modal-ex-videos');
 }
 // FOUNDATION SLICE ADDITION (canonical-program-run-ui-logger-integration-

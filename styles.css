@@ -169,6 +169,18 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 .modal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius) var(--radius) 0 0; width: 100%; max-width: 600px; max-height: 92vh; overflow-y: auto; padding: 20px 16px; padding-bottom: calc(20px + env(safe-area-inset-bottom)); }
 .modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
 .modal-title { font-family: var(--font-display); font-size: 22px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em; }
+/* VIDEO-URL ENTRY (phone only): the Logger's Videos dialog opens just below
+   the safe area instead of as a bottom sheet, so the URL field is never where
+   the keyboard lands, and the field + Add sit directly under the title (the
+   list of saved links follows), so they stay above the keyboard however many
+   links there are. Desktop (>= 600px) and History's viewer are unchanged. */
+@media (max-width: 599px) {
+  .modal-overlay.video-entry { align-items: flex-start; padding-top: calc(env(safe-area-inset-top, 0px) + 12px); }
+  .modal-overlay.video-entry .modal { width: calc(100% - 16px); border-radius: var(--radius); max-height: calc(100% - 24px); padding-bottom: 20px; }
+  .modal-overlay.video-entry #ex-videos-modal-body > div { display: flex; flex-direction: column; }
+  .modal-overlay.video-entry #ex-videos-modal-body .video-section-label { order: -2; }
+  .modal-overlay.video-entry #ex-videos-modal-body .video-add-row { order: -1; margin: 0 0 10px !important; padding-top: 0; border-top: none; }
+}
 
 /* ===== BADGES ===== */
 .badge { display: inline-block; padding: 3px 9px; border-radius: 20px; font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
