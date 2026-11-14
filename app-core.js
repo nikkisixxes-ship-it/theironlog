@@ -2056,13 +2056,62 @@ function openLogHeaderMenu(e) {
   const items = [
     { label: 'Reorder Exercises', icon: '↕', action: 'openReorderModal()' },
     { label: 'Log Bodyweight',    icon: '⚖', action: 'openLogBWModal()' },
-    { label: 'RPE',               icon: '',  action: 'toggleRPEFromMenu()', toggle: currentWorkout?.rpeEnabled ? '✓ ' : '' },
+    // EDIT WORKOUT TIME: open live workouts only (never a History edit).
+    ...(workoutTimeEditAvailable() ? [{ label: 'Edit Workout Time', icon: '⏱', action: 'openEditWorkoutTimeModal()' }] : []),
+    { label: 'RPE',              icon: '',  action: 'toggleRPEFromMenu()', toggle: currentWorkout?.rpeEnabled ? '✓ ' : '' },
     { divider: true },
     { label: 'Cancel Workout', icon: '✕', action: 'cancelWorkout()', danger: true },
   ];
   showDropdown(e.currentTarget, items);
 }
 function togglePauseWorkout() { if (!currentWorkout) return; if (workoutPaused) resumeWorkout(); else pauseWorkout(); }
+
+// ==================== EDIT WORKOUT TIME ====================
+// Corrects the elapsed time of the OPEN live workout (e.g. a forgotten
+// pause). It works by moving workoutPausedTotal -- the value that
+// getElapsedSeconds() and updateTimerDisplay() already subtract -- so the
+// Logger timer, the active-workout bar, the recovery draft and Finish's
+// saved duration all read the same corrected value. activeWorkoutStart
+// (and the workout's id and date) is never touched. workoutPausedTotal may
+// go negative when the entered time is longer than the real time since
+// start; the elapsed math and the recovery draft's shape check accept that.
+// startWorkoutTimer()/stopWorkoutTimer() reset it, so nothing carries over
+// to the next workout.
+function workoutTimeEditAvailable() {
+  return !!(currentWorkout && !currentWorkout._isEdit && activeWorkoutStart);
+}
+function openEditWorkoutTimeModal() {
+  if (!workoutTimeEditAvailable()) return;
+  if (planRunLoggerFinishBlocksCancel()) { showToast('Resolve the current Finish attempt before changing the workout time.', 'error'); return; }
+  const s = Math.max(0, getElapsedSeconds());
+  document.getElementById('wt-modal-min').value = String(Math.floor(s / 60));
+  document.getElementById('wt-modal-sec').value = String(s % 60);
+  openModal('modal-edit-workout-time');
+}
+// Whole, nonnegative number written with digits only ("", "-1", "1.5",
+// "1e3" are all rejected). Returns null when invalid.
+function parseWorkoutTimeField(v) {
+  v = String(v == null ? '' : v).trim();
+  return /^\d{1,5}$/.test(v) ? parseInt(v, 10) : null;
+}
+function setWorkoutElapsedSeconds(target) {
+  // "As of now": running -> measured from this moment; paused -> measured
+  // from the pause moment, so the paused display holds `target` exactly.
+  const ref = workoutPaused ? workoutPausedAt : Date.now();
+  workoutPausedTotal = ref - activeWorkoutStart - target * 1000;
+  updateTimerDisplay();
+  awDraftSaveNow();
+}
+function saveWorkoutTimeFromModal() {
+  if (!workoutTimeEditAvailable()) { closeModal('modal-edit-workout-time'); return; }
+  if (planRunLoggerFinishBlocksCancel()) { showToast('Resolve the current Finish attempt before changing the workout time.', 'error'); return; }
+  const m = parseWorkoutTimeField(document.getElementById('wt-modal-min').value);
+  const s = parseWorkoutTimeField(document.getElementById('wt-modal-sec').value);
+  if (m === null || s === null || s > 59) { showToast('Enter whole minutes, and seconds from 0 to 59.', 'error'); return; }
+  setWorkoutElapsedSeconds(m * 60 + s);
+  closeModal('modal-edit-workout-time');
+  showToast('Workout time updated', 'success');
+}
 
 // WORKOUT-FLEXIBILITY CORRECTION (restores user authority over a
 // Program Run Session's planned exercises -- see the correction report
