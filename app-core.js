@@ -1640,6 +1640,7 @@ function renderHistoryStats() {
 
 // ==================== WORKOUT TIMER ====================
 function startWorkoutTimer() {
+  if (typeof restTimerClear === 'function') restTimerClear(); // REST TIMER: never carries into a new workout
   activeWorkoutStart = Date.now(); workoutPaused = false; workoutPausedTotal = 0; workoutPausedAt = null;
   if (activeWorkoutTimer) clearInterval(activeWorkoutTimer);
   document.getElementById('active-bar').classList.add('visible');
@@ -1667,11 +1668,12 @@ function getElapsedSeconds() {
 }
 function pauseWorkout() { if (!currentWorkout || workoutPaused) return; workoutPaused = true; workoutPausedAt = Date.now(); updateTimerDisplay(); awDraftSaveNow(); showToast('Workout paused', ''); }
 function resumeWorkout() { if (!currentWorkout || !workoutPaused) return; workoutPausedTotal += (Date.now() - workoutPausedAt); workoutPaused = false; workoutPausedAt = null; updateTimerDisplay(); awDraftSaveNow(); showToast('Workout resumed', 'success'); }
-function stopWorkoutTimer() { if (activeWorkoutTimer) clearInterval(activeWorkoutTimer); document.getElementById('active-bar').classList.remove('visible'); workoutPaused = false; workoutPausedTotal = 0; workoutPausedAt = null; }
+function stopWorkoutTimer() { if (typeof restTimerClear === 'function') restTimerClear(); /* REST TIMER: workout ended/discarded */ if (activeWorkoutTimer) clearInterval(activeWorkoutTimer); document.getElementById('active-bar').classList.remove('visible'); workoutPaused = false; workoutPausedTotal = 0; workoutPausedAt = null; }
 // ACTIVE-WORKOUT RECOVERY: continues the timer from a recovered draft's
 // stored values (same semantics as startWorkoutTimer/pause/resume: time in
 // the background counts unless the workout was paused).
 function restoreWorkoutTimer(t) {
+  if (typeof restTimerClear === 'function') restTimerClear(); // REST TIMER: an active countdown is not restored after reload
   activeWorkoutStart = t.activeWorkoutStart; workoutPaused = !!t.workoutPaused;
   workoutPausedAt = t.workoutPaused ? t.workoutPausedAt : null; workoutPausedTotal = t.workoutPausedTotal || 0;
   if (activeWorkoutTimer) clearInterval(activeWorkoutTimer);
@@ -2058,6 +2060,8 @@ function openLogHeaderMenu(e) {
     { label: 'Log Bodyweight',    icon: '⚖', action: 'openLogBWModal()' },
     // EDIT WORKOUT TIME: open live workouts only (never a History edit).
     ...(workoutTimeEditAvailable() ? [{ label: 'Edit Workout Time', icon: '⏱', action: 'openEditWorkoutTimeModal()' }] : []),
+    // REST TIMER (app-rest-timer.js); live workouts only, never HISTORY edits.
+    ...(currentWorkout && !currentWorkout._isEdit ? [{ label: 'Rest Timer', icon: '◷', action: 'openRestTimerDialog()' }] : []),
     // LOAD CALCULATOR: standalone tool (app-load-calc.js); live workouts only.
     ...(currentWorkout && !currentWorkout._isEdit ? [{ label: 'Load Calculator', icon: '▦', action: 'openLoadCalculator()' }] : []),
     { label: 'RPE',              icon: '',  action: 'toggleRPEFromMenu()', toggle: currentWorkout?.rpeEnabled ? '✓ ' : '' },

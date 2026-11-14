@@ -141,7 +141,8 @@
       <div class="log-header">
         <div class="log-session-name" id="log-session-name-display">NEW WORKOUT</div>
         <div class="log-timer-pill" id="log-timer-display" onclick="togglePauseWorkout()" style="cursor:pointer">0:00</div>
-        <div style="flex:1"></div>
+        <div class="log-rest-row"><button type="button" class="rest-pill" id="rest-indicator" style="display:none" onclick="openRestTimerDialog()">Rest</button></div>
+        <div class="log-header-spacer" style="flex:1"></div>
         <button class="log-menu-btn" onclick="openLogHeaderMenu(event)">•••</button>
       </div>
       <div class="log-content">
@@ -345,6 +346,14 @@
       <input type="number" id="bw-modal-input" placeholder="e.g. 185" step="0.5">
     </div>
     <button class="btn btn-primary" style="width:100%" onclick="saveBWFromModal()">Save</button>
+  </div>
+</div>
+
+<!-- REST TIMER MODAL (open live workout only; app-rest-timer.js) -->
+<div class="modal-overlay lc-top" id="modal-rest-timer">
+  <div class="modal">
+    <div class="modal-header"><div class="modal-title">Rest Timer</div><button class="btn-icon" aria-label="Close" onclick="closeModal('modal-rest-timer')">✕</button></div>
+    <div id="rt-body"></div>
   </div>
 </div>
 
@@ -698,5 +707,6 @@
 <script src="app-plan-run-end-ui.js"></script>
 <script src="app-core.js"></script>
 <script src="app-load-calc.js"></script>
+<script src="app-rest-timer.js"></script>
 </body>
 </html>

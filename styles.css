@@ -2229,3 +2229,42 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 .lcq-grid-big .lcq-lab-r { text-align: left; }
 .lcq-grid-big .lcq-cell { height: 20px; border-radius: 4px; border-width: 1.5px; }
 .lcq-grid-big .lcq-cell.lcq-five::after, .lcq-grid-big .lcq-cell.lcq-half::after { width: 14px; height: 6px; }
+
+/* =====================================================
+   REST TIMER (app-rest-timer.js)
+   ===================================================== */
+/* Indicator next to the workout clock: rounded, orange-tinted pill (the
+   workout clock is a square gray pill) so the two are easy to tell apart. */
+.rest-pill { flex-shrink: 0; display: inline-flex; align-items: center; gap: 4px; background: rgba(255,106,0,0.16); border: 1px solid var(--accent); border-radius: 20px; padding: 3px 10px; font-family: var(--font-display); font-size: 14px; font-weight: 700; letter-spacing: 0.05em; color: #ffb27a; cursor: pointer; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rest-pill.done { background: rgba(46,213,115,0.16); border-color: var(--green); color: var(--green); }
+.log-session-name { min-width: 0; }
+/* The indicator sits in .log-rest-row. Wide screens: the row is
+   "display: contents", so the pill stays inline right after the workout
+   clock (unchanged layout). Narrow screens, only while the indicator is
+   showing: the row wraps onto its own compact second line, so the workout
+   name, clock and ••• keep the whole first line. */
+.log-rest-row { display: contents; }
+/* The narrow layout is a two-row grid whose first row reproduces the
+   one-line header exactly (same 48px height, 10px gaps, name column
+   shrinking with an ellipsis, zero-width spacer), so the workout name keeps
+   exactly the space it had before the indicator appeared. */
+@media (max-width: 599px) {
+  .log-header.has-rest { display: grid; grid-template-columns: minmax(0, 1fr) auto 0 auto; grid-template-rows: 48px auto; column-gap: 10px; row-gap: 0; height: auto; align-items: center; }
+  .log-header.has-rest .log-session-name { grid-column: 1; grid-row: 1; }
+  .log-header.has-rest .log-timer-pill { grid-column: 2; grid-row: 1; }
+  .log-header.has-rest .log-header-spacer { grid-column: 3; grid-row: 1; min-width: 0; }
+  .log-header.has-rest .log-menu-btn { grid-column: 4; grid-row: 1; }
+  .log-header.has-rest .log-rest-row { display: flex; grid-column: 1 / -1; grid-row: 2; padding: 0 0 8px; }
+  .log-header.has-rest .rest-pill { padding: 2px 10px; }
+}
+.rt-status { font-family: var(--font-display); font-size: 18px; font-weight: 800; letter-spacing: 0.03em; text-transform: uppercase; color: #ffb27a; margin-bottom: 12px; font-variant-numeric: tabular-nums; }
+.rt-status-done { color: var(--green); }
+.rt-presets { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 14px; }
+.rt-preset { padding: 12px 4px; border-radius: var(--radius-sm); border: 1px solid var(--border); background: var(--surface2); color: var(--text); font-family: var(--font-display); font-size: 18px; font-weight: 700; cursor: pointer; }
+.rt-preset.selected { border-color: var(--accent); background: rgba(255,106,0,0.16); color: #ffb27a; }
+.rt-custom { display: flex; gap: 12px; }
+.rt-chime { display: flex; align-items: center; gap: 8px; text-transform: none; letter-spacing: 0; font-size: 15px; color: var(--text); margin: 2px 0 14px; }
+.rt-chime input { width: 18px; height: 18px; accent-color: var(--accent); }
+.rt-error { color: var(--red); font-size: 14px; margin: -4px 0 12px; }
+.rt-actions { display: flex; gap: 10px; }
+.rt-actions .btn { flex: 1; justify-content: center; }
