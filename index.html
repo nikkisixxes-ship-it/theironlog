@@ -348,6 +348,20 @@
   </div>
 </div>
 
+<!-- LOAD CALCULATOR MODAL (open live workout only; app-load-calc.js) -->
+<div class="modal-overlay lc-top" id="modal-load-calc">
+  <div class="modal">
+    <div class="modal-header">
+      <div style="display:flex;align-items:center;gap:8px;min-width:0">
+        <button class="btn-icon" id="lc-back-btn" aria-label="Back" onclick="lcBack()" style="display:none">‹</button>
+        <div class="modal-title" id="lc-title">Load Calculator</div>
+      </div>
+      <button class="btn-icon" aria-label="Close" onclick="closeLoadCalculator()">✕</button>
+    </div>
+    <div id="lc-body"></div>
+  </div>
+</div>
+
 <!-- EDIT WORKOUT TIME MODAL (open live workout only) -->
 <div class="modal-overlay" id="modal-edit-workout-time">
   <div class="modal">
@@ -683,5 +697,6 @@
      real user sees today. -->
 <script src="app-plan-run-end-ui.js"></script>
 <script src="app-core.js"></script>
+<script src="app-load-calc.js"></script>
 </body>
 </html>

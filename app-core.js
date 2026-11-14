@@ -2058,6 +2058,8 @@ function openLogHeaderMenu(e) {
     { label: 'Log Bodyweight',    icon: '⚖', action: 'openLogBWModal()' },
     // EDIT WORKOUT TIME: open live workouts only (never a History edit).
     ...(workoutTimeEditAvailable() ? [{ label: 'Edit Workout Time', icon: '⏱', action: 'openEditWorkoutTimeModal()' }] : []),
+    // LOAD CALCULATOR: standalone tool (app-load-calc.js); live workouts only.
+    ...(currentWorkout && !currentWorkout._isEdit ? [{ label: 'Load Calculator', icon: '▦', action: 'openLoadCalculator()' }] : []),
     { label: 'RPE',              icon: '',  action: 'toggleRPEFromMenu()', toggle: currentWorkout?.rpeEnabled ? '✓ ' : '' },
     { divider: true },
     { label: 'Cancel Workout', icon: '✕', action: 'cancelWorkout()', danger: true },
