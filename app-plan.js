@@ -12368,86 +12368,56 @@ function planCanonicalEditorExerciseOptions() {
   return [];
 }
 
-// Regular PLAN navigation entry. Mount the canonical editor inside the
-// existing page-programs page instead of the old fixed development overlay.
-// Re-entering PLAN preserves the current in-memory draft; only the first visit
-// boots a fresh state (and performs the existing recovery-marker check).
 // =============================================================================
-// PHASE B MULTI-SCREEN EDITOR -- navigation controller and screen rendering
+// PLAN REDESIGN -- Program Outline / Microcycle / Session workspace /
+// Progression (approved IRON-LOG-Program-Library-Profile mockup)
 // =============================================================================
-// Replaces the temporary one-screen canonical editor's single flat render
-// with the intended hierarchical workflow (Program Library -> Program ->
-// Microcycle -> Session -> Exercise -> Sets/Progression), per the Phase B
-// multi-screen specification. Everything ABOVE this banner in this file
-// (canonical model, normalization, writer, reader, Program library
-// persistence, save/reopen lifecycle, recovery locks, duplication-lineage
-// engine, and every field-setter/structural-editing handler) is preserved
-// completely unmodified by this section -- this section only changes HOW
-// that already-accepted state is presented and navigated.
+// Presentation and navigation only. Everything this section renders is
+// backed by the SAME canonical editor state (planCanonicalEditorState.
+// editorState) and the SAME, unmodified field-setter / structural /
+// progression / series / replacement / save / recovery handlers defined
+// above. No handler, validation rule, commit-package builder, reader, or
+// Firestore path is changed here.
 //
-// ---- Controller architecture ----
-// planCanonicalEditorState.nav is a transient, editor-session-scoped
-// navigation selection, added as a SIBLING of editorState (never inside
-// it -- see planCanonicalEditorBuildFreshState above). It is never read by
-// planAdaptEditorStateToCanonicalDraft, planNormalizeCanonicalGraph, any
-// commit-package builder, or any Firestore read/write -- the only functions
-// that ever touch it are the ones in this section, plus the four explicit
-// wholesale-replacement reset points commented above (HandleNew,
-// ApplyBootRecoveryOutcome's verified branch, ApplySaveResult's post-save
-// reopen branch, HandleReopen's success branch).
+// ---- Screens ----
+//   'program'     Program Outline: name + Program details disclosure
+//                 (description, structure label, notes) + Microcycle rows.
+//   'microcycle'  Microcycle name + Session rows + Microcycle actions
+//                 (move earlier/later, Duplicate Microcycle, remove).
+//   'session'     Session workspace: name, notes, Exercise rows. One
+//                 exercise expands in place (exercise, prescription notes,
+//                 Sets, Progression entry row, exercise actions); inside it,
+//                 one Set editor opens in place under its row.
+//   'progression' Dedicated Progression screen for one exercise.
+// The previous drill-down screens 'exercise' and 'set' no longer exist as
+// separate screens: they are the expanded exercise and the open set editor
+// inside the Session workspace. The legacy navigation handler names
+// (planCanonicalEditorNavOpenExercise / NavOpenSet / NavBackToExercise /
+// NavBackToSession) are kept and mapped onto that model.
 //
-// nav holds STABLE OBJECT REFERENCES for the current Microcycle/Session/
-// Exercise/Set selection (never a bare array index as long-lived identity):
-// { screen, microcycle, session, exercise, set, staleNotice }. `screen` is
-// one of 'program' | 'microcycle' | 'session' | 'exercise' | 'set' |
-// 'progression' -- private identifiers to this controller. On every render,
-// planCanonicalEditorResolveNavLocation() re-resolves each held reference
-// against the CURRENT editorState tree by strict identity (Array#indexOf):
-// reordering never loses the selection (indexOf finds the same object at
-// its new position); removal (or a wholesale editorState replacement, whose
-// new objects can never coincidentally match old references) makes it
-// unresolvable, and the controller falls back to the nearest still-valid
-// parent screen with a concise, honest explanation in nav.staleNotice --
-// never silently opening a different object that happens to occupy the same
-// index.
-//
-// ---- Screen/field inventory (see the implementation report for the full
-// table) ----
-//   Program screen:     name, description, structureLabel, notes; Microcycle
-//                        rows (open/add/duplicate+confirm/cancel/move/remove).
-//   Microcycle screen:  name only (no notes field); Session rows
-//                        (open/add/move/remove); Duplicate this Microcycle.
-//   Session screen:     name, notes; Exercise rows (open/add/move/remove).
-//   Exercise screen:    exercise selection (or text fallback), notes; Set
-//                        rows (open/add/move/remove); Progression
-//                        summary + navigation.
-//   Set screen:         every existing canonical Set field (dedicated child
-//                        screen -- see the report's justification).
-//   Progression screen: every existing canonical Rule field, including
-//                        enabled/disable (dedicated child screen, matching
-//                        the Set screen's own precedent).
-// A persistent global header (Save/outcome/validation/save-phase/reload-
-// warning/New/Back to Programs/Reopen-diagnostic) renders identically on
-// every screen, using the exact same canonical save handler and state this
-// editor has always used -- never a second save implementation.
+// ---- nav (transient, never saved -- a sibling of editorState) ----
+// { screen, microcycle, session, exercise, set, staleNotice,
+//   detailsOpen, moreOpen, scrollTarget }
+// microcycle/session/exercise/set are STABLE OBJECT REFERENCES resolved by
+// identity on every render (planCanonicalEditorResolveNavLocation), exactly
+// as before: reordering keeps the selection; removal falls back to the
+// nearest valid parent. In the Session workspace, the expanded exercise and
+// open set are disclosure state, so if either disappears it simply closes.
 // =============================================================================
 
 function planCanonicalEditorFreshNavState() {
-  return { screen: 'program', microcycle: null, session: null, exercise: null, set: null, staleNotice: null };
+  return { screen: 'program', microcycle: null, session: null, exercise: null, set: null, staleNotice: null, detailsOpen: false, moreOpen: false, scrollTarget: null };
 }
 
 // ---- planCanonicalEditorResolveNavLocation() ----
-// See the banner comment above for the full contract. Called at the top of
-// every render, before any screen-specific HTML is built. Mutates
-// planCanonicalEditorState.nav IN PLACE only when a held selection can no
-// longer be resolved (falling back to its nearest valid parent); otherwise
-// leaves nav untouched. Returns a plain resolved-location object (never
-// nav itself) carrying the CURRENT indices/objects for whichever levels are
-// valid for the (possibly just-corrected) screen.
+// Called at the top of every render. Mutates nav in place only when a held
+// selection can no longer be resolved; returns the current indices/objects.
 function planCanonicalEditorResolveNavLocation() {
   var st = planCanonicalEditorState;
   if (!st.nav || typeof st.nav !== 'object') st.nav = planCanonicalEditorFreshNavState();
   var nav = st.nav;
+  // Older screen names map onto the Session workspace.
+  if (nav.screen === 'exercise' || nav.screen === 'set') nav.screen = 'session';
   var es = st.editorState;
   var loc = { screen: nav.screen, mi: -1, si: -1, ei: -1, seti: -1, mc: null, session: null, exercise: null, set: null };
   if (!es || nav.screen === 'program') { loc.screen = 'program'; return loc; }
@@ -12455,7 +12425,7 @@ function planCanonicalEditorResolveNavLocation() {
   var mi = (nav.microcycle && Array.isArray(es.microcycles)) ? es.microcycles.indexOf(nav.microcycle) : -1;
   if (mi === -1) {
     nav.screen = 'program'; nav.microcycle = null; nav.session = null; nav.exercise = null; nav.set = null;
-    nav.staleNotice = 'That microcycle is no longer available here -- returned to the Program screen.';
+    nav.staleNotice = 'That microcycle is no longer available here -- returned to the Program Outline.';
     loc.screen = 'program';
     return loc;
   }
@@ -12465,82 +12435,95 @@ function planCanonicalEditorResolveNavLocation() {
   var si = (nav.session && Array.isArray(loc.mc.sessions)) ? loc.mc.sessions.indexOf(nav.session) : -1;
   if (si === -1) {
     nav.screen = 'microcycle'; nav.session = null; nav.exercise = null; nav.set = null;
-    nav.staleNotice = 'That session is no longer available here -- returned to the Microcycle screen.';
+    nav.staleNotice = 'That session is no longer available here -- returned to the Microcycle.';
     loc.screen = 'microcycle';
     return loc;
   }
   loc.si = si; loc.session = loc.mc.sessions[si];
-  if (nav.screen === 'session') return loc;
 
   var ei = (nav.exercise && Array.isArray(loc.session.exercises)) ? loc.session.exercises.indexOf(nav.exercise) : -1;
+  if (nav.screen === 'session') {
+    // Disclosure state: an expanded exercise / open set that no longer
+    // exists simply closes (no notice -- e.g. it was just removed).
+    if (ei === -1) { nav.exercise = null; nav.set = null; return loc; }
+    loc.ei = ei; loc.exercise = loc.session.exercises[ei];
+    var seti = (nav.set && Array.isArray(loc.exercise.sets)) ? loc.exercise.sets.indexOf(nav.set) : -1;
+    if (seti === -1) { nav.set = null; return loc; }
+    loc.seti = seti; loc.set = loc.exercise.sets[seti];
+    return loc;
+  }
+  // 'progression'
   if (ei === -1) {
     nav.screen = 'session'; nav.exercise = null; nav.set = null;
-    nav.staleNotice = 'That exercise is no longer available here -- returned to the Session screen.';
+    nav.staleNotice = 'That exercise is no longer available here -- returned to the Session.';
     loc.screen = 'session';
     return loc;
   }
   loc.ei = ei; loc.exercise = loc.session.exercises[ei];
-  if (nav.screen === 'exercise' || nav.screen === 'progression') return loc;
-
-  var seti = (nav.set && Array.isArray(loc.exercise.sets)) ? loc.exercise.sets.indexOf(nav.set) : -1;
-  if (seti === -1) {
-    nav.screen = 'exercise'; nav.set = null;
-    nav.staleNotice = 'That set is no longer available here -- returned to the Exercise screen.';
-    loc.screen = 'exercise';
-    return loc;
-  }
-  loc.seti = seti; loc.set = loc.exercise.sets[seti];
   return loc;
 }
 
 // ---- Navigation handlers ----
-// Pure navigation: never mutate editorState, never gated by
-// planCanonicalEditorGuardMutable (busy/pending-save/recovery-checking) --
-// documented policy: "ordinary movement between already-open editor levels
-// may remain available... since it cannot discard/replace state." Each
-// resolves its target through the SAME planCanonicalEditorResolve*
-// functions every field-setter/structural handler already uses, so an
-// out-of-range index throws the identical typed error rather than silently
-// opening nothing.
+// Pure navigation: never mutate editorState and never gated by
+// planCanonicalEditorGuardMutable (moving between already-open levels
+// cannot discard or replace state). Targets are resolved through the same
+// planCanonicalEditorResolve* functions the field/structure handlers use.
+function planCanonicalEditorNavEnsure() {
+  var st = planCanonicalEditorState;
+  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
+  return st.nav;
+}
 function planCanonicalEditorNavOpenMicrocycle(mi) {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenMicrocycle');
   var mc = planCanonicalEditorResolveMicrocycle(mi);
-  var st = planCanonicalEditorState;
-  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
-  st.nav.screen = 'microcycle'; st.nav.microcycle = mc; st.nav.session = null; st.nav.exercise = null; st.nav.set = null; st.nav.staleNotice = null;
+  var nav = planCanonicalEditorNavEnsure();
+  nav.screen = 'microcycle'; nav.microcycle = mc; nav.session = null; nav.exercise = null; nav.set = null; nav.staleNotice = null;
+  nav.scrollTarget = { top: true };
   planCanonicalEditorRender();
 }
 function planCanonicalEditorNavBackToProgram() {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToProgram');
-  planCanonicalEditorState.nav = planCanonicalEditorFreshNavState();
+  var prev = planCanonicalEditorState.nav || planCanonicalEditorFreshNavState();
+  var fresh = planCanonicalEditorFreshNavState();
+  fresh.detailsOpen = !!prev.detailsOpen; fresh.moreOpen = !!prev.moreOpen;
+  var es = planCanonicalEditorState.editorState;
+  var mi = (prev.microcycle && es && es.microcycles) ? es.microcycles.indexOf(prev.microcycle) : -1;
+  fresh.scrollTarget = mi >= 0 ? { selector: '[data-testid="open-microcycle"][data-mi="' + mi + '"]', block: 'center', focus: true } : { top: true };
+  planCanonicalEditorState.nav = fresh;
   planCanonicalEditorRender();
 }
 function planCanonicalEditorNavOpenSession(mi, si) {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenSession');
   var mc = planCanonicalEditorResolveMicrocycle(mi);
   var sess = planCanonicalEditorResolveSession(mi, si);
-  var st = planCanonicalEditorState;
-  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
-  st.nav.screen = 'session'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = null; st.nav.set = null; st.nav.staleNotice = null;
+  var nav = planCanonicalEditorNavEnsure();
+  nav.screen = 'session'; nav.microcycle = mc; nav.session = sess; nav.exercise = null; nav.set = null; nav.staleNotice = null;
+  nav.scrollTarget = { top: true };
   planCanonicalEditorRender();
 }
 function planCanonicalEditorNavBackToMicrocycle() {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToMicrocycle');
   var nav = planCanonicalEditorState.nav;
   planCanonicalAdapterRequire(nav, 'planCanonicalEditorNavBackToMicrocycle: no navigation state');
+  var mc = nav.microcycle, sess = nav.session;
+  var si = (mc && sess && mc.sessions) ? mc.sessions.indexOf(sess) : -1;
   nav.screen = 'microcycle'; nav.session = null; nav.exercise = null; nav.set = null; nav.staleNotice = null;
+  nav.scrollTarget = si >= 0 ? { selector: '[data-testid="open-session"][data-si="' + si + '"]', block: 'center', focus: true } : { top: true };
   planCanonicalEditorRender();
 }
+// Opens the Session workspace with this exercise expanded (the former
+// Exercise screen).
 function planCanonicalEditorNavOpenExercise(mi, si, ei) {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenExercise');
   var mc = planCanonicalEditorResolveMicrocycle(mi);
   var sess = planCanonicalEditorResolveSession(mi, si);
   var ex = planCanonicalEditorResolveExercise(mi, si, ei);
-  var st = planCanonicalEditorState;
-  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
-  st.nav.screen = 'exercise'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = ex; st.nav.set = null; st.nav.staleNotice = null;
+  var nav = planCanonicalEditorNavEnsure();
+  nav.screen = 'session'; nav.microcycle = mc; nav.session = sess; nav.exercise = ex; nav.set = null; nav.staleNotice = null;
+  nav.scrollTarget = { selector: '[data-testid="open-exercise"][data-ei="' + ei + '"]', block: 'start' };
   planCanonicalEditorRender();
 }
+// Collapses the expanded exercise, staying in the Session workspace.
 function planCanonicalEditorNavBackToSession() {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToSession');
   var nav = planCanonicalEditorState.nav;
@@ -12548,15 +12531,16 @@ function planCanonicalEditorNavBackToSession() {
   nav.screen = 'session'; nav.exercise = null; nav.set = null; nav.staleNotice = null;
   planCanonicalEditorRender();
 }
+// Opens this set's editor in place (the former Set screen).
 function planCanonicalEditorNavOpenSet(mi, si, ei, seti) {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavOpenSet');
   var mc = planCanonicalEditorResolveMicrocycle(mi);
   var sess = planCanonicalEditorResolveSession(mi, si);
   var ex = planCanonicalEditorResolveExercise(mi, si, ei);
   var set = planCanonicalEditorResolveSet(mi, si, ei, seti);
-  var st = planCanonicalEditorState;
-  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
-  st.nav.screen = 'set'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = ex; st.nav.set = set; st.nav.staleNotice = null;
+  var nav = planCanonicalEditorNavEnsure();
+  nav.screen = 'session'; nav.microcycle = mc; nav.session = sess; nav.exercise = ex; nav.set = set; nav.staleNotice = null;
+  nav.scrollTarget = { selector: '[data-testid="open-set"][data-ei="' + ei + '"][data-seti="' + seti + '"]', block: 'start' };
   planCanonicalEditorRender();
 }
 function planCanonicalEditorNavOpenProgression(mi, si, ei) {
@@ -12564,28 +12548,258 @@ function planCanonicalEditorNavOpenProgression(mi, si, ei) {
   var mc = planCanonicalEditorResolveMicrocycle(mi);
   var sess = planCanonicalEditorResolveSession(mi, si);
   var ex = planCanonicalEditorResolveExercise(mi, si, ei);
-  var st = planCanonicalEditorState;
-  if (!st.nav) st.nav = planCanonicalEditorFreshNavState();
-  st.nav.screen = 'progression'; st.nav.microcycle = mc; st.nav.session = sess; st.nav.exercise = ex; st.nav.set = null; st.nav.staleNotice = null;
+  var nav = planCanonicalEditorNavEnsure();
+  nav.screen = 'progression'; nav.microcycle = mc; nav.session = sess; nav.exercise = ex; nav.set = null; nav.staleNotice = null;
+  nav.scrollTarget = { top: true };
   planCanonicalEditorRender();
 }
-// Shared by both the Set screen and the Progression screen -- both are
-// children of the Exercise screen, so "Back" from either has the same
-// exact logical parent.
+// Back from Progression: the Session workspace with the same exercise
+// still expanded and its Progression row in view.
 function planCanonicalEditorNavBackToExercise() {
   planCanonicalEditorRequireBooted('planCanonicalEditorNavBackToExercise');
   var nav = planCanonicalEditorState.nav;
   planCanonicalAdapterRequire(nav, 'planCanonicalEditorNavBackToExercise: no navigation state');
-  nav.screen = 'exercise'; nav.set = null; nav.staleNotice = null;
+  var sess = nav.session, ex = nav.exercise;
+  var ei = (sess && ex && sess.exercises) ? sess.exercises.indexOf(ex) : -1;
+  nav.screen = 'session'; nav.set = null; nav.staleNotice = null;
+  nav.scrollTarget = ei >= 0 ? { selector: '[data-testid="open-progression"][data-ei="' + ei + '"]', block: 'center', focus: true } : null;
   planCanonicalEditorRender();
 }
 
+// ---- Session workspace disclosure (one exercise / one set at a time) ----
+function planUiToggleExercise(mi, si, ei) {
+  planCanonicalEditorRequireBooted('planUiToggleExercise');
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var nav = planCanonicalEditorNavEnsure();
+  if (nav.screen === 'session' && nav.exercise === ex) {
+    nav.exercise = null; nav.set = null; nav.staleNotice = null;
+    nav.scrollTarget = { selector: '[data-testid="open-exercise"][data-ei="' + ei + '"]', block: 'nearest', focus: true };
+    planCanonicalEditorRender();
+    return;
+  }
+  planCanonicalEditorNavOpenExercise(mi, si, ei);
+}
+// Tapping a set row opens its editor in place; tapping another row closes
+// the previous editor (its edits are already in editorState -- every field
+// writes through on input) and opens the new one; tapping the open row
+// closes it.
+function planUiToggleSet(mi, si, ei, seti) {
+  planCanonicalEditorRequireBooted('planUiToggleSet');
+  var set = planCanonicalEditorResolveSet(mi, si, ei, seti);
+  var nav = planCanonicalEditorNavEnsure();
+  if (nav.screen === 'session' && nav.set === set) { planUiSetDone(); return; }
+  planCanonicalEditorNavOpenSet(mi, si, ei, seti);
+}
+function planUiSetDone() {
+  planCanonicalEditorRequireBooted('planUiSetDone');
+  var nav = planCanonicalEditorNavEnsure();
+  var ex = nav.exercise, set = nav.set, sess = nav.session;
+  var ei = (sess && ex) ? sess.exercises.indexOf(ex) : -1;
+  var seti = (ex && set) ? ex.sets.indexOf(set) : -1;
+  nav.set = null;
+  nav.scrollTarget = (ei >= 0 && seti >= 0) ? { selector: '[data-testid="open-set"][data-ei="' + ei + '"][data-seti="' + seti + '"]', block: 'nearest', focus: true } : null;
+  planCanonicalEditorRender();
+}
+// Keeps the open set's row summary current while typing, without a full
+// redraw (a redraw would drop keyboard focus).
+function planUiRefreshSetSummary(mi, si, ei, seti) {
+  if (typeof document === 'undefined' || !planCanonicalEditorState) return;
+  try {
+    var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+    var set = ex.sets[seti];
+    if (!set) return;
+    var row = document.querySelector('[data-testid="open-set"][data-mi="' + mi + '"][data-si="' + si + '"][data-ei="' + ei + '"][data-seti="' + seti + '"] small');
+    if (row) row.innerHTML = escapeHtml(planUiSetText(set, planUiWorkingLoadEligible(ex))) + (set.notes && set.notes.trim() ? ' <span class="plan-note-tag">NOTE</span>' : '');
+  } catch (e) { /* display convenience only */ }
+}
+function planUiToggleDetails() {
+  var nav = planCanonicalEditorNavEnsure();
+  nav.detailsOpen = !nav.detailsOpen;
+  nav.scrollTarget = { selector: '[data-testid="program-details-toggle"]', block: 'nearest', focus: true };
+  planCanonicalEditorRender();
+}
+
+// ---- Add actions: the existing add handlers, then open what was added ----
+function planUiAddMicrocycle() {
+  var es = planCanonicalEditorState.editorState;
+  var before = es.microcycles.length;
+  planCanonicalEditorHandleAddMicrocycle();
+  if (planCanonicalEditorState.editorState.microcycles.length > before) planCanonicalEditorNavOpenMicrocycle(before);
+}
+function planUiAddSession(mi) {
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var before = mc.sessions.length;
+  planCanonicalEditorHandleAddSession(mi);
+  if (mc.sessions.length > before) planCanonicalEditorNavOpenSession(mi, before);
+}
+function planUiAddExercise(mi, si) {
+  var sess = planCanonicalEditorResolveSession(mi, si);
+  var before = sess.exercises.length;
+  planCanonicalEditorHandleAddExercise(mi, si);
+  if (sess.exercises.length > before) planCanonicalEditorNavOpenExercise(mi, si, before);
+}
+function planUiAddSet(mi, si, ei) {
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var before = ex.sets.length;
+  planCanonicalEditorHandleAddSet(mi, si, ei);
+  if (ex.sets.length > before) planCanonicalEditorNavOpenSet(mi, si, ei, before);
+}
+
+// ---- Remove actions: the existing remove handlers (same last-item
+// refusal, Gateway clamp and lineage pruning); afterwards leave the screen
+// of a removed microcycle/session instead of showing a stale notice ----
+function planUiRemoveMicrocycle(mi) {
+  var es = planCanonicalEditorState.editorState;
+  var mc = es.microcycles[mi];
+  planCanonicalEditorHandleRemoveMicrocycle(mi);
+  if (mc && planCanonicalEditorState.editorState.microcycles.indexOf(mc) === -1) {
+    var nav = planCanonicalEditorNavEnsure();
+    var keepDetails = !!nav.detailsOpen, keepMore = !!nav.moreOpen;
+    planCanonicalEditorState.nav = planCanonicalEditorFreshNavState();
+    planCanonicalEditorState.nav.detailsOpen = keepDetails; planCanonicalEditorState.nav.moreOpen = keepMore;
+    planCanonicalEditorState.nav.scrollTarget = { top: true };
+    planCanonicalEditorRender();
+  }
+}
+function planUiRemoveSession(mi, si) {
+  var mc = planCanonicalEditorResolveMicrocycle(mi);
+  var sess = mc.sessions[si];
+  planCanonicalEditorHandleRemoveSession(mi, si);
+  if (sess && mc.sessions.indexOf(sess) === -1) {
+    var nav = planCanonicalEditorNavEnsure();
+    nav.screen = 'microcycle'; nav.session = null; nav.exercise = null; nav.set = null; nav.staleNotice = null;
+    nav.scrollTarget = { top: true };
+    planCanonicalEditorRender();
+  }
+}
+function planUiRemoveExercise(mi, si, ei) {
+  planCanonicalEditorHandleRemoveExercise(mi, si, ei);
+}
+function planUiRemoveSet(mi, si, ei, seti) {
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  var set = ex.sets[seti];
+  planCanonicalEditorHandleRemoveSet(mi, si, ei, seti);
+  if (set && ex.sets.indexOf(set) === -1) {
+    var nav = planCanonicalEditorNavEnsure();
+    nav.set = null;
+    nav.scrollTarget = { selector: '[data-testid="add-set"][data-ei="' + ei + '"]', block: 'center', focus: true };
+    planCanonicalEditorRender();
+  }
+}
+// ---- Move actions keep the moved item open and in view ----
+function planUiMoveExercise(mi, si, ei, delta) {
+  planCanonicalEditorHandleMoveExercise(mi, si, ei, delta);
+  var nav = planCanonicalEditorNavEnsure();
+  var to = ei + delta;
+  nav.scrollTarget = { selector: '[data-testid="open-exercise"][data-ei="' + to + '"]', block: 'start' };
+  planCanonicalEditorRender();
+}
+function planUiMoveSet(mi, si, ei, seti, delta) {
+  planCanonicalEditorHandleMoveSet(mi, si, ei, seti, delta);
+  var nav = planCanonicalEditorNavEnsure();
+  var to = seti + delta;
+  nav.scrollTarget = { selector: '[data-testid="open-set"][data-ei="' + ei + '"][data-seti="' + to + '"]', block: 'start' };
+  planCanonicalEditorRender();
+}
+
+// ---- Back (top bar) ----
+// Program Outline -> where the editor was opened from (Program Profile for
+// Edit Template, the Library for New Program), through the existing
+// safety-checked planCanonicalEditorHandleBackToPrograms. Deeper screens
+// move up one level and keep the draft exactly as edited.
+function planUiEditorBack() {
+  planCanonicalEditorRequireBooted('planUiEditorBack');
+  var nav = planCanonicalEditorNavEnsure();
+  if (nav.screen === 'progression') return planCanonicalEditorNavBackToExercise();
+  if (nav.screen === 'session' || nav.screen === 'exercise' || nav.screen === 'set') return planCanonicalEditorNavBackToMicrocycle();
+  if (nav.screen === 'microcycle') return planCanonicalEditorNavBackToProgram();
+  return planUiLeaveEditor();
+}
+function planUiLeaveEditor() {
+  var st = planCanonicalEditorState;
+  var returnTo = st && st.returnTo ? st.returnTo : null;
+  var result = planCanonicalEditorHandleBackToPrograms();
+  if (result && result.status === 'blocked') return result;
+  // A pending recovery check can take over #page-programs instead of the
+  // library; only continue to the Profile when the library is showing.
+  if (planCanonicalEditorState) return result;
+  if (returnTo && returnTo.view === 'profile' && returnTo.templateId && planCanonicalLibraryState) {
+    return planCanonicalLibraryOpenProfile(returnTo.templateId, { expanded: returnTo.expanded });
+  }
+  return result;
+}
+
+// "Start a new blank program" (the existing New handler). A blank program
+// was not opened from any Profile, so Back from it returns to the Library.
+function planUiNewBlank() {
+  planCanonicalEditorRequireBooted('planUiNewBlank');
+  var st = planCanonicalEditorState;
+  var before = st.editorState;
+  planCanonicalEditorHandleNew();
+  if (planCanonicalEditorState === st && st.editorState !== before) { st.returnTo = null; }
+}
+
+// ---- Save Template ----
+// Calls the one existing save handler, unchanged. That handler's verified
+// post-save reopen replaces editorState with freshly read objects and
+// resets nav to the Program Outline. This wrapper then restores the
+// person's LATEST location in the editor -- not the one they saved from:
+// navigation stays live while a save is in flight, and every editor render
+// records where the person is (st._saveTrack, only while the pre-save graph
+// is still the one on screen). After the reopen, that latest location is
+// re-applied BY POSITION on the reopened graph (order is exactly what was
+// just saved), including a still-valid expanded exercise or open set;
+// anything that no longer exists falls back to its parent level.
+// If the editor session is no longer the current one when the save settles
+// (the person left the editor), this does nothing: a late result never
+// reopens the editor or redraws over the current view. If the save did not
+// replace the graph (validation, pending/unresolved, failure), nav was
+// never reset and is left exactly as the person left it.
+function planUiLocSnapshot(loc, nav) {
+  return { screen: loc.screen, mi: loc.mi, si: loc.si, ei: loc.ei, seti: loc.seti, detailsOpen: !!(nav && nav.detailsOpen), moreOpen: !!(nav && nav.moreOpen) };
+}
+function planUiApplyLocSnapshot(st, want) {
+  var es = st.editorState;
+  var nav = planCanonicalEditorFreshNavState();
+  nav.detailsOpen = want.detailsOpen; nav.moreOpen = want.moreOpen;
+  var mc = (want.screen !== 'program' && want.mi >= 0) ? es.microcycles[want.mi] : null;
+  if (mc) {
+    nav.screen = 'microcycle'; nav.microcycle = mc;
+    var sess = (want.screen === 'session' || want.screen === 'progression') && want.si >= 0 ? mc.sessions[want.si] : null;
+    if (sess) {
+      nav.screen = 'session'; nav.session = sess;
+      var ex = want.ei >= 0 ? sess.exercises[want.ei] : null;
+      if (ex) {
+        nav.exercise = ex;
+        if (want.screen === 'progression') nav.screen = 'progression';
+        else if (want.seti >= 0 && ex.sets[want.seti]) nav.set = ex.sets[want.seti];
+      }
+    }
+  }
+  st.nav = nav;
+}
+async function planUiSave() {
+  planCanonicalEditorRequireBooted('planUiSave');
+  var st = planCanonicalEditorState;
+  var esBefore = st.editorState;
+  var track = { es: esBefore, loc: planUiLocSnapshot(planCanonicalEditorResolveNavLocation(), st.nav) };
+  st._saveTrack = track;
+  var result;
+  try {
+    result = await planCanonicalEditorHandleSave();
+  } finally {
+    if (st._saveTrack === track) st._saveTrack = null;
+  }
+  if (planCanonicalEditorState !== st) return result;
+  if (st.editorState === esBefore) return result;
+  planUiApplyLocSnapshot(st, track.loc);
+  planCanonicalEditorRender();
+  return result;
+}
+
 // ---- planCanonicalGetExerciseName(exerciseId) ----
-// Display-name resolution for exercise rows/titles, mirroring the legacy
-// editor's own getExercise() lookups (app-data.js's shared, already-
-// accepted exercise catalog accessor -- never a canonical writer/reader
-// concern). Guarded exactly like planCanonicalEditorExerciseOptions above
-// so a bare Node load without app-data.js never breaks rendering.
+// Display-name resolution (app-data.js's shared exercise catalog accessor),
+// guarded so a bare Node load never breaks rendering.
 function planCanonicalGetExerciseName(exerciseId) {
   if (!exerciseId) return '(no exercise selected)';
   try {
@@ -12597,10 +12811,72 @@ function planCanonicalGetExerciseName(exerciseId) {
   return exerciseId;
 }
 
-// Regular PLAN navigation entry. Mount the canonical editor inside the
-// existing page-programs page instead of the old fixed development overlay.
-// Re-entering PLAN preserves the current in-memory draft; only the first visit
-// boots a fresh state (and performs the existing recovery-marker check).
+// ---- Shared PLAN display helpers (pure; used by the editor and by the
+// read-only Profile / session views) ----
+function planUiCount(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+function planUiUnit() { return (typeof appDb !== 'undefined' && appDb && appDb.unit === 'kg') ? 'kg' : 'lb'; }
+function planUiSessionSummary(sess) {
+  var exs = (sess && sess.exercises) || [];
+  var sets = exs.reduce(function (n, e) { return n + ((e.sets || []).length); }, 0);
+  return planUiCount(exs.length, 'exercise') + ' · ' + planUiCount(sets, 'set');
+}
+// Metadata line: microcycle count, sessions per microcycle when every
+// microcycle has the same number (else the total), and the structure label.
+function planUiProgramMeta(p) {
+  var mcs = (p && p.microcycles) || [];
+  var sizes = mcs.map(function (m) { return (m.sessions || []).length; });
+  var parts = [planUiCount(mcs.length, 'microcycle')];
+  if (sizes.length) {
+    var same = sizes.every(function (n) { return n === sizes[0]; });
+    parts.push(same ? planUiCount(sizes[0], 'session') + ' / microcycle' : planUiCount(sizes.reduce(function (a, b) { return a + b; }, 0), 'session'));
+  }
+  if (p && p.structureLabel && String(p.structureLabel).trim()) parts.push(String(p.structureLabel).trim());
+  return parts.join(' · ');
+}
+// Concise progression summary: planProgressionSummaryText without the
+// fixed "Repeat on fail" tail, plus the series name when linked.
+function planUiProgressionShort(ex) {
+  var prog = ex && ex.progression;
+  if (!prog || !prog.enabled) return '';
+  var txt = planProgressionSummaryText(ex).replace(/\s*•\s*Repeat on fail\s*$/, '').replace(/\s*•\s*/g, ' · ');
+  if (prog.progressionSeriesName) txt += ' · ' + prog.progressionSeriesName;
+  return txt;
+}
+function planUiExerciseRowSub(ex) {
+  var bits = [planUiCount((ex.sets || []).length, 'set')];
+  var p = planUiProgressionShort(ex);
+  if (p) bits.push(p);
+  return bits.join(' · ');
+}
+// Plain-text set prescription (planFormatSetSummary without its HTML note tag).
+function planUiSetText(set, workingLoadEligible) {
+  return planFormatSetSummary(set, false, workingLoadEligible);
+}
+function planUiWorkingLoadEligible(ex) {
+  return !!(ex && ex.progression && ex.progression.enabled && ex.progression.adjustmentType === 'addLoad');
+}
+// Row button markup shared by every PLAN list: title + detail + glyph.
+function planUiRow(attrs, title, detail, glyph, extraClass) {
+  return '<button type="button" class="pl-row' + (extraClass ? ' ' + extraClass : '') + '"' + attrs + '>' +
+    '<span class="pl-row-text"><strong>' + escapeHtml(title) + '</strong>' + (detail ? '<small>' + detail + '</small>' : '') + '</span>' +
+    '<span class="pl-glyph" aria-hidden="true">' + (glyph || '&rsaquo;') + '</span></button>';
+}
+// After a render, bring the requested row into view (and optionally focus
+// it, so Back lands the screen-reader/keyboard user on the same row).
+function planUiApplyScrollTarget(root, target) {
+  if (!target || typeof document === 'undefined') return;
+  try {
+    var main = document.getElementById('main');
+    if (target.top) { if (main) main.scrollTop = 0; return; }
+    var el = root.querySelector(target.selector);
+    if (!el) return;
+    if (target.focus && el.focus) el.focus({ preventScroll: true });
+    el.scrollIntoView({ block: target.block || 'nearest' });
+  } catch (e) { /* scrolling is a convenience only */ }
+}
+
+// Regular PLAN navigation entry (diagnostic/direct path; ordinary PLAN
+// navigation goes through planOpenCanonicalLibraryFromPlanNavigation).
 function planOpenCanonicalEditorFromPlanNavigation() {
   if (typeof document !== 'undefined') {
     var page = planContainer();
@@ -12630,78 +12906,84 @@ function planCanonicalEditorRender() {
   var es = st.editorState;
   var loc = planCanonicalEditorResolveNavLocation();
   var nav = st.nav;
+  var unit = planUiUnit();
+  // While a save is in flight, remember where the person is now (see planUiSave).
+  if (st._saveTrack && st.editorState === st._saveTrack.es) st._saveTrack.loc = planUiLocSnapshot(loc, nav);
 
-  // Save-progress/safe-to-leave correction (Phase A requirement 3): the
-  // beforeunload guard is synced on every render from the SAME
-  // planCanonicalEditorIsSafeToLeave() predicate that already drives
-  // lockedAttr/reopenLockedAttr below (busy || pending save attempt ||
-  // recovery check in progress) -- never a separately-tracked flag that
-  // could drift from what is actually rendered as locked. This means the
-  // warning is installed/removed based on current editor state on every
-  // render, not permanently installed once and left in place. Unaffected
-  // by which screen is currently showing (Phase B requirement: "The
-  // before-unload warning and save-phase state must remain active
-  // regardless of visible editor level").
+  // Same beforeunload sync and lock rules as before (unchanged predicates).
   planCanonicalEditorSyncBeforeUnloadGuard(!planCanonicalEditorIsSafeToLeave());
   var busyAttr = st.busy ? 'disabled' : '';
-  // Save-lifecycle correction requirement 3 ("Rendered controls must be
-  // disabled appropriately"): every control that MUTATES editorState is
-  // disabled whenever planCanonicalEditorGuardMutable would refuse it --
-  // busy (an operation is literally in flight) OR a save attempt is
-  // pending confirmation (requirement 2's chosen "block editing" policy).
-  // The actual protection against mutation is planCanonicalEditorGuardMutable
-  // itself (every handler checks it regardless of what is rendered here) --
-  // this attribute is the honest reflection of that in the DOM, not the
-  // enforcement mechanism.
-  // Uncertain-save recovery correction requirement 4: recoveryChecking now
-  // blocks mutation exactly like busy/_pendingSaveAttempt already do (see
-  // planCanonicalEditorGuardMutable) -- the rendered lock reflects that.
   var lockedAttr = (st.busy || st._pendingSaveAttempt || st.recoveryChecking) ? 'disabled' : '';
 
+  // ---- Status messages (same sources and testids as before) ----
   var outcomeHtml = st.outcome
-    ? '<div class="plan-canonical-editor-outcome" data-testid="outcome" style="margin:8px 0;padding:8px;border-radius:6px;background:#eee">' +
+    ? '<div class="pl-status" data-testid="outcome">' +
       escapeHtml(planCanonicalEditorOutcomeLabel(st.outcome)) +
       (st.outcome.message ? ' -- ' + escapeHtml(st.outcome.message) : '') +
       (st.outcome.error && st.outcome.error.message ? ' -- ' + escapeHtml(st.outcome.error.message) : '') +
       '</div>'
     : '';
   var validationHtml = st.validationMessage
-    ? '<div class="plan-canonical-editor-validation" data-testid="validation-message" style="margin:8px 0;padding:8px;border-radius:6px;background:#fee;color:#900">' + escapeHtml(st.validationMessage) + '</div>'
+    ? '<div class="pl-status pl-status-error" data-testid="validation-message">' + escapeHtml(st.validationMessage) + '</div>'
     : '';
-  // Uncertain-save recovery correction requirement 3: "If local storage is
-  // unavailable, keep the current in-memory behavior but visibly warn that
-  // reload recovery will not be available while the save is unresolved."
   var reloadWarningHtml = st.reloadRecoveryWarning
-    ? '<div class="plan-canonical-editor-reload-warning" data-testid="reload-recovery-warning" style="margin:8px 0;padding:8px;border-radius:6px;background:#ffe;color:#740">' + escapeHtml(st.reloadRecoveryWarning) + '</div>'
+    ? '<div class="pl-status pl-status-warn" data-testid="reload-recovery-warning">' + escapeHtml(st.reloadRecoveryWarning) + '</div>'
     : '';
-  // Save-progress/safe-to-leave correction (Phase A requirement 3): a small,
-  // always-present-when-relevant banner distinguishing the in-flight save
-  // sub-phases (preparing/saving/verifying reopen) from the terminal
-  // outcome banner above. st.savePhase is set/cleared only by
-  // planCanonicalEditorHandleSave/HandleRetrySave/ApplySaveResult -- this
-  // is a pure read of that state, not a second source of truth.
   var savePhaseLabels = { preparingSave: 'Preparing save...', saving: 'Saving...', verifyingReopen: 'Saved -- verifying...' };
   var savePhaseHtml = (st.savePhase && savePhaseLabels[st.savePhase])
-    ? '<div class="plan-canonical-editor-save-phase" data-testid="save-phase" style="margin:8px 0;padding:8px;border-radius:6px;background:#eef">' + escapeHtml(savePhaseLabels[st.savePhase]) + '</div>'
+    ? '<div class="pl-status" data-testid="save-phase">' + escapeHtml(savePhaseLabels[st.savePhase]) + '</div>'
     : '';
-  // Phase B multi-screen editor: a concise, one-time explanation when the
-  // navigation controller just fell back from a stale selection (a
-  // removed/replaced Microcycle/Session/Exercise/Set) to its nearest valid
-  // parent screen. Persists until the next explicit navigation action
-  // (every planCanonicalEditorNav* handler above clears it).
   var staleNoticeHtml = nav.staleNotice
-    ? '<div class="plan-canonical-editor-nav-stale" data-testid="nav-stale-notice" style="margin:8px 0;padding:8px;border-radius:6px;background:#eef;color:#335">' + escapeHtml(nav.staleNotice) + '</div>'
+    ? '<div class="pl-status" data-testid="nav-stale-notice">' + escapeHtml(nav.staleNotice) + '</div>'
     : '';
+
+  // ---- Save area: the same four states as before. The ordinary state is
+  // the explicit Save Template button in the top bar; the unresolved-save
+  // and recovery states show their existing controls under the bar. ----
+  var abandonControlHtml =
+    '<div class="pl-abandon" data-testid="abandon-control">' +
+    '<label class="pl-check"><input type="checkbox" data-testid="abandon-ack-checkbox" ' + (st._abandonAcknowledged ? 'checked' : '') + ' onchange="planCanonicalEditorState._abandonAcknowledged = this.checked; planCanonicalEditorRender();"> Yes, I understand a Program may already exist and I am abandoning tracking it.</label>' +
+    '<button type="button" class="pl-btn" data-testid="abandon-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleAbandonUnresolvedSave({acknowledged: planCanonicalEditorState._abandonAcknowledged === true})">Abandon</button>' +
+    '</div>';
+  var saveBarBtn = '';
+  var saveBlockHtml = '';
+  if (st.recoveryChecking) {
+    saveBlockHtml =
+      '<div class="pl-status pl-status-warn" data-testid="recovery-lock-banner">Checking previous save status -- editing is locked until this resolves.</div>' +
+      '<div class="pl-actions"><button type="button" class="pl-btn pl-btn-accent" data-testid="retry-recovery-check-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetryRecoveryCheck()">Retry Check</button></div>' +
+      abandonControlHtml;
+  } else if (st._pendingSaveAttempt && st._pendingSaveAttempt.cancelledUnresolved) {
+    saveBlockHtml =
+      '<div class="pl-actions"><button type="button" class="pl-btn pl-btn-accent" data-testid="retry-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetrySave()">Retry Save</button>' +
+      '<button type="button" class="pl-btn" data-testid="check-saved-status-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleCheckSavedStatus()">Check Saved Status</button></div>' +
+      abandonControlHtml;
+  } else if (st._pendingSaveAttempt) {
+    saveBlockHtml =
+      '<div class="pl-actions"><button type="button" class="pl-btn pl-btn-accent" data-testid="retry-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetrySave()">Retry Save</button>' +
+      '<button type="button" class="pl-btn" data-testid="cancel-pending-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleCancelPendingSave()">Cancel</button></div>';
+  } else {
+    saveBarBtn = '<button type="button" class="pl-save" data-testid="save-btn" ' + busyAttr + ' onclick="planUiSave()">Save Template</button>';
+  }
+  var reopenLockedAttr = (st.busy || st._pendingSaveAttempt || st.recoveryChecking) ? 'disabled' : '';
+  var programName = (es && es.name && es.name.trim()) ? es.name.trim() : 'Untitled Program';
+
+  // ---- Field builders (every input writes through the existing setter) ----
+  function textField(label, testid, idxAttr, value, oninput, opts) {
+    opts = opts || {};
+    var control = opts.area
+      ? '<textarea rows="' + (opts.rows || 2) + '" data-testid="' + testid + '"' + idxAttr + ' ' + lockedAttr + ' oninput="' + oninput + '">' + escapeHtml(value || '') + '</textarea>'
+      : '<input type="text" data-testid="' + testid + '"' + idxAttr + ' ' + lockedAttr + ' value="' + escapeHtml(value || '') + '" oninput="' + oninput + '">';
+    return '<label class="pl-field"><span>' + label + '</span>' + control + '</label>';
+  }
 
   var exerciseOptions = planCanonicalEditorExerciseOptions();
-
   function exerciseSelectHtml(mi, si, ei, ex) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
     if (!exerciseOptions.length) {
-      return '<label style="font-size:11px;display:block">Exercise<input type="text" data-testid="exercise-id-input"' + idx + ' ' + lockedAttr + ' placeholder="exercise id" value="' + escapeHtml(ex.exerciseId || '') + '" oninput="planCanonicalEditorHandleSetExerciseField(' + mi + ',' + si + ',' + ei + ',\'exerciseId\',this.value)"></label>';
+      return '<label class="pl-field"><span>Exercise</span><input type="text" data-testid="exercise-id-input"' + idx + ' ' + lockedAttr + ' placeholder="exercise id" value="' + escapeHtml(ex.exerciseId || '') + '" oninput="planCanonicalEditorHandleSetExerciseField(' + mi + ',' + si + ',' + ei + ',\'exerciseId\',this.value)"></label>';
     }
     var foundCurrent = false;
-    var optionsHtml = '<option value="">-- Select Exercise --</option>' + exerciseOptions.map(function (opt) {
+    var optionsHtml = '<option value="">Select exercise</option>' + exerciseOptions.map(function (opt) {
       var selected = opt.id === ex.exerciseId;
       if (selected) foundCurrent = true;
       return '<option value="' + escapeHtml(opt.id) + '" ' + (selected ? 'selected' : '') + '>' + escapeHtml(opt.name || opt.id) + '</option>';
@@ -12709,85 +12991,94 @@ function planCanonicalEditorRender() {
     if (ex.exerciseId && !foundCurrent) {
       optionsHtml += '<option value="' + escapeHtml(ex.exerciseId) + '" selected>' + escapeHtml(ex.exerciseId) + '</option>';
     }
-    return '<label style="font-size:11px;display:block">Exercise<select data-testid="exercise-select"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetExerciseField(' + mi + ',' + si + ',' + ei + ',\'exerciseId\',this.value)">' + optionsHtml + '</select></label>';
+    // Choosing an exercise also refreshes the row title above it.
+    return '<label class="pl-field"><span>Exercise</span><select data-testid="exercise-select"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetExerciseField(' + mi + ',' + si + ',' + ei + ',\'exerciseId\',this.value);planCanonicalEditorRender()">' + optionsHtml + '</select></label>';
   }
 
+  // Every existing canonical Set field, unchanged rules: each type selector
+  // keeps its Blank option, numeric fields stay optional (blank = null),
+  // and only the controls for the chosen type are shown.
   function setFieldsHtml(mi, si, ei, set, seti) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei, seti);
+    var call = function (field) { return 'planCanonicalEditorHandleSetSetField(' + mi + ',' + si + ',' + ei + ',' + seti + ',\'' + field + '\',this.value);planUiRefreshSetSummary(' + mi + ',' + si + ',' + ei + ',' + seti + ')'; };
     function num(field, label) {
       var v = set[field];
-      return '<label style="font-size:11px">' + label + '<input type="number" step="any" data-testid="set-' + field + '"' + idx + ' ' + lockedAttr + ' value="' + (v === null || v === undefined ? '' : v) + '" oninput="planCanonicalEditorHandleSetSetField(' + mi + ',' + si + ',' + ei + ',' + seti + ',\'' + field + '\',this.value)"></label>';
+      return '<label class="pl-field"><span>' + label + '</span><input type="number" inputmode="decimal" step="any" data-testid="set-' + field + '"' + idx + ' ' + lockedAttr + ' value="' + (v === null || v === undefined ? '' : v) + '" oninput="' + call(field) + '"></label>';
     }
-    var loadHtml = set.loadType === 'fixed' ? num('weight', 'Weight')
-      : set.loadType === 'percentTM' ? num('percent', '% TM')
-      : set.loadType === 'percent1RM' ? num('percent', '% 1RM')
-      : set.loadType === 'bodyweight' ? num('addedWeight', 'Added Weight')
-      : '';
-    var repsHtml = set.repsType === 'fixed' ? num('reps', 'Reps')
-      : set.repsType === 'range' ? (num('minReps', 'Min Reps') + num('maxReps', 'Max Reps'))
-      : '';
-    var effortHtml = set.effortType === 'fixed' ? num('rir', 'RIR')
-      : set.effortType === 'range' ? (num('minRir', 'Min RIR') + num('maxRir', 'Max RIR'))
-      : '';
-    var timeHtml = set.timeType === 'fixed' ? num('seconds', 'Seconds')
-      : set.timeType === 'range' ? (num('minSeconds', 'Min Sec') + num('maxSeconds', 'Max Sec'))
-      : '';
     function typeSelect(field, label, opts) {
-      return '<label style="font-size:11px">' + label +
-        '<select data-testid="set-' + field + '"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetSetField(' + mi + ',' + si + ',' + ei + ',' + seti + ',\'' + field + '\',this.value)">' +
+      return '<label class="pl-field"><span>' + label + '</span>' +
+        '<select data-testid="set-' + field + '"' + idx + ' ' + lockedAttr + ' onchange="' + call(field) + '">' +
         opts.map(function (o) { return '<option value="' + o.v + '" ' + (set[field] === o.v ? 'selected' : '') + '>' + o.label + '</option>'; }).join('') +
         '</select></label>';
     }
-    return '<div class="plan-field-group" data-testid="set-fields"' + idx + '>' +
-      typeSelect('loadType', 'Load', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed Weight' }, { v: 'percentTM', label: '% TM' }, { v: 'percent1RM', label: '% 1RM' }, { v: 'bodyweight', label: 'Bodyweight' }]) +
-      loadHtml +
-      typeSelect('repsType', 'Reps', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed' }, { v: 'range', label: 'Range' }]) +
-      repsHtml +
-      typeSelect('effortType', 'Effort', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed RIR' }, { v: 'range', label: 'RIR Range' }]) +
-      effortHtml +
-      typeSelect('timeType', 'Time', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed' }, { v: 'range', label: 'Range' }]) +
-      timeHtml +
-      '<label style="font-size:11px">Notes<input type="text" data-testid="set-notes"' + idx + ' ' + lockedAttr + ' value="' + escapeHtml(set.notes || '') + '" oninput="planCanonicalEditorHandleSetSetField(' + mi + ',' + si + ',' + ei + ',' + seti + ',\'notes\',this.value)"></label>' +
-      '</div>';
+    function pair(a, b) { return '<div class="pl-pair">' + a + (b || '<span></span>') + '</div>'; }
+    var loadValue = set.loadType === 'fixed' ? num('weight', 'Weight (' + unit + ')')
+      : set.loadType === 'percentTM' ? num('percent', 'Percent TM')
+      : set.loadType === 'percent1RM' ? num('percent', 'Percent 1RM')
+      : set.loadType === 'bodyweight' ? num('addedWeight', 'Added weight (' + unit + ')')
+      : '';
+    var html = pair(typeSelect('loadType', 'Load', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed Weight' }, { v: 'percentTM', label: '% TM' }, { v: 'percent1RM', label: '% 1RM' }, { v: 'bodyweight', label: 'Bodyweight' }]), loadValue);
+    html += pair(typeSelect('repsType', 'Reps', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed' }, { v: 'range', label: 'Range' }]),
+      set.repsType === 'fixed' ? num('reps', 'Reps') : set.repsType === 'range' ? num('minReps', 'Minimum reps') : '');
+    if (set.repsType === 'range') html += pair('<span></span>', num('maxReps', 'Maximum reps'));
+    html += pair(typeSelect('effortType', 'Effort', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed RIR' }, { v: 'range', label: 'RIR Range' }]),
+      set.effortType === 'fixed' ? num('rir', 'RIR') : set.effortType === 'range' ? num('minRir', 'Minimum RIR') : '');
+    if (set.effortType === 'range') html += pair('<span></span>', num('maxRir', 'Maximum RIR'));
+    html += pair(typeSelect('timeType', 'Time', [{ v: '', label: 'Blank' }, { v: 'fixed', label: 'Fixed' }, { v: 'range', label: 'Range' }]),
+      set.timeType === 'fixed' ? num('seconds', 'Seconds') : set.timeType === 'range' ? num('minSeconds', 'Minimum seconds') : '');
+    if (set.timeType === 'range') html += pair('<span></span>', num('maxSeconds', 'Maximum seconds'));
+    html += '<label class="pl-field"><span>Set notes</span><input type="text" data-testid="set-notes"' + idx + ' ' + lockedAttr + ' value="' + escapeHtml(set.notes || '') + '" oninput="' + call('notes') + '"></label>';
+    return '<div class="pl-set-fields" data-testid="set-fields"' + idx + '>' + html + '</div>';
   }
 
+  // ---- Progression (dedicated screen): every existing control, handler
+  // and testid; option VALUES unchanged, labels in plain words ----
   function progressionFieldsHtml(mi, si, ei, ex) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
     var prog = ex.progression;
     if (!prog || !prog.enabled) {
-      return '<div class="plan-canonical-editor-progression" data-testid="progression-panel"' + idx + ' style="margin:6px 0">' +
-        '<button type="button" class="btn btn-secondary btn-sm" data-testid="progression-enable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleEnableProgression(' + mi + ',' + si + ',' + ei + ')">Enable Progression</button>' +
+      return '<div class="pl-prog" data-testid="progression-panel"' + idx + '>' +
+        '<p class="pl-note">Progression is off for this exercise.</p>' +
+        '<button type="button" class="pl-btn pl-btn-wide" data-testid="progression-enable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleEnableProgression(' + mi + ',' + si + ',' + ei + ')">Enable Progression</button>' +
         '</div>';
     }
+    var call = function (field) { return 'planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'' + field + '\',this.value)'; };
     var setCount = ex.sets.length;
     var gatewayOptions = ex.sets.map(function (s, i) { return '<option value="' + i + '" ' + (prog.gatewaySetIndex === i ? 'selected' : '') + '>Set ' + (i + 1) + '</option>'; }).join('');
-    return '<div class="plan-canonical-editor-progression plan-field-group" data-testid="progression-panel"' + idx + '>' +
-      '<div style="font-size:12px;font-weight:600">Progression: ON</div>' +
-      '<label style="font-size:11px">Evaluation<select data-testid="progression-evaluationType"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'evaluationType\',this.value)">' +
-        ['strict', 'volume', 'gateway'].map(function (v) { return '<option value="' + v + '" ' + (prog.evaluationType === v ? 'selected' : '') + '>' + v + '</option>'; }).join('') +
+    var gwIdx = (typeof prog.gatewaySetIndex === 'number' && prog.gatewaySetIndex >= 0 && prog.gatewaySetIndex < setCount) ? prog.gatewaySetIndex : 0;
+    var gatewayNote = setCount ? '<p class="pl-note" data-testid="progression-gateway-set-summary">Set ' + (gwIdx + 1) + ' · ' + escapeHtml(planUiSetText(ex.sets[gwIdx], planUiWorkingLoadEligible(ex))) + '</p>' : '';
+    var evalLabels = { strict: 'Strict Match', volume: 'Volume Total', gateway: 'Gateway Set' };
+    return '<div class="pl-prog pl-fields" data-testid="progression-panel"' + idx + '>' +
+      '<p class="pl-note" data-testid="progression-summary">' + escapeHtml(planUiProgressionShort(ex) || 'On') + '</p>' +
+      '<label class="pl-field"><span>Evaluation</span><select data-testid="progression-evaluationType"' + idx + ' ' + lockedAttr + ' onchange="' + call('evaluationType') + '">' +
+        ['strict', 'volume', 'gateway'].map(function (v) { return '<option value="' + v + '" ' + (prog.evaluationType === v ? 'selected' : '') + '>' + evalLabels[v] + '</option>'; }).join('') +
         '</select></label>' +
-      (prog.evaluationType === 'gateway' && setCount ? '<label style="font-size:11px">Gateway Set<select data-testid="progression-gatewaySetIndex"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'gatewaySetIndex\',this.value)">' + gatewayOptions + '</select></label>' : '') +
-      '<label style="font-size:11px">Adjustment<select data-testid="progression-adjustmentType"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'adjustmentType\',this.value)">' +
+      (prog.evaluationType === 'gateway' && setCount ? '<label class="pl-field"><span>Gateway set</span><select data-testid="progression-gatewaySetIndex"' + idx + ' ' + lockedAttr + ' onchange="' + call('gatewaySetIndex') + ';planCanonicalEditorRender()">' + gatewayOptions + '</select></label>' + gatewayNote : '') +
+      '<label class="pl-field"><span>Adjustment on pass</span><select data-testid="progression-adjustmentType"' + idx + ' ' + lockedAttr + ' onchange="' + call('adjustmentType') + '">' +
         [{ v: 'addLoad', label: 'Increase Fixed Load' }, { v: 'increaseTM', label: 'Increase Training Max' }].map(function (o) { return '<option value="' + o.v + '" ' + (prog.adjustmentType === o.v ? 'selected' : '') + '>' + o.label + '</option>'; }).join('') +
         '</select></label>' +
       (prog.adjustmentType === 'increaseTM'
-        ? '<label style="font-size:11px">TM Increase<input type="number" step="any" data-testid="progression-tmIncrease"' + idx + ' ' + lockedAttr + ' value="' + (prog.tmIncrease === null || prog.tmIncrease === undefined ? '' : prog.tmIncrease) + '" oninput="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'tmIncrease\',this.value)"></label>'
-        : '<label style="font-size:11px">Load Increase<input type="number" step="any" data-testid="progression-loadIncrease"' + idx + ' ' + lockedAttr + ' value="' + (prog.loadIncrease === null || prog.loadIncrease === undefined ? '' : prog.loadIncrease) + '" oninput="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'loadIncrease\',this.value)"></label>') +
-      '<label style="font-size:11px">On Failure<select data-testid="progression-failBehavior"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'failBehavior\',this.value)">' +
+        ? '<label class="pl-field"><span>Training max increase (' + unit + ')</span><input type="number" inputmode="decimal" step="any" data-testid="progression-tmIncrease"' + idx + ' ' + lockedAttr + ' value="' + (prog.tmIncrease === null || prog.tmIncrease === undefined ? '' : prog.tmIncrease) + '" oninput="' + call('tmIncrease') + '"></label>'
+        : '<label class="pl-field"><span>Fixed load increase (' + unit + ')</span><input type="number" inputmode="decimal" step="any" data-testid="progression-loadIncrease"' + idx + ' ' + lockedAttr + ' value="' + (prog.loadIncrease === null || prog.loadIncrease === undefined ? '' : prog.loadIncrease) + '" oninput="' + call('loadIncrease') + '"></label>') +
+      '<label class="pl-field"><span>On failure</span><select data-testid="progression-failBehavior"' + idx + ' ' + lockedAttr + ' onchange="' + call('failBehavior') + '">' +
         '<option value="repeat" ' + (prog.failBehavior === 'repeat' ? 'selected' : '') + '>Repeat Prescription</option>' +
         '</select></label>' +
+      '<h3 class="pl-h">Progression series</h3>' +
       progressionSeriesHtml(mi, si, ei, ex) +
+      '<h3 class="pl-h">Recommended replacements</h3>' +
       recommendedReplacementsHtml(mi, si, ei, ex) +
       (st.pendingProgressionDisable && st.pendingProgressionDisable.mi === mi && st.pendingProgressionDisable.si === si && st.pendingProgressionDisable.ei === ei
-        ? '<div data-testid="progression-disable-confirm"' + idx + ' style="margin:6px 0;padding:8px;border:1px solid #b60;border-radius:6px;font-size:12px">Turning Progression off also removes this exercise’s Recommended Replacements. Remove them?' +
-          '<div style="margin-top:6px;display:flex;gap:6px"><button type="button" class="btn btn-danger btn-sm" data-testid="progression-disable-confirm-btn"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ',{confirmed:true})">Turn off and remove</button>' +
-          '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-disable-keep-btn"' + idx + ' onclick="planCanonicalEditorHandleCancelDisableProgression()">Keep</button></div></div>'
+        ? '<div class="pl-confirm" data-testid="progression-disable-confirm"' + idx + '>Turning Progression off also removes this exercise’s Recommended Replacements. Remove them?' +
+          '<div class="pl-actions"><button type="button" class="pl-btn pl-btn-danger" data-testid="progression-disable-confirm-btn"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ',{confirmed:true})">Turn off and remove</button>' +
+          '<button type="button" class="pl-btn" data-testid="progression-disable-keep-btn"' + idx + ' onclick="planCanonicalEditorHandleCancelDisableProgression()">Keep</button></div></div>'
         : '') +
-      '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-disable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ')">Disable Progression</button>' +
+      '<button type="button" class="pl-btn pl-btn-wide" data-testid="progression-disable"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleDisableProgression(' + mi + ',' + si + ',' + ei + ')">Disable Progression</button>' +
       '</div>';
   }
 
-  // RECOMMENDED REPLACEMENTS -- compact panel inside the Progression panel.
+  // RECOMMENDED REPLACEMENTS -- same controls, handlers, testids and copy as
+  // before (sources with Remove, resolved list, missing warning, Add
+  // exercise, Refresh, Add filter, Add a Collection, compatibility notice).
   function recommendedReplacementsHtml(mi, si, ei, ex) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
     var rec = ex.progression.recommendedReplacements;
@@ -12796,313 +13087,274 @@ function planCanonicalEditorRender() {
     var exName = function (id) { var e = (typeof getExercise === 'function') ? getExercise(id) : null; return e ? e.name : null; };
     var collExists = function (cid) { return typeof appDb !== 'undefined' && appDb && Array.isArray(appDb.exerciseCollections) && appDb.exerciseCollections.some(function (c) { return c && c.id === cid; }); };
     var srcLabel = function (src) {
-      if (src.kind === 'exercise') return exName(src.exerciseId) ? 'Exercise: ' + exName(src.exerciseId) : 'Exercise: unavailable (no longer exists)';
+      if (src.kind === 'exercise') return exName(src.exerciseId) ? exName(src.exerciseId) : 'Unavailable exercise (no longer exists)';
       if (src.kind === 'collection') return 'Collection: ' + (src.collectionName || 'Untitled') + (collExists(src.collectionId) ? '' : ' (no longer exists)') + ' — ' + src.exerciseIds.length;
       var parts = [src.categories.length ? src.categories.join(', ') : 'Any category'];
       if (src.movementStructure) parts.push(src.movementStructure);
       if (src.executionStyle) parts.push(src.executionStyle);
       return 'Filter: ' + parts.join(' · ') + ' — ' + src.exerciseIds.length;
     };
+    var srcKind = function (src) { return src.kind === 'exercise' ? 'Individual exercise' : src.kind === 'collection' ? 'Collection' : 'Filter'; };
     var missing = ids.filter(function (id) { return !exName(id); }).length;
     var listHtml = ids.length
-      ? '<div data-testid="rec-resolved-list" style="font-size:11px;color:var(--text2);margin:4px 0">' + ids.map(function (id) { return exName(id) ? escapeHtml(exName(id)) : '<span style="color:#b00">Unavailable exercise</span>'; }).join(', ') + '</div>'
+      ? '<p class="pl-note" data-testid="rec-resolved-list">' + ids.map(function (id) { return exName(id) ? escapeHtml(exName(id)) : '<span class="pl-warn-text">Unavailable exercise</span>'; }).join(', ') + '</p>'
       : '';
-    var wrap = function (inner) { return '<div class="plan-canonical-editor-recommended" data-testid="rec-panel"' + idx + ' style="margin:8px 0;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px">' + inner + '</div>'; };
-    var header = '<div style="font-size:12px;font-weight:600" data-testid="rec-count">Recommended Replacements: ' + ids.length + '</div>' +
-      (missing ? '<div data-testid="rec-missing-warning" style="font-size:11px;color:#b00">' + missing + ' recommended exercise' + (missing === 1 ? '' : 's') + ' no longer exist' + (missing === 1 ? 's' : '') + ' and will show as unavailable.</div>' : '');
+    var header = '<p class="pl-note" data-testid="rec-count">Recommended Replacements: ' + ids.length + '</p>' +
+      (missing ? '<p class="pl-note pl-warn-text" data-testid="rec-missing-warning">' + missing + ' recommended exercise' + (missing === 1 ? '' : 's') + ' no longer exist' + (missing === 1 ? 's' : '') + ' and will show as unavailable.</p>' : '');
+    var wrap = function (inner) { return '<div class="pl-rec" data-testid="rec-panel"' + idx + '>' + inner + '</div>'; };
     if (!planRecommendedReplacementsUiEnabled()) {
-      return ids.length || sources.length ? wrap(header + listHtml + '<div style="font-size:11px;color:var(--text3)">Editing Recommended Replacements needs the newer version of the app.</div>') : '';
+      return ids.length || sources.length ? wrap(header + listHtml + '<p class="pl-note">Editing Recommended Replacements needs the newer version of the app.</p>') : wrap('<p class="pl-note">None.</p>');
     }
-    var sourcesHtml = sources.map(function (src, k) {
-      return '<div data-testid="rec-source"' + idx + ' style="font-size:11px;display:flex;gap:6px;align-items:center;margin:2px 0"><span style="flex:1">' + escapeHtml(srcLabel(src)) + '</span>' +
-        '<button type="button" class="btn btn-ghost btn-sm" data-testid="rec-source-remove"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveRecommendedSource(' + mi + ',' + si + ',' + ei + ',' + k + ')">Remove</button></div>';
-    }).join('');
+    var sourcesHtml = sources.length ? '<div class="pl-rows">' + sources.map(function (src, k) {
+      return '<div class="pl-source" data-testid="rec-source"' + idx + '><span class="pl-row-text"><strong>' + escapeHtml(srcLabel(src)) + '</strong><small>' + srcKind(src) + '</small></span>' +
+        '<button type="button" class="pl-icon-btn" aria-label="Remove ' + escapeHtml(srcLabel(src)) + '" data-testid="rec-source-remove"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveRecommendedSource(' + mi + ',' + si + ',' + ei + ',' + k + ')">×</button></div>';
+    }).join('') + '</div>' : '';
     var fd = planCanonicalEditorRecFilterDraft(mi, si, ei);
     var cats = (typeof LIBRARY_CATEGORIES !== 'undefined') ? LIBRARY_CATEGORIES : [];
     var opt = function (v, label, cur) { return '<option value="' + escapeHtml(v) + '" ' + (cur === v ? 'selected' : '') + '>' + escapeHtml(label) + '</option>'; };
     var colls = (typeof appDb !== 'undefined' && appDb && Array.isArray(appDb.exerciseCollections)) ? appDb.exerciseCollections : [];
-    var filterForm = '<div style="display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin-top:4px;font-size:11px">' +
-      '<select data-testid="rec-filter-category"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'category\',this.value)">' + opt('', 'Any category', fd.category) + cats.map(function (c) { return opt(c, c, fd.category); }).join('') + '</select>' +
-      '<select data-testid="rec-filter-movement"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'movementStructure\',this.value)">' + opt('', 'Any movement', fd.movementStructure) + opt('Compound', 'Compound', fd.movementStructure) + opt('Isolation', 'Isolation', fd.movementStructure) + '</select>' +
-      '<select data-testid="rec-filter-execution"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'executionStyle\',this.value)">' + opt('', 'Any style', fd.executionStyle) + opt('Bilateral', 'Bilateral', fd.executionStyle) + opt('Unilateral', 'Unilateral', fd.executionStyle) + '</select>' +
-      '<button type="button" class="btn btn-secondary btn-sm" data-testid="rec-add-filter"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRecFilterAdd(' + mi + ',' + si + ',' + ei + ')">Add filter</button></div>';
-    var collForm = colls.length ? '<select style="margin-top:4px;font-size:11px" data-testid="rec-add-collection"' + idx + ' ' + lockedAttr + ' onchange="if(this.value)planCanonicalEditorHandleAddRecommendedCollection(' + mi + ',' + si + ',' + ei + ',this.value)"><option value="">Add a Collection…</option>' + colls.map(function (c) { return '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.name || 'Untitled') + '</option>'; }).join('') + '</select>' : '';
+    var filterForm = '<div class="pl-subpanel"><p class="pl-note">Add a filter</p><div class="pl-pair">' +
+      '<label class="pl-field"><span>Category</span><select data-testid="rec-filter-category"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'category\',this.value)">' + opt('', 'Any category', fd.category) + cats.map(function (c) { return opt(c, c, fd.category); }).join('') + '</select></label>' +
+      '<label class="pl-field"><span>Movement</span><select data-testid="rec-filter-movement"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'movementStructure\',this.value)">' + opt('', 'Any movement', fd.movementStructure) + opt('Compound', 'Compound', fd.movementStructure) + opt('Isolation', 'Isolation', fd.movementStructure) + '</select></label></div>' +
+      '<div class="pl-pair"><label class="pl-field"><span>Style</span><select data-testid="rec-filter-execution"' + idx + ' ' + lockedAttr + ' onchange="planCanonicalEditorHandleRecFilterField(' + mi + ',' + si + ',' + ei + ',\'executionStyle\',this.value)">' + opt('', 'Any style', fd.executionStyle) + opt('Bilateral', 'Bilateral', fd.executionStyle) + opt('Unilateral', 'Unilateral', fd.executionStyle) + '</select></label>' +
+      '<button type="button" class="pl-btn pl-btn-end" data-testid="rec-add-filter"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRecFilterAdd(' + mi + ',' + si + ',' + ei + ')">Add filter</button></div></div>';
+    var collForm = colls.length ? '<label class="pl-field"><span>Add a Collection</span><select data-testid="rec-add-collection"' + idx + ' ' + lockedAttr + ' onchange="if(this.value)planCanonicalEditorHandleAddRecommendedCollection(' + mi + ',' + si + ',' + ei + ',this.value)"><option value="">Choose a Collection…</option>' + colls.map(function (c) { return '<option value="' + escapeHtml(c.id) + '">' + escapeHtml(c.name || 'Untitled') + '</option>'; }).join('') + '</select></label>' : '';
     return wrap(header +
-      '<div style="font-size:11px;color:var(--text3)">Suggestions shown first when you Change Exercise during a workout. Nothing is ever replaced automatically. Filters and Collections are saved as a fixed list; use Refresh to update it.</div>' +
+      '<p class="pl-note">Suggestions shown first when you Change Exercise during a workout. Nothing is ever replaced automatically. Filters and Collections are saved as a fixed list; use Refresh to update it.</p>' +
       sourcesHtml + listHtml +
-      '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">' +
-      '<button type="button" class="btn btn-secondary btn-sm" data-testid="rec-add-exercise"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRecPickExercise(' + mi + ',' + si + ',' + ei + ')">Add exercise</button>' +
-      (sources.length ? '<button type="button" class="btn btn-ghost btn-sm" data-testid="rec-refresh"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRefreshRecommended(' + mi + ',' + si + ',' + ei + ')">Refresh</button>' : '') +
+      '<div class="pl-actions">' +
+      '<button type="button" class="pl-btn" data-testid="rec-add-exercise"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRecPickExercise(' + mi + ',' + si + ',' + ei + ')">+ Add exercise</button>' +
+      (sources.length ? '<button type="button" class="pl-btn" data-testid="rec-refresh"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRefreshRecommended(' + mi + ',' + si + ',' + ei + ')">Refresh</button>' : '') +
       '</div>' + filterForm + collForm);
   }
 
-  // PROGRESSION SERIES FOUNDATION -- the explicit series panel. Hidden in the
-  // compatibility build except as a read-only label on an already-linked entry.
+  // PROGRESSION SERIES -- same panel logic, controls, handlers and testids.
   function progressionSeriesHtml(mi, si, ei, ex) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
     var prog = ex.progression;
     var enabledUi = planProgressionSeriesUiEnabled();
     var allSeries = planCanonicalEditorListProgressionSeries(st.editorState);
     var mine = prog.progressionSeriesId ? allSeries.filter(function (x) { return x.seriesId === prog.progressionSeriesId; })[0] : null;
-    var wrap = function (inner) { return '<div class="plan-canonical-editor-series" data-testid="progression-series-panel"' + idx + ' style="margin:8px 0;padding:8px;border:1px solid var(--border,#ccc);border-radius:6px">' + inner + '</div>'; };
+    var wrap = function (inner) { return '<div class="pl-series" data-testid="progression-series-panel"' + idx + '>' + inner + '</div>'; };
     function where(m) {
-      var mc = st.editorState.microcycles[m.mi], ss = mc.sessions[m.si];
-      return escapeHtml((mc.name || ('Microcycle ' + (m.mi + 1))) + ' · ' + (ss.name || ('Session ' + (m.si + 1))));
+      var mc = st.editorState.microcycles[m.mi], ss = mc.sessions[m.si], mex = ss.exercises[m.ei];
+      return escapeHtml((mc.name || ('Microcycle ' + (m.mi + 1))) + ' · ' + (ss.name || ('Session ' + (m.si + 1))) + ' · ' + planCanonicalGetExerciseName(mex && mex.exerciseId));
     }
     if (mine) {
-      var memberList = '<ul data-testid="progression-series-members" style="margin:4px 0 6px 18px;padding:0;font-size:12px">' +
-        mine.members.map(function (m) { return '<li>' + where(m) + (m.mi === mi && m.si === si && m.ei === ei ? ' <em>(this one)</em>' : '') + '</li>'; }).join('') + '</ul>';
+      var memberList = '<ul class="pl-series-list" data-testid="progression-series-members">' +
+        mine.members.map(function (m) { return '<li>' + where(m) + (m.mi === mi && m.si === si && m.ei === ei ? ' <em>(this exercise)</em>' : '') + '</li>'; }).join('') + '</ul>';
       if (!enabledUi) {
-        return wrap('<div style="font-size:12px;font-weight:600" data-testid="progression-series-label">Progression series: ' + escapeHtml(mine.seriesName) + '</div>' + memberList +
-          '<div style="font-size:11px;color:var(--text3)">Editing Progression series needs the newer version of the app.</div>');
+        return wrap('<p class="pl-note" data-testid="progression-series-label">Progression series: ' + escapeHtml(mine.seriesName) + '</p>' + memberList +
+          '<p class="pl-note">Editing Progression series needs the newer version of the app.</p>');
       }
-      return wrap('<div style="font-size:12px;font-weight:600" data-testid="progression-series-label">Progression series: ' + escapeHtml(mine.seriesName) + '</div>' +
-        '<div style="font-size:11px;color:var(--text3)">These exercises share one continuing value in a Program Run. Each finished Session updates it; the next linked Session uses the result.</div>' +
-        '<label style="font-size:11px">Series name<input type="text" maxlength="' + PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH + '" data-testid="progression-series-name"' + idx + ' ' + lockedAttr + ' value="' + escapeHtml(mine.seriesName) + '" oninput="planCanonicalEditorHandleRenameProgressionSeries(\'' + escapeHtml(mine.seriesId) + '\', this.value)"></label>' +
-        '<div style="font-size:11px;margin-top:4px">Linked exercises (' + mine.members.length + '):</div>' + memberList +
-        '<button type="button" class="btn btn-ghost btn-sm" data-testid="progression-series-unlink"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleUnlinkProgressionSeries(' + mi + ',' + si + ',' + ei + ')">Remove from series</button>');
+      return wrap('<p class="pl-note" data-testid="progression-series-label">Progression series: ' + escapeHtml(mine.seriesName) + '</p>' +
+        '<p class="pl-note">These exercises share one continuing value in a Program Run. Each finished Session updates it; the next linked Session uses the result.</p>' +
+        '<label class="pl-field"><span>Series name</span><input type="text" maxlength="' + PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH + '" data-testid="progression-series-name"' + idx + ' ' + lockedAttr + ' value="' + escapeHtml(mine.seriesName) + '" oninput="planCanonicalEditorHandleRenameProgressionSeries(\'' + escapeHtml(mine.seriesId) + '\', this.value)"></label>' +
+        '<p class="pl-note">Linked exercises (' + mine.members.length + '):</p>' + memberList +
+        '<button type="button" class="pl-btn" data-testid="progression-series-unlink"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleUnlinkProgressionSeries(' + mi + ',' + si + ',' + ei + ')">Remove from Series</button>');
     }
-    if (!enabledUi) return '';
+    if (!enabledUi) return wrap('<p class="pl-note">No series linked</p>');
     var options = allSeries.map(function (sr) {
       var reason = planCanonicalEditorSeriesLinkBlockReason(st.editorState, mi, si, ei, sr);
       return '<option value="' + escapeHtml(sr.seriesId) + '" ' + (reason ? 'disabled' : '') + '>' + escapeHtml(sr.seriesName + ' (' + sr.members.length + ')' + (reason ? ' — ' + reason : '')) + '</option>';
     }).join('');
-    return wrap('<div style="font-size:12px;font-weight:600">Progression series: none</div>' +
-      '<div style="font-size:11px;color:var(--text3)">Without a series, this exercise\u2019s Progression only affects this one Session. Link exercises into a series to carry the value forward. Nothing is linked automatically.</div>' +
-      '<button type="button" class="btn btn-secondary btn-sm" data-testid="progression-series-start"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleStartProgressionSeries(' + mi + ',' + si + ',' + ei + ')">Start a new series here</button>' +
-      (allSeries.length ? '<label style="font-size:11px;display:block;margin-top:6px">Or link to an existing series<select data-testid="progression-series-link"' + idx + ' ' + lockedAttr + ' onchange="if(this.value)planCanonicalEditorHandleLinkProgressionSeries(' + mi + ',' + si + ',' + ei + ',this.value)"><option value="">Choose a series…</option>' + options + '</select></label>' : ''));
+    return wrap('<p class="pl-note">No series linked. Without a series, this exercise’s Progression only affects this one Session. Link exercises into a series to carry the value forward. Nothing is linked automatically.</p>' +
+      '<button type="button" class="pl-btn" data-testid="progression-series-start"' + idx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleStartProgressionSeries(' + mi + ',' + si + ',' + ei + ')">Start a New Series Here</button>' +
+      (allSeries.length ? '<label class="pl-field"><span>Join existing series</span><select data-testid="progression-series-link"' + idx + ' ' + lockedAttr + ' onchange="if(this.value)planCanonicalEditorHandleLinkProgressionSeries(' + mi + ',' + si + ',' + ei + ',this.value)"><option value="">Select series</option>' + options + '</select></label>' : ''));
   }
 
-  // ---- Shared global header: identical Save/outcome/validation/save-phase/
-  // reload-warning/New/Back-to-Programs/Reopen-diagnostic block on every
-  // screen -- the exact same canonical save handler and states throughout
-  // (never a second, per-level save implementation). Save-lifecycle /
-  // uncertain-save recovery correction: the same four saveAreaHtml states
-  // as before this round (recovery-locked / cancelled-unresolved-pending /
-  // live-pending / ordinary Save), byte-identical logic, unmoved.
-  var abandonControlHtml =
-    '<div class="plan-canonical-editor-abandon" data-testid="abandon-control" style="margin-top:8px;padding:8px;border:1px dashed #900;border-radius:6px">' +
-    '<label style="font-size:11px;display:block"><input type="checkbox" data-testid="abandon-ack-checkbox" ' + (st._abandonAcknowledged ? 'checked' : '') + ' onchange="planCanonicalEditorState._abandonAcknowledged = this.checked; planCanonicalEditorRender();"> Yes, I understand a Program may already exist and I am abandoning tracking it.</label>' +
-    '<button type="button" class="btn btn-secondary" data-testid="abandon-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleAbandonUnresolvedSave({acknowledged: planCanonicalEditorState._abandonAcknowledged === true})">Abandon</button>' +
-    '</div>';
-  var saveAreaHtml;
-  if (st.recoveryChecking) {
-    saveAreaHtml =
-      '<div class="plan-canonical-editor-recovery-lock" data-testid="recovery-lock-banner" style="padding:8px;border-radius:6px;background:#ffe">' +
-      'Checking previous save status -- editing is locked until this resolves.' +
-      '</div>' +
-      '<button type="button" class="btn btn-primary" data-testid="retry-recovery-check-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetryRecoveryCheck()">Retry Check</button>' +
-      abandonControlHtml;
-  } else if (st._pendingSaveAttempt && st._pendingSaveAttempt.cancelledUnresolved) {
-    saveAreaHtml =
-      '<button type="button" class="btn btn-primary" data-testid="retry-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetrySave()">Retry Save</button>' +
-      '<button type="button" class="btn btn-secondary" data-testid="check-saved-status-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleCheckSavedStatus()">Check Saved Status</button>' +
-      abandonControlHtml;
-  } else if (st._pendingSaveAttempt) {
-    saveAreaHtml =
-      '<button type="button" class="btn btn-primary" data-testid="retry-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleRetrySave()">Retry Save</button>' +
-      '<button type="button" class="btn btn-secondary" data-testid="cancel-pending-save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleCancelPendingSave()">Cancel</button>';
-  } else {
-    saveAreaHtml = '<button type="button" class="btn btn-primary" data-testid="save-btn" ' + busyAttr + ' onclick="planCanonicalEditorHandleSave()">Save</button>';
-  }
-  var reopenLockedAttr = (st.busy || st._pendingSaveAttempt || st.recoveryChecking) ? 'disabled' : '';
-  var programName = (es && es.name && es.name.trim()) ? es.name.trim() : 'Untitled Program';
-  var globalHeaderHtml =
-    '<div class="page-title-zone"><h2>' + escapeHtml(programName) + '</h2></div>' +
-    savePhaseHtml + outcomeHtml + validationHtml + reloadWarningHtml + staleNoticeHtml +
-    '<div style="margin:0 0 16px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
-    saveAreaHtml +
-    '<button type="button" class="btn btn-secondary" data-testid="new-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleNew()">New</button>' +
-    '<button type="button" class="btn btn-secondary" data-testid="back-to-programs-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleBackToPrograms()">Back to Programs</button>' +
-    '</div>' +
-    '<div class="form-group" data-testid="reopen-diagnostic-area"><label>Reopen Template Id (diagnostic/dev -- ordinarily use the Program library instead)</label>' +
-    '<input type="text" data-testid="reopen-template-id-input" ' + reopenLockedAttr + ' value="' + escapeHtml(st.reopenTemplateIdInput || '') + '" oninput="planCanonicalEditorState.reopenTemplateIdInput = this.value">' +
-    '<button type="button" class="btn btn-secondary" data-testid="reopen-btn" ' + reopenLockedAttr + ' onclick="planCanonicalEditorHandleReopen()">Reopen</button>' +
-    '<button type="button" class="btn btn-secondary" data-testid="reopen-last-saved-btn" ' + (reopenLockedAttr || (!st.lastSavedTemplateId ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleReopenLastSaved()">Reopen Last Saved</button>' +
-    '</div>';
-
-  function breadcrumbHtml(segments) {
-    var trail = segments.filter(Boolean).map(escapeHtml).join(' <span class="plan-breadcrumb-sep">&rsaquo;</span> ');
-    return trail ? '<div class="plan-breadcrumb">' + trail + '</div>' : '';
-  }
-
-  // ---- Duplicate Microcycle control (unchanged handler chain/testids --
-  // see the Phase B duplication-lineage correction above) -- shared by the
-  // Program-screen microcycle row AND the Microcycle screen's own page
-  // action, per the multi-screen spec's "expose Duplicate Microcycle
-  // naturally at the Program/Microcycle level."
+  // Duplicate Microcycle (unchanged handler chain and testids, including
+  // the in-app confirmation step).
   function duplicateMicrocycleControlHtml(mi, mc) {
     var mcIdx = planCanonicalEditorIdxAttrs(mi);
     var pendingDupConfirm = st._pendingDuplicateMicrocycleConfirm;
     var dupConfirmPendingForThis = !!(pendingDupConfirm && pendingDupConfirm.microcycle === mc);
     return dupConfirmPendingForThis
-      ? ('<span data-testid="duplicate-microcycle-confirm-area"' + mcIdx + ' style="margin-right:4px">' +
-        '<span data-testid="duplicate-microcycle-confirm-message"' + mcIdx + ' style="font-size:11px;margin-right:4px">Duplicate this microcycle?</span>' +
-        '<button type="button" class="btn btn-sm btn-primary" data-testid="duplicate-microcycle-confirm-btn"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleConfirmDuplicateMicrocycle(' + mi + ')">Confirm Duplicate</button>' +
-        '<button type="button" class="btn btn-sm btn-secondary" data-testid="duplicate-microcycle-cancel-btn"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleCancelDuplicateMicrocycle(' + mi + ')">Cancel</button>' +
-        '</span>')
-      : ('<button type="button" class="btn-icon btn-sm" data-testid="duplicate-microcycle"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRequestDuplicateMicrocycle(' + mi + ')">Duplicate Microcycle</button>');
+      ? ('<div class="pl-confirm" data-testid="duplicate-microcycle-confirm-area"' + mcIdx + '>' +
+        '<span data-testid="duplicate-microcycle-confirm-message"' + mcIdx + '>Duplicate this microcycle?</span>' +
+        '<div class="pl-actions"><button type="button" class="pl-btn pl-btn-accent" data-testid="duplicate-microcycle-confirm-btn"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleConfirmDuplicateMicrocycle(' + mi + ')">Confirm Duplicate</button>' +
+        '<button type="button" class="pl-btn" data-testid="duplicate-microcycle-cancel-btn"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleCancelDuplicateMicrocycle(' + mi + ')">Cancel</button></div>' +
+        '</div>')
+      : ('<button type="button" class="pl-btn" data-testid="duplicate-microcycle"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRequestDuplicateMicrocycle(' + mi + ')">Duplicate Microcycle</button>');
+  }
+  function moveRemoveHtml(upAttrs, downAttrs, removeAttrs, upLabel, downLabel, removeLabel) {
+    return '<div class="pl-actions">' +
+      '<button type="button" class="pl-btn"' + upAttrs + '>' + upLabel + '</button>' +
+      '<button type="button" class="pl-btn"' + downAttrs + '>' + downLabel + '</button>' +
+      '<button type="button" class="pl-btn pl-btn-danger"' + removeAttrs + '>' + removeLabel + '</button>' +
+      '</div>';
   }
 
-  var bodyHtml;
+  var title = 'Program Outline';
+  var backTestid = 'back-to-programs-btn';
+  var context = '';
+  var bodyHtml = '';
 
   // ===========================================================================
-  // PROGRAM SCREEN
+  // PROGRAM OUTLINE
   // ===========================================================================
   if (loc.screen === 'program') {
-    var mcCount0 = es.microcycles.length;
-    var mcRowsHtml = mcCount0 ? es.microcycles.map(function (mc, mi) {
-      var mcIdx = planCanonicalEditorIdxAttrs(mi);
-      return '<div class="plan-row" data-testid="microcycle-row"' + mcIdx + '>' +
-        '<button type="button" class="plan-row-main" data-testid="open-microcycle"' + mcIdx + ' onclick="planCanonicalEditorNavOpenMicrocycle(' + mi + ')" style="background:none;border:none;text-align:left;padding:0">' +
-        '<div class="plan-row-name">' + escapeHtml(mc.name || ('Microcycle ' + (mi + 1))) + '</div>' +
-        '<div class="plan-row-sub">' + planMicrocycleSummary(mc) + '</div>' +
-        '</button>' +
-        '<div class="plan-row-controls">' +
-        duplicateMicrocycleControlHtml(mi, mc) +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-microcycle-up"' + mcIdx + ' ' + (lockedAttr || (mi === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi + ',-1)">&uarr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-microcycle-down"' + mcIdx + ' ' + (lockedAttr || (mi === mcCount0 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi + ',1)">&darr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="remove-microcycle"' + mcIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveMicrocycle(' + mi + ')">&#10005;</button>' +
-        '</div></div>';
-    }).join('') : planEmptyState('No Microcycles yet.', 'Create your first microcycle to begin building this Program.');
-
+    var mcRows = es.microcycles.map(function (mc, mi) {
+      var names = (mc.sessions || []).slice(0, 3).map(function (s, k) { return s.name || ('Session ' + (k + 1)); });
+      var detail = escapeHtml([planUiCount((mc.sessions || []).length, 'session')].concat(names).join(' · '));
+      return '<div class="pl-entry" data-testid="microcycle-row"' + planCanonicalEditorIdxAttrs(mi) + '>' +
+        planUiRow(' data-testid="open-microcycle"' + planCanonicalEditorIdxAttrs(mi) + ' onclick="planCanonicalEditorNavOpenMicrocycle(' + mi + ')"', mc.name || ('Microcycle ' + (mi + 1)), detail) +
+        '</div>';
+    }).join('');
+    var detailsOpen = !!nav.detailsOpen;
     bodyHtml =
-      planLevelEyebrow('Program') +
-      '<div class="form-group"><label>Program Name</label><input type="text" data-testid="program-name" ' + lockedAttr + ' value="' + escapeHtml(es.name || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'name\',this.value)"></div>' +
-      '<div class="form-group"><label>Description</label><textarea data-testid="program-description" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'description\',this.value)">' + escapeHtml(es.description || '') + '</textarea></div>' +
-      '<div class="form-group"><label>Structure Label</label><input type="text" data-testid="program-structureLabel" ' + lockedAttr + ' value="' + escapeHtml(es.structureLabel || '') + '" oninput="planCanonicalEditorHandleSetProgramField(\'structureLabel\',this.value)"></div>' +
-      '<div class="form-group"><label>Notes</label><textarea data-testid="program-notes" ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetProgramField(\'notes\',this.value)">' + escapeHtml(es.notes || '') + '</textarea></div>' +
-      '<div class="prof-section-label" style="margin:16px 0 8px">Microcycles</div>' +
-      mcRowsHtml +
-      '<button type="button" class="btn btn-secondary" style="margin-top:8px" data-testid="add-microcycle-btn" ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddMicrocycle()">+ Add Microcycle</button>';
+      '<div class="pl-fields">' +
+      textField('Program name', 'program-name', '', es.name, 'planCanonicalEditorHandleSetProgramField(\'name\',this.value)') +
+      '<div class="pl-rows">' +
+      planUiRow(' data-testid="program-details-toggle" aria-expanded="' + detailsOpen + '" onclick="planUiToggleDetails()"', 'Program details', 'Description, structure label, and notes', detailsOpen ? '&#8963;' : '&rsaquo;') +
+      (detailsOpen ? '<div class="pl-detail-fields" data-testid="program-details">' +
+        textField('Description', 'program-description', '', es.description, 'planCanonicalEditorHandleSetProgramField(\'description\',this.value)', { area: true }) +
+        textField('Structure label', 'program-structureLabel', '', es.structureLabel, 'planCanonicalEditorHandleSetProgramField(\'structureLabel\',this.value)') +
+        textField('Program notes', 'program-notes', '', es.notes, 'planCanonicalEditorHandleSetProgramField(\'notes\',this.value)', { area: true }) +
+        '</div>' : '') +
+      '</div></div>' +
+      '<h3 class="pl-h">Microcycles</h3>' +
+      (mcRows ? '<div class="pl-rows">' + mcRows + '</div>' : '<p class="pl-note">No microcycles yet.</p>') +
+      '<button type="button" class="pl-add" data-testid="add-microcycle-btn" ' + lockedAttr + ' onclick="planUiAddMicrocycle()">+ Add Microcycle</button>' +
+      // Existing editor-level actions with no place in the mockup: New
+      // (blank program) and the diagnostic Reopen-by-id tools.
+      '<details class="pl-more" data-testid="editor-more"' + (nav.moreOpen ? ' open' : '') + ' ontoggle="if(planCanonicalEditorState&&planCanonicalEditorState.nav)planCanonicalEditorState.nav.moreOpen=this.open">' +
+      '<summary>More options</summary>' +
+      '<div class="pl-more-body">' +
+      '<button type="button" class="pl-btn" data-testid="new-btn" ' + lockedAttr + ' onclick="planUiNewBlank()">Start a new blank program</button>' +
+      '<p class="pl-note">Replaces this draft with a new blank program. Unsaved changes here are discarded.</p>' +
+      '<div class="pl-fields" data-testid="reopen-diagnostic-area">' +
+      '<label class="pl-field"><span>Reopen Template Id (diagnostic)</span><input type="text" data-testid="reopen-template-id-input" ' + reopenLockedAttr + ' value="' + escapeHtml(st.reopenTemplateIdInput || '') + '" oninput="planCanonicalEditorState.reopenTemplateIdInput = this.value"></label>' +
+      '<div class="pl-actions"><button type="button" class="pl-btn" data-testid="reopen-btn" ' + reopenLockedAttr + ' onclick="planCanonicalEditorHandleReopen()">Reopen</button>' +
+      '<button type="button" class="pl-btn" data-testid="reopen-last-saved-btn" ' + (reopenLockedAttr || (!st.lastSavedTemplateId ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleReopenLastSaved()">Reopen Last Saved</button></div>' +
+      '</div></div></details>';
 
   // ===========================================================================
-  // MICROCYCLE SCREEN
+  // MICROCYCLE
   // ===========================================================================
   } else if (loc.screen === 'microcycle') {
     var mc1 = loc.mc, mi1 = loc.mi;
-    var sessCount1 = mc1.sessions.length;
-    var sessRowsHtml = sessCount1 ? mc1.sessions.map(function (s, si) {
-      var sIdx = planCanonicalEditorIdxAttrs(mi1, si);
-      return '<div class="plan-row" data-testid="session-row"' + sIdx + '>' +
-        '<button type="button" class="plan-row-main" data-testid="open-session"' + sIdx + ' onclick="planCanonicalEditorNavOpenSession(' + mi1 + ',' + si + ')" style="background:none;border:none;text-align:left;padding:0">' +
-        '<div class="plan-row-name">' + escapeHtml(s.name || ('Session ' + (si + 1))) + '</div>' +
-        '<div class="plan-row-sub">' + planSessionSummary(s) + '</div>' +
-        '</button>' +
-        '<div class="plan-row-controls">' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-session-up"' + sIdx + ' ' + (lockedAttr || (si === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi1 + ',' + si + ',-1)">&uarr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-session-down"' + sIdx + ' ' + (lockedAttr || (si === sessCount1 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi1 + ',' + si + ',1)">&darr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="remove-session"' + sIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveSession(' + mi1 + ',' + si + ')">&#10005;</button>' +
-        '</div></div>';
-    }).join('') : planEmptyState('No Sessions yet.', 'Add a session to this microcycle.');
-
+    var mcCount = es.microcycles.length;
+    title = mc1.name || ('Microcycle ' + (mi1 + 1));
+    backTestid = 'nav-back-to-program';
+    context = programName;
+    var sessRows = mc1.sessions.map(function (s, si) {
+      return '<div class="pl-entry" data-testid="session-row"' + planCanonicalEditorIdxAttrs(mi1, si) + '>' +
+        planUiRow(' data-testid="open-session"' + planCanonicalEditorIdxAttrs(mi1, si) + ' onclick="planCanonicalEditorNavOpenSession(' + mi1 + ',' + si + ')"', s.name || ('Session ' + (si + 1)), escapeHtml(planUiSessionSummary(s))) +
+        '</div>';
+    }).join('');
+    var m1 = planCanonicalEditorIdxAttrs(mi1);
     bodyHtml =
-      '<button type="button" class="btn-icon" data-testid="nav-back-to-program" onclick="planCanonicalEditorNavBackToProgram()" aria-label="Back">&#8592; Program</button>' +
-      breadcrumbHtml([programName]) +
-      planLevelEyebrow('Microcycle') +
-      '<div class="form-group"><label>Microcycle Name</label><input type="text" data-testid="microcycle-name"' + planCanonicalEditorIdxAttrs(mi1) + ' ' + lockedAttr + ' value="' + escapeHtml(mc1.name || '') + '" oninput="planCanonicalEditorHandleSetMicrocycleField(' + mi1 + ',\'name\',this.value)"></div>' +
-      '<div class="prof-section-label" style="margin:16px 0 8px">Sessions</div>' +
-      sessRowsHtml +
-      '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">' +
-      '<button type="button" class="btn btn-secondary" data-testid="add-session"' + planCanonicalEditorIdxAttrs(mi1) + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddSession(' + mi1 + ')">+ Add Session</button>' +
-      duplicateMicrocycleControlHtml(mi1, mc1) +
-      '</div>';
+      '<div class="pl-fields">' + textField('Microcycle name', 'microcycle-name', m1, mc1.name, 'planCanonicalEditorHandleSetMicrocycleField(' + mi1 + ',\'name\',this.value)') + '</div>' +
+      '<h3 class="pl-h">Sessions</h3>' +
+      (sessRows ? '<div class="pl-rows">' + sessRows + '</div>' : '<p class="pl-note">No sessions yet.</p>') +
+      '<button type="button" class="pl-add" data-testid="add-session"' + m1 + ' ' + lockedAttr + ' onclick="planUiAddSession(' + mi1 + ')">+ Add Session</button>' +
+      '<h3 class="pl-h">Microcycle actions</h3>' +
+      '<div class="pl-actions">' + duplicateMicrocycleControlHtml(mi1, mc1) + '</div>' +
+      moveRemoveHtml(
+        ' data-testid="move-microcycle-up"' + m1 + ' ' + (lockedAttr || (mi1 === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi1 + ',-1)"',
+        ' data-testid="move-microcycle-down"' + m1 + ' ' + (lockedAttr || (mi1 === mcCount - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveMicrocycle(' + mi1 + ',1)"',
+        ' data-testid="remove-microcycle"' + m1 + ' ' + lockedAttr + ' onclick="planUiRemoveMicrocycle(' + mi1 + ')"',
+        'Move earlier', 'Move later', 'Remove Microcycle');
 
   // ===========================================================================
-  // SESSION SCREEN
+  // SESSION WORKSPACE
   // ===========================================================================
   } else if (loc.screen === 'session') {
     var mi2 = loc.mi, si2 = loc.si, sess2 = loc.session, mc2 = loc.mc;
-    var exCount2 = sess2.exercises.length;
-    var exRowsHtml = exCount2 ? sess2.exercises.map(function (ex, ei) {
+    var sessCount = mc2.sessions.length;
+    title = sess2.name || ('Session ' + (si2 + 1));
+    backTestid = 'nav-back-to-microcycle';
+    context = programName + ' / ' + (mc2.name || ('Microcycle ' + (mi2 + 1)));
+    var s2 = planCanonicalEditorIdxAttrs(mi2, si2);
+    var exCount = sess2.exercises.length;
+    var exRows = sess2.exercises.map(function (ex, ei) {
       var eIdx = planCanonicalEditorIdxAttrs(mi2, si2, ei);
-      return '<div class="plan-row" data-testid="exercise-row"' + eIdx + '>' +
-        '<button type="button" class="plan-row-main" data-testid="open-exercise"' + eIdx + ' onclick="planCanonicalEditorNavOpenExercise(' + mi2 + ',' + si2 + ',' + ei + ')" style="background:none;border:none;text-align:left;padding:0">' +
-        '<div class="plan-row-name">' + escapeHtml(planCanonicalGetExerciseName(ex.exerciseId)) + '</div>' +
-        '<div class="plan-row-sub">' + planExerciseSummary(ex) + '</div>' +
-        '</button>' +
-        '<div class="plan-row-controls">' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-exercise-up"' + eIdx + ' ' + (lockedAttr || (ei === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveExercise(' + mi2 + ',' + si2 + ',' + ei + ',-1)">&uarr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-exercise-down"' + eIdx + ' ' + (lockedAttr || (ei === exCount2 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveExercise(' + mi2 + ',' + si2 + ',' + ei + ',1)">&darr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="remove-exercise"' + eIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveExercise(' + mi2 + ',' + si2 + ',' + ei + ')">&#10005;</button>' +
-        '</div></div>';
-    }).join('') : planEmptyState('No Exercises yet.', 'Add your first exercise to begin building this session.');
-
+      var expanded = loc.exercise === ex;
+      var html = '<div class="pl-entry' + (expanded ? ' pl-entry-open' : '') + '" data-testid="exercise-row"' + eIdx + '>' +
+        planUiRow(' data-testid="open-exercise"' + eIdx + ' aria-expanded="' + expanded + '" onclick="planUiToggleExercise(' + mi2 + ',' + si2 + ',' + ei + ')"',
+          planCanonicalGetExerciseName(ex.exerciseId) === '(no exercise selected)' ? 'Select exercise' : planCanonicalGetExerciseName(ex.exerciseId),
+          escapeHtml(planUiExerciseRowSub(ex)), expanded ? '&#8963;' : '&rsaquo;');
+      if (expanded) {
+        var wl = planUiWorkingLoadEligible(ex);
+        var setRows = ex.sets.map(function (set, seti) {
+          var setIdx = planCanonicalEditorIdxAttrs(mi2, si2, ei, seti);
+          var open = loc.set === set;
+          return '<div class="pl-entry pl-set-entry' + (open ? ' pl-entry-active' : '') + '" data-testid="set-row"' + setIdx + '>' +
+            planUiRow(' data-testid="open-set"' + setIdx + ' aria-expanded="' + open + '" onclick="planUiToggleSet(' + mi2 + ',' + si2 + ',' + ei + ',' + seti + ')"',
+              'Set ' + (seti + 1), escapeHtml(planUiSetText(set, wl)) + (set.notes && set.notes.trim() ? ' <span class="plan-note-tag">NOTE</span>' : ''), open ? '&#8963;' : '&rsaquo;', 'pl-set-row') +
+            (open ? '<div class="pl-form" data-testid="set-editor"' + setIdx + '>' + setFieldsHtml(mi2, si2, ei, set, seti) +
+              '<div class="pl-actions pl-actions-split">' +
+              '<button type="button" class="pl-btn pl-btn-danger" data-testid="remove-set"' + setIdx + ' ' + lockedAttr + ' onclick="planUiRemoveSet(' + mi2 + ',' + si2 + ',' + ei + ',' + seti + ')">Remove Set</button>' +
+              '<span class="pl-actions-group">' +
+              '<button type="button" class="pl-icon-btn" aria-label="Move set up" data-testid="move-set-up"' + setIdx + ' ' + (lockedAttr || (seti === 0 ? 'disabled' : '')) + ' onclick="planUiMoveSet(' + mi2 + ',' + si2 + ',' + ei + ',' + seti + ',-1)">&uarr;</button>' +
+              '<button type="button" class="pl-icon-btn" aria-label="Move set down" data-testid="move-set-down"' + setIdx + ' ' + (lockedAttr || (seti === ex.sets.length - 1 ? 'disabled' : '')) + ' onclick="planUiMoveSet(' + mi2 + ',' + si2 + ',' + ei + ',' + seti + ',1)">&darr;</button>' +
+              '<button type="button" class="pl-btn" data-testid="set-done"' + setIdx + ' onclick="planUiSetDone()">Done</button>' +
+              '</span></div></div>' : '') +
+            '</div>';
+        }).join('');
+        var progOn = !!(ex.progression && ex.progression.enabled);
+        html += '<div class="pl-open" data-testid="exercise-workspace"' + eIdx + '>' +
+          '<div class="pl-fields">' + exerciseSelectHtml(mi2, si2, ei, ex) +
+          textField('Prescription notes', 'exercise-notes', eIdx, ex.notes, 'planCanonicalEditorHandleSetExerciseField(' + mi2 + ',' + si2 + ',' + ei + ',\'notes\',this.value)', { area: true }) + '</div>' +
+          '<h3 class="pl-h">Sets</h3>' +
+          (setRows ? '<div class="pl-rows">' + setRows + '</div>' : '<p class="pl-note">No sets yet.</p>') +
+          '<button type="button" class="pl-add" data-testid="add-set"' + eIdx + ' ' + lockedAttr + ' onclick="planUiAddSet(' + mi2 + ',' + si2 + ',' + ei + ')">+ Add Set</button>' +
+          '<h3 class="pl-h">Progression</h3>' +
+          '<div class="pl-rows" data-testid="progression-row"' + eIdx + '>' +
+          planUiRow(' data-testid="open-progression"' + eIdx + ' onclick="planCanonicalEditorNavOpenProgression(' + mi2 + ',' + si2 + ',' + ei + ')"', 'Progression', escapeHtml(progOn ? planUiProgressionShort(ex) : 'Off')) +
+          '</div>' +
+          '<div class="pl-actions pl-ex-actions">' +
+          '<button type="button" class="pl-btn" data-testid="move-exercise-up"' + eIdx + ' ' + (lockedAttr || (ei === 0 ? 'disabled' : '')) + ' onclick="planUiMoveExercise(' + mi2 + ',' + si2 + ',' + ei + ',-1)">Move up</button>' +
+          '<button type="button" class="pl-btn" data-testid="move-exercise-down"' + eIdx + ' ' + (lockedAttr || (ei === exCount - 1 ? 'disabled' : '')) + ' onclick="planUiMoveExercise(' + mi2 + ',' + si2 + ',' + ei + ',1)">Move down</button>' +
+          '<button type="button" class="pl-btn pl-btn-danger" data-testid="remove-exercise"' + eIdx + ' ' + lockedAttr + ' onclick="planUiRemoveExercise(' + mi2 + ',' + si2 + ',' + ei + ')">Remove Exercise</button>' +
+          '</div></div>';
+      }
+      return html + '</div>';
+    }).join('');
     bodyHtml =
-      '<button type="button" class="btn-icon" data-testid="nav-back-to-microcycle" onclick="planCanonicalEditorNavBackToMicrocycle()" aria-label="Back">&#8592; Microcycle</button>' +
-      breadcrumbHtml([programName, mc2.name || ('Microcycle ' + (mi2 + 1))]) +
-      planLevelEyebrow('Session') +
-      '<div class="form-group"><label>Session Name</label><input type="text" data-testid="session-name"' + planCanonicalEditorIdxAttrs(mi2, si2) + ' ' + lockedAttr + ' value="' + escapeHtml(sess2.name || '') + '" oninput="planCanonicalEditorHandleSetSessionField(' + mi2 + ',' + si2 + ',\'name\',this.value)"></div>' +
-      '<div class="form-group"><label>Session Notes</label><textarea data-testid="session-notes"' + planCanonicalEditorIdxAttrs(mi2, si2) + ' ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetSessionField(' + mi2 + ',' + si2 + ',\'notes\',this.value)">' + escapeHtml(sess2.notes || '') + '</textarea></div>' +
-      '<div class="prof-section-label" style="margin:16px 0 8px">Exercises</div>' +
-      exRowsHtml +
-      '<button type="button" class="btn btn-secondary" style="margin-top:8px" data-testid="add-exercise"' + planCanonicalEditorIdxAttrs(mi2, si2) + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddExercise(' + mi2 + ',' + si2 + ')">+ Add Exercise</button>';
+      '<div class="pl-fields">' +
+      textField('Session name', 'session-name', s2, sess2.name, 'planCanonicalEditorHandleSetSessionField(' + mi2 + ',' + si2 + ',\'name\',this.value)') +
+      textField('Session notes', 'session-notes', s2, sess2.notes, 'planCanonicalEditorHandleSetSessionField(' + mi2 + ',' + si2 + ',\'notes\',this.value)', { area: true, rows: 2 }) +
+      '</div>' +
+      '<h3 class="pl-h">Exercises</h3>' +
+      '<p class="pl-note" data-testid="session-summary">' + escapeHtml(planUiSessionSummary(sess2)) + '</p>' +
+      (exRows ? '<div class="pl-rows">' + exRows + '</div>' : '<p class="pl-note">No exercises yet.</p>') +
+      '<button type="button" class="pl-add" data-testid="add-exercise"' + s2 + ' ' + lockedAttr + ' onclick="planUiAddExercise(' + mi2 + ',' + si2 + ')">+ Add Exercise</button>' +
+      '<h3 class="pl-h">Session actions</h3>' +
+      moveRemoveHtml(
+        ' data-testid="move-session-up"' + s2 + ' ' + (lockedAttr || (si2 === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi2 + ',' + si2 + ',-1)"',
+        ' data-testid="move-session-down"' + s2 + ' ' + (lockedAttr || (si2 === sessCount - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSession(' + mi2 + ',' + si2 + ',1)"',
+        ' data-testid="remove-session"' + s2 + ' ' + lockedAttr + ' onclick="planUiRemoveSession(' + mi2 + ',' + si2 + ')"',
+        'Move earlier', 'Move later', 'Remove Session');
 
   // ===========================================================================
-  // EXERCISE SCREEN
-  // ===========================================================================
-  } else if (loc.screen === 'exercise') {
-    var mi3 = loc.mi, si3 = loc.si, ei3 = loc.ei, ex3 = loc.exercise, sess3 = loc.session, mc3 = loc.mc;
-    var setCount3 = ex3.sets.length;
-    var setRowsHtml = setCount3 ? ex3.sets.map(function (set, seti) {
-      var setIdx = planCanonicalEditorIdxAttrs(mi3, si3, ei3, seti);
-      var workingLoadEligible = !!(ex3.progression && ex3.progression.enabled && ex3.progression.adjustmentType === 'addLoad');
-      return '<div class="plan-set-row" data-testid="set-row"' + setIdx + '>' +
-        '<button type="button" class="plan-set-row-main" data-testid="open-set"' + setIdx + ' onclick="planCanonicalEditorNavOpenSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ')" style="background:none;border:none;text-align:left;padding:0">' +
-        '<span class="plan-set-row-num">' + (seti + 1) + '</span>' +
-        '<span class="plan-set-row-summary">' + planFormatSetSummary(set, true, workingLoadEligible) + '</span>' +
-        '</button>' +
-        '<div class="plan-row-controls">' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-set-up"' + setIdx + ' ' + (lockedAttr || (seti === 0 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ',-1)">&uarr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="move-set-down"' + setIdx + ' ' + (lockedAttr || (seti === setCount3 - 1 ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleMoveSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ',1)">&darr;</button>' +
-        '<button type="button" class="btn-icon btn-sm" data-testid="remove-set"' + setIdx + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleRemoveSet(' + mi3 + ',' + si3 + ',' + ei3 + ',' + seti + ')">&#10005;</button>' +
-        '</div></div>';
-    }).join('') : planEmptyState('No Sets yet.', 'Add your first prescribed set.');
-
-    var progSummary = planProgressionSummaryText(ex3);
-    var eIdx3 = planCanonicalEditorIdxAttrs(mi3, si3, ei3);
-    bodyHtml =
-      '<button type="button" class="btn-icon" data-testid="nav-back-to-session" onclick="planCanonicalEditorNavBackToSession()" aria-label="Back">&#8592; Session</button>' +
-      breadcrumbHtml([programName, mc3.name || ('Microcycle ' + (mi3 + 1)), sess3.name || ('Session ' + (si3 + 1))]) +
-      planLevelEyebrow('Exercise') +
-      exerciseSelectHtml(mi3, si3, ei3, ex3) +
-      '<div class="form-group"><label>Exercise Notes</label><textarea data-testid="exercise-notes"' + eIdx3 + ' ' + lockedAttr + ' oninput="planCanonicalEditorHandleSetExerciseField(' + mi3 + ',' + si3 + ',' + ei3 + ',\'notes\',this.value)">' + escapeHtml(ex3.notes || '') + '</textarea></div>' +
-      '<div class="prof-section-label" style="margin:16px 0 8px">Sets</div>' +
-      setRowsHtml +
-      '<button type="button" class="btn btn-secondary" style="margin-top:8px" data-testid="add-set"' + eIdx3 + ' ' + lockedAttr + ' onclick="planCanonicalEditorHandleAddSet(' + mi3 + ',' + si3 + ',' + ei3 + ')">+ Add Set</button>' +
-      '<div class="prof-section-label" style="margin:16px 0 8px">Progression</div>' +
-      '<div class="plan-row" data-testid="progression-row"' + eIdx3 + '>' +
-      '<button type="button" class="plan-row-main" data-testid="open-progression"' + eIdx3 + ' onclick="planCanonicalEditorNavOpenProgression(' + mi3 + ',' + si3 + ',' + ei3 + ')" style="background:none;border:none;text-align:left;padding:0">' +
-      '<div class="plan-row-name">' + (ex3.progression && ex3.progression.enabled ? 'Progression: On' : 'Progression: Off') + '</div>' +
-      (progSummary ? '<div class="plan-row-sub">' + escapeHtml(progSummary) + '</div>' : '') +
-      '</button></div>';
-
-  // ===========================================================================
-  // SET SCREEN
-  // ===========================================================================
-  } else if (loc.screen === 'set') {
-    var mi4 = loc.mi, si4 = loc.si, ei4 = loc.ei, seti4 = loc.seti, ex4 = loc.exercise, sess4 = loc.session, mc4 = loc.mc, set4 = loc.set;
-    var workingLoadEligible4 = !!(ex4.progression && ex4.progression.enabled && ex4.progression.adjustmentType === 'addLoad');
-    bodyHtml =
-      '<button type="button" class="btn-icon" data-testid="nav-back-to-exercise" onclick="planCanonicalEditorNavBackToExercise()" aria-label="Back">&#8592; Exercise</button>' +
-      breadcrumbHtml([programName, mc4.name || ('Microcycle ' + (mi4 + 1)), sess4.name || ('Session ' + (si4 + 1)), planCanonicalGetExerciseName(ex4.exerciseId)]) +
-      planLevelEyebrow('Set ' + (seti4 + 1)) +
-      '<div class="plan-set-preview-box" data-testid="set-preview">' + planFormatSetSummary(set4, true, workingLoadEligible4) + '</div>' +
-      setFieldsHtml(mi4, si4, ei4, set4, seti4);
-
-  // ===========================================================================
-  // PROGRESSION SCREEN
+  // PROGRESSION
   // ===========================================================================
   } else if (loc.screen === 'progression') {
     var mi5 = loc.mi, si5 = loc.si, ei5 = loc.ei, ex5 = loc.exercise, sess5 = loc.session, mc5 = loc.mc;
-    bodyHtml =
-      '<button type="button" class="btn-icon" data-testid="nav-back-to-exercise" onclick="planCanonicalEditorNavBackToExercise()" aria-label="Back">&#8592; Exercise</button>' +
-      breadcrumbHtml([programName, mc5.name || ('Microcycle ' + (mi5 + 1)), sess5.name || ('Session ' + (si5 + 1)), planCanonicalGetExerciseName(ex5.exerciseId)]) +
-      planLevelEyebrow('Progression') +
-      progressionFieldsHtml(mi5, si5, ei5, ex5);
+    title = 'Progression';
+    backTestid = 'nav-back-to-exercise';
+    context = [programName, mc5.name || ('Microcycle ' + (mi5 + 1)), sess5.name || ('Session ' + (si5 + 1)), planCanonicalGetExerciseName(ex5.exerciseId)].join(' / ');
+    bodyHtml = progressionFieldsHtml(mi5, si5, ei5, ex5);
   }
 
-  root.innerHTML = globalHeaderHtml + '<div class="plan-editor">' + bodyHtml + '</div>';
+  root.innerHTML =
+    '<div class="pl-screen" data-testid="plan-editor" data-screen="' + loc.screen + '">' +
+    '<div class="pl-bar">' +
+    '<button type="button" class="pl-back" data-testid="' + backTestid + '" aria-label="Back" onclick="planUiEditorBack()">&larr;</button>' +
+    '<h2 class="pl-title" data-testid="plan-screen-title">' + escapeHtml(title) + '</h2>' +
+    saveBarBtn +
+    '</div>' +
+    '<div class="pl-main plan-editor">' +
+    (context ? '<p class="pl-context" data-testid="plan-context">' + escapeHtml(context) + '</p>' : '') +
+    savePhaseHtml + outcomeHtml + validationHtml + reloadWarningHtml + staleNoticeHtml + saveBlockHtml +
+    bodyHtml +
+    '</div></div>';
+
+  var target = nav.scrollTarget;
+  nav.scrollTarget = null;
+  planUiApplyScrollTarget(root, target);
 }
 
 // =============================================================================
@@ -13320,6 +13572,12 @@ async function planCanonicalLibraryHandleOpen(templateId) {
   var recoveryCheck = planCanonicalLibraryCheckAndLockOnPendingRecovery(st.ctx);
   if (recoveryCheck.locked) return { status: 'ignored', reason: 'recoveryPending', editorState: recoveryCheck.editorState };
   st.openingTemplateId = templateId;
+  // PLAN redesign: each open gets a sequence number. Navigating away from
+  // the Program Profile (Back to the Library, another Profile, a read-only
+  // session, Start on Train) cancels it via
+  // planCanonicalLibraryCancelPendingOpen, so a read that completes later is
+  // ignored instead of mounting the editor over the current view.
+  var mySeq = st.openSeq = (st.openSeq || 0) + 1;
   st.openError = null;
   planCanonicalLibraryRender();
   // Phase A correction (finding 1): a successful reopen must leave the
@@ -13342,6 +13600,7 @@ async function planCanonicalLibraryHandleOpen(templateId) {
     // flight, this result belongs to a session that no longer exists --
     // never act on it, and never touch st (a different object now).
     if (planCanonicalLibraryState !== st) return reopenResult;
+    if (st.openSeq !== mySeq) return { status: 'ignored', reason: 'navigatedAway', result: reopenResult };
     if (reopenResult.status === 'success' && reopenResult.editorState) {
       var freshState = planCanonicalEditorBuildFreshState(editorCtx);
       freshState.editorState = reopenResult.editorState;
@@ -13362,14 +13621,14 @@ async function planCanonicalLibraryHandleOpen(templateId) {
     return reopenResult;
   } catch (err) {
     var classified = planClassifyCanonicalReadError(err);
-    if (planCanonicalLibraryState === st) st.openError = classified;
+    if (planCanonicalLibraryState === st && st.openSeq === mySeq) st.openError = classified;
     return classified;
   } finally {
     // Only the non-success paths (failure, stale, or an exception) still
     // own #page-programs as the library -- render it there, honestly
     // reflecting st.openError. A successful transition to the editor
     // (openedEditor) must never be followed by a library render here.
-    if (!openedEditor && planCanonicalLibraryState === st) {
+    if (!openedEditor && planCanonicalLibraryState === st && st.openSeq === mySeq) {
       st.openingTemplateId = null;
       planCanonicalLibraryRender();
     }
@@ -13383,15 +13642,25 @@ function planCanonicalLibraryOutcomeLabel(err) {
 }
 
 // ---- planCanonicalLibraryRender() ----
-// Real DOM, guarded no-op under Node -- same convention as
-// planCanonicalEditorRender above. Covers every state requirement 2 names:
-// loading, empty, one active-Program card per valid summary (name plus
-// whichever of description/structureLabel/assignmentCount are available),
-// New Program, Open/Edit, retry for a retryable list failure, and honest
-// disabled/unknown-error states.
+// PLAN REDESIGN: the library container now shows one of three views, all
+// read-only, selected by planCanonicalLibraryState.view:
+//   'list'    Program Library (template rows + New Program)
+//   'profile' Program Profile for one template (verified full read)
+//   'review'  read-only prescription view of one session in that template
+// Loading / disabled / retryable / error / empty / Load More states for the
+// list are unchanged in behavior. Opening a template for EDITING still goes
+// through planCanonicalLibraryHandleOpen (same verified read, same recovery
+// lock check, same editor mount); Start on Train still calls the existing
+// planRunStartOpen(templateId).
 function planCanonicalLibraryRender() {
   if (typeof document === 'undefined') return;
   if (!planCanonicalLibraryState) return;
+  // An open editor session (including a recovery check) owns #page-programs.
+  // A library list read that finishes while the editor is open (e.g. Edit
+  // Template tapped on a Profile while the list is still refreshing after a
+  // save) must not redraw the library over it. Every path back to the
+  // library clears planCanonicalEditorState first.
+  if (planCanonicalEditorState) return;
   var page = planContainer();
   var root = document.getElementById(PLAN_CANONICAL_LIBRARY_CONTAINER_ID);
   if (!root) {
@@ -13401,70 +13670,258 @@ function planCanonicalLibraryRender() {
     else if (typeof document.body !== 'undefined') { document.body.appendChild(root); }
   }
   var st = planCanonicalLibraryState;
-  var newBtnHtml = '<button type="button" class="btn btn-primary" data-testid="library-new-btn" onclick="planCanonicalLibraryHandleNew()">New Program</button>';
+  var target = st.scrollTarget || null;
+  st.scrollTarget = null;
+  if (st.view === 'profile' && st.profile) { root.innerHTML = planCanonicalLibraryProfileHtml(st); planUiApplyScrollTarget(root, target); return; }
+  if (st.view === 'review' && st.profile && st.profile.program) { root.innerHTML = planCanonicalLibraryReviewHtml(st); planUiApplyScrollTarget(root, target); return; }
+  root.innerHTML = planCanonicalLibraryListHtml(st);
+  planUiApplyScrollTarget(root, target);
+}
 
+function planCanonicalLibraryBarHtml(backAction, backTestid, title) {
+  return '<div class="pl-bar">' +
+    (backAction ? '<button type="button" class="pl-back" data-testid="' + backTestid + '" aria-label="Back" onclick="' + backAction + '">&larr;</button>' : '') +
+    '<h2 class="pl-title" data-testid="plan-screen-title">' + escapeHtml(title) + '</h2></div>';
+}
+
+function planCanonicalLibraryListHtml(st) {
+  var newBtnHtml = '<button type="button" class="pl-new" data-testid="library-new-btn" onclick="planCanonicalLibraryHandleNew()">+ New Program</button>';
+  var head = '<div class="pl-screen" data-testid="plan-library">' + planCanonicalLibraryBarHtml('', '', 'Programs') + '<div class="pl-main">';
+  var tail = '</div></div>';
   if (st.status === 'loading' && !st.items.length) {
-    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
-      '<div data-testid="library-loading" style="padding:16px">Loading Programs...</div>';
-    return;
+    return head + '<p class="pl-note" data-testid="library-loading">Loading Programs...</p>' + tail;
   }
   if (st.status === 'disabled') {
-    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
-      '<div data-testid="library-disabled" style="padding:8px;border-radius:6px;background:#eee">The canonical Program library is currently disabled.</div>' +
-      newBtnHtml;
-    return;
+    return head + '<div class="pl-status" data-testid="library-disabled">The canonical Program library is currently disabled.</div>' + newBtnHtml + tail;
   }
   if (st.status === 'retryable' || st.status === 'error') {
     var isRetryable = st.status === 'retryable';
-    root.innerHTML = '<div class="page-title-zone"><h2>Programs</h2></div>' +
-      '<div data-testid="' + (isRetryable ? 'library-retryable' : 'library-error') + '" style="padding:8px;border-radius:6px;' + (isRetryable ? 'background:#ffe;color:#740' : 'background:#fee;color:#900') + '">Could not load Programs' + (isRetryable ? ' -- a retryable error occurred.' : '.') +
+    return head +
+      '<div class="pl-status ' + (isRetryable ? 'pl-status-warn' : 'pl-status-error') + '" data-testid="' + (isRetryable ? 'library-retryable' : 'library-error') + '">Could not load Programs' + (isRetryable ? ' -- a retryable error occurred.' : '.') +
       (st.error && st.error.error && st.error.error.message ? ' -- ' + escapeHtml(st.error.error.message) : '') + '</div>' +
-      '<button type="button" class="btn btn-secondary" data-testid="library-retry-btn" onclick="planCanonicalLibraryHandleRetry()">Retry</button>' +
-      newBtnHtml;
-    return;
+      '<div class="pl-actions"><button type="button" class="pl-btn" data-testid="library-retry-btn" onclick="planCanonicalLibraryHandleRetry()">Retry</button></div>' +
+      newBtnHtml + tail;
   }
-
   var openErrorHtml = st.openError
-    ? '<div class="plan-canonical-library-open-error" data-testid="library-open-error" style="margin:8px 0;padding:8px;border-radius:6px;background:#fee;color:#900">' +
+    ? '<div class="pl-status pl-status-error" data-testid="library-open-error">' +
       escapeHtml(planCanonicalLibraryOutcomeLabel(st.openError)) +
       (st.openError.error && st.openError.error.message ? ' -- ' + escapeHtml(st.openError.error.message) : '') +
       '</div>'
     : '';
-
-  var cardsHtml = !st.items.length
-    ? '<div data-testid="library-empty" style="padding:16px">No Programs yet. Use New Program to create one.</div>'
-    : st.items.map(function (item) {
-      var opening = st.openingTemplateId === item.templateId;
-      var detailBits = [];
-      if (item.description) detailBits.push(escapeHtml(item.description));
-      if (item.structureLabel) detailBits.push(escapeHtml(item.structureLabel));
-      if (typeof item.assignmentCount === 'number') detailBits.push(item.assignmentCount + ' assignment' + (item.assignmentCount === 1 ? '' : 's'));
-      var safeTemplateId = escapeHtml(item.templateId).replace(/'/g, "\\'");
-      return '<div class="plan-canonical-library-card" data-testid="library-card" data-template-id="' + escapeHtml(item.templateId) + '" style="border:1px solid #ccc;border-radius:6px;padding:8px;margin:6px 0">' +
-        '<div style="font-weight:600">' + escapeHtml(item.name || '(untitled Program)') + '</div>' +
-        (detailBits.length ? '<div style="font-size:12px;color:#555">' + detailBits.join(' -- ') + '</div>' : '') +
-        '<button type="button" class="btn btn-sm" data-testid="library-open-btn" data-template-id="' + escapeHtml(item.templateId) + '" ' + (opening ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleOpen(\'' + safeTemplateId + '\')">' + (opening ? 'Opening...' : 'Open / Edit') + '</button> ' +
-        // START-FLOW SLICE ADDITION -- rendered unconditionally on every
-        // card (deliberate simplification, see app-plan-run-start-ui.js's
-        // own header: this lightweight list item carries no Sessions count,
-        // so eligibility is determined at click-time by planRunStartOpen's
-        // own verified read, not pre-checked here). Wired the same safe,
-        // escaped-string-literal way as the existing Open/Edit button
-        // above -- never a raw, unescaped interpolation.
-        '<button type="button" class="btn btn-sm" data-testid="library-start-btn" data-template-id="' + escapeHtml(item.templateId) + '" onclick="planRunStartOpen(\'' + safeTemplateId + '\')">Start on Train</button>' +
-        '</div>';
-    }).join('');
-
+  // One row per template summary: name, description, structure label and
+  // the summary's assignment count. Microcycle/session counts are on the
+  // Profile, which reads the whole template.
+  var rows = st.items.map(function (item) {
+    var safeTemplateId = escapeHtml(item.templateId).replace(/'/g, "\\'");
+    var detailBits = [item.description, item.structureLabel].filter(function (x) { return x && String(x).trim(); }).map(function (x) { return escapeHtml(String(x).trim()); });
+    // Same assignment count the previous Library row showed, when the
+    // summary supplies it (including 0), with singular/plural label.
+    if (typeof item.assignmentCount === 'number') detailBits.push(item.assignmentCount + ' assignment' + (item.assignmentCount === 1 ? '' : 's'));
+    var detail = detailBits.join(' · ');
+    return '<div class="pl-entry" data-testid="library-card" data-template-id="' + escapeHtml(item.templateId) + '">' +
+      planUiRow(' data-testid="library-open-btn" data-template-id="' + escapeHtml(item.templateId) + '" onclick="planCanonicalLibraryOpenProfile(\'' + safeTemplateId + '\')"', item.name || 'Untitled Program', detail) +
+      '</div>';
+  }).join('');
   var loadMoreHtml = st.hasMore
-    ? '<button type="button" class="btn btn-secondary" data-testid="library-load-more-btn" ' + (st.status === 'loading' ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleLoadMore()">Load More</button>'
+    ? '<button type="button" class="pl-add" data-testid="library-load-more-btn" ' + (st.status === 'loading' ? 'disabled' : '') + ' onclick="planCanonicalLibraryHandleLoadMore()">Load More</button>'
     : '';
+  return head + openErrorHtml + newBtnHtml +
+    '<div data-testid="library-cards">' + (rows ? '<div class="pl-rows">' + rows + '</div>' : '<p class="pl-note" data-testid="library-empty">No Programs yet. Use New Program to create one.</p>') + '</div>' +
+    loadMoreHtml + tail;
+}
 
-  root.innerHTML =
-    '<div class="page-title-zone"><h2>Programs</h2></div>' +
-    openErrorHtml +
-    newBtnHtml +
-    '<div data-testid="library-cards">' + cardsHtml + '</div>' +
-    loadMoreHtml;
+// ---- Program Profile ----
+// Reads the whole template through the SAME verified read path the editor
+// uses (planReopenCanonicalTemplate -- read-only, no side effects) and
+// renders it read-only. Nothing here can change the template.
+async function planCanonicalLibraryOpenProfile(templateId, opts) {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryOpenProfile');
+  planCanonicalAdapterRequire(typeof templateId === 'string' && templateId, 'planCanonicalLibraryOpenProfile: templateId is required');
+  opts = opts || {};
+  var st = planCanonicalLibraryState;
+  planCanonicalLibraryCancelPendingOpen(st);
+  var prof = { templateId: templateId, status: 'loading', program: null, error: null, expanded: (typeof opts.expanded === 'number') ? opts.expanded : -1, reviewMi: -1, reviewSi: -1 };
+  st.view = 'profile';
+  st.profile = prof;
+  st.openError = null;
+  st.scrollTarget = { top: true };
+  planCanonicalLibraryRender();
+  var result;
+  try {
+    var editorCtx = st.ctx.buildEditorCtx();
+    result = await planReopenCanonicalTemplate(editorCtx.ownerUid, templateId, editorCtx);
+  } catch (err) {
+    result = planClassifyCanonicalReadError(err);
+  }
+  if (planCanonicalLibraryState !== st || st.profile !== prof) return result;
+  if (result && result.status === 'success' && result.editorState) {
+    prof.status = 'ready';
+    prof.program = result.editorState;
+    if (prof.expanded >= prof.program.microcycles.length) prof.expanded = -1;
+  } else {
+    prof.status = 'error';
+    prof.error = result;
+  }
+  if (st.view === 'profile') {
+    if (prof.expanded >= 0) st.scrollTarget = { selector: '[data-testid="profile-microcycle-toggle"][data-mi="' + prof.expanded + '"]', block: 'start' };
+    planCanonicalLibraryRender();
+  }
+  return result;
+}
+// Cancels an Edit Template open that is still reading (see
+// planCanonicalLibraryHandleOpen's openSeq check).
+function planCanonicalLibraryCancelPendingOpen(st) {
+  if (st && st.openingTemplateId) {
+    st.openSeq = (st.openSeq || 0) + 1;
+    st.openingTemplateId = null;
+  }
+}
+function planCanonicalLibraryBackToList() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryBackToList');
+  var st = planCanonicalLibraryState;
+  planCanonicalLibraryCancelPendingOpen(st);
+  var tid = st.profile ? st.profile.templateId : null;
+  st.view = 'list';
+  st.profile = null;
+  st.openError = null;
+  st.scrollTarget = tid ? { selector: '[data-testid="library-open-btn"][data-template-id="' + String(tid).replace(/"/g, '\\"') + '"]', block: 'center', focus: true } : { top: true };
+  planCanonicalLibraryRender();
+}
+function planCanonicalLibraryToggleProfileMicrocycle(mi) {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryToggleProfileMicrocycle');
+  var st = planCanonicalLibraryState;
+  if (!st.profile) return;
+  st.profile.expanded = st.profile.expanded === mi ? -1 : mi;
+  st.scrollTarget = { selector: '[data-testid="profile-microcycle-toggle"][data-mi="' + mi + '"]', block: 'nearest', focus: true };
+  planCanonicalLibraryRender();
+}
+function planCanonicalLibraryOpenReview(mi, si) {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryOpenReview');
+  var st = planCanonicalLibraryState;
+  var prof = st.profile;
+  if (!prof || !prof.program || !prof.program.microcycles[mi] || !prof.program.microcycles[mi].sessions[si]) return;
+  planCanonicalLibraryCancelPendingOpen(st);
+  prof.reviewMi = mi; prof.reviewSi = si;
+  st.view = 'review';
+  st.scrollTarget = { top: true };
+  planCanonicalLibraryRender();
+}
+// Back from the read-only session: the Profile, with the same microcycle
+// still expanded and the session row in view.
+function planCanonicalLibraryBackToProfile() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryBackToProfile');
+  var st = planCanonicalLibraryState;
+  var prof = st.profile;
+  if (!prof) return planCanonicalLibraryBackToList();
+  st.view = 'profile';
+  prof.expanded = prof.reviewMi >= 0 ? prof.reviewMi : prof.expanded;
+  st.scrollTarget = (prof.reviewMi >= 0 && prof.reviewSi >= 0)
+    ? { selector: '[data-testid="profile-session-row"][data-mi="' + prof.reviewMi + '"][data-si="' + prof.reviewSi + '"]', block: 'center', focus: true }
+    : null;
+  planCanonicalLibraryRender();
+}
+// Edit Template: the existing open-for-editing path (recovery check,
+// verified read, editor mount). The editor remembers to come back here.
+async function planCanonicalLibraryEditFromProfile() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryEditFromProfile');
+  var st = planCanonicalLibraryState;
+  var prof = st.profile;
+  if (!prof) return { status: 'ignored', reason: 'noProfile' };
+  var templateId = prof.templateId;
+  var expanded = prof.expanded;
+  var result = await planCanonicalLibraryHandleOpen(templateId);
+  if (result && result.status === 'success' && planCanonicalEditorState && !planCanonicalEditorState.recoveryChecking) {
+    planCanonicalEditorState.returnTo = { view: 'profile', templateId: templateId, expanded: expanded };
+  }
+  return result;
+}
+function planCanonicalLibraryStartFromProfile() {
+  planCanonicalLibraryRequireBooted('planCanonicalLibraryStartFromProfile');
+  var prof = planCanonicalLibraryState.profile;
+  if (!prof) return;
+  planCanonicalLibraryCancelPendingOpen(planCanonicalLibraryState);
+  planCanonicalLibraryRender();
+  return planRunStartOpen(prof.templateId);
+}
+function planCanonicalLibraryRetryProfile() {
+  var prof = planCanonicalLibraryState && planCanonicalLibraryState.profile;
+  if (!prof) return;
+  return planCanonicalLibraryOpenProfile(prof.templateId, { expanded: prof.expanded });
+}
+
+function planCanonicalLibraryProfileHtml(st) {
+  var prof = st.profile;
+  var head = '<div class="pl-screen" data-testid="plan-profile">' + planCanonicalLibraryBarHtml('planCanonicalLibraryBackToList()', 'profile-back-btn', 'Program Profile') + '<div class="pl-main">';
+  var tail = '</div></div>';
+  if (prof.status === 'loading') return head + '<p class="pl-note" data-testid="profile-loading">Loading program...</p>' + tail;
+  if (prof.status === 'error') {
+    return head + '<div class="pl-status pl-status-error" data-testid="profile-error">' + escapeHtml(planCanonicalLibraryOutcomeLabel(prof.error) || 'Could not open this Program') +
+      (prof.error && prof.error.error && prof.error.error.message ? ' -- ' + escapeHtml(prof.error.error.message) : '') + '</div>' +
+      '<div class="pl-actions"><button type="button" class="pl-btn" data-testid="profile-retry-btn" onclick="planCanonicalLibraryRetryProfile()">Retry</button></div>' + tail;
+  }
+  var p = prof.program;
+  var opening = st.openingTemplateId === prof.templateId;
+  var openErrorHtml = st.openError
+    ? '<div class="pl-status pl-status-error" data-testid="library-open-error">' + escapeHtml(planCanonicalLibraryOutcomeLabel(st.openError)) +
+      (st.openError.error && st.openError.error.message ? ' -- ' + escapeHtml(st.openError.error.message) : '') + '</div>'
+    : '';
+  var weeks = p.microcycles.map(function (mc, mi) {
+    var open = prof.expanded === mi;
+    var html = '<div class="pl-entry' + (open ? ' pl-entry-open' : '') + '">' +
+      planUiRow(' data-testid="profile-microcycle-toggle"' + planCanonicalEditorIdxAttrs(mi) + ' aria-expanded="' + open + '" onclick="planCanonicalLibraryToggleProfileMicrocycle(' + mi + ')"',
+        mc.name || ('Microcycle ' + (mi + 1)), escapeHtml(planUiCount((mc.sessions || []).length, 'session')), open ? '&#8963;' : '&#8964;');
+    if (open) {
+      html += '<div class="pl-review-sessions" data-testid="profile-sessions"' + planCanonicalEditorIdxAttrs(mi) + '>' +
+        ((mc.sessions || []).length ? mc.sessions.map(function (s, si) {
+          var preview = (s.exercises || []).filter(function (e) { return e.exerciseId; }).slice(0, 3).map(function (e) { return planCanonicalGetExerciseName(e.exerciseId); });
+          return planUiRow(' data-testid="profile-session-row"' + planCanonicalEditorIdxAttrs(mi, si) + ' onclick="planCanonicalLibraryOpenReview(' + mi + ',' + si + ')"',
+            s.name || ('Session ' + (si + 1)), escapeHtml([planUiSessionSummary(s)].concat(preview).join(' · ')));
+        }).join('') : '<p class="pl-note">No sessions yet.</p>') +
+        '</div>';
+    }
+    return html + '</div>';
+  }).join('');
+  return head + openErrorHtml +
+    '<h2 class="pl-profile-name" data-testid="profile-name">' + escapeHtml(p.name || 'Untitled Program') + '</h2>' +
+    (p.description ? '<p class="pl-note" data-testid="profile-description">' + escapeHtml(p.description) + '</p>' : '') +
+    '<p class="pl-note" data-testid="profile-meta">' + escapeHtml(planUiProgramMeta(p)) + '</p>' +
+    '<div class="pl-profile-actions">' +
+    '<button type="button" class="pl-btn pl-btn-start" data-testid="profile-start-btn" onclick="planCanonicalLibraryStartFromProfile()">Start on Train</button>' +
+    '<button type="button" class="pl-btn" data-testid="profile-edit-btn" ' + (opening ? 'disabled' : '') + ' onclick="planCanonicalLibraryEditFromProfile()">' + (opening ? 'Opening...' : 'Edit Template') + '</button>' +
+    '</div>' +
+    (p.notes ? '<h3 class="pl-h">Program notes</h3><p class="pl-note" data-testid="profile-notes">' + escapeHtml(p.notes) + '</p>' : '') +
+    '<h3 class="pl-h">Program structure</h3>' +
+    (weeks ? '<div class="pl-rows">' + weeks + '</div>' : '<p class="pl-note">No microcycles yet.</p>') +
+    tail;
+}
+
+function planCanonicalLibraryReviewHtml(st) {
+  var prof = st.profile, p = prof.program;
+  var mc = p.microcycles[prof.reviewMi], s = mc.sessions[prof.reviewSi];
+  var exHtml = (s.exercises || []).map(function (ex, ei) {
+    var wl = planUiWorkingLoadEligible(ex);
+    var prog = planUiProgressionShort(ex);
+    return '<section class="pl-entry pl-read-ex" data-testid="review-exercise"' + planCanonicalEditorIdxAttrs(prof.reviewMi, prof.reviewSi, ei) + '>' +
+      '<h3>' + escapeHtml(ex.exerciseId ? planCanonicalGetExerciseName(ex.exerciseId) : 'Unselected exercise') + '</h3>' +
+      (prog ? '<p class="pl-note" data-testid="review-progression">Progression: ' + escapeHtml(prog) + '</p>' : '') +
+      (ex.notes ? '<p class="pl-note">' + escapeHtml(ex.notes) + '</p>' : '') +
+      ((ex.sets || []).length
+        ? '<ol class="pl-read-sets">' + ex.sets.map(function (set, i) {
+            return '<li data-testid="review-set"><span class="pl-setnum">' + (i + 1) + '</span>' + escapeHtml(planUiSetText(set, wl)) +
+              (set.notes && set.notes.trim() ? '<p class="pl-note">' + escapeHtml(set.notes) + '</p>' : '') + '</li>';
+          }).join('') + '</ol>'
+        : '<p class="pl-note">No sets prescribed.</p>') +
+      '</section>';
+  }).join('');
+  return '<div class="pl-screen" data-testid="plan-review">' +
+    planCanonicalLibraryBarHtml('planCanonicalLibraryBackToProfile()', 'review-back-btn', s.name || ('Session ' + (prof.reviewSi + 1))) +
+    '<div class="pl-main">' +
+    '<p class="pl-context">' + escapeHtml((p.name || 'Untitled Program') + ' / ' + (mc.name || ('Microcycle ' + (prof.reviewMi + 1)))) + '</p>' +
+    '<p class="pl-note" data-testid="review-summary">' + escapeHtml(planUiSessionSummary(s)) + '</p>' +
+    (s.notes ? '<h3 class="pl-h">Session notes</h3><p class="pl-note" data-testid="review-session-notes">' + escapeHtml(s.notes) + '</p>' : '') +
+    '<h3 class="pl-h">Prescriptions</h3>' +
+    (exHtml ? '<div class="pl-rows">' + exHtml + '</div>' : '<p class="pl-note">No exercise prescriptions yet.</p>') +
+    '</div></div>';
 }
 
 // ---- planCanonicalOwnsPageProgramsView() ----
