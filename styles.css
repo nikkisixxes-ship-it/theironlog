@@ -2368,3 +2368,17 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
   .pl-title { font-size: 19px; }
   .pl-save { font-size: 13px; padding: 7px 8px; }
 }
+
+/* ===== TRAIN Session Preview (before the logger) ===== */
+#page-run-session-preview .rsp-list { padding: 0 16px 24px; }
+#page-run-session-preview .rsp-ex { padding: 6px 0 6px; border-bottom: 1px solid var(--border); }
+#page-run-session-preview .rsp-ex:first-child { padding-top: 4px; }
+#page-run-session-preview .rsp-ex-name { font-family: var(--font-body); font-size: 19px; font-weight: 600; line-height: 1.25; color: var(--text); margin-bottom: 4px; overflow-wrap: anywhere; }
+#page-run-session-preview .rsp-set { font-size: 16px; line-height: 1.5; color: var(--text2); padding-left: 2px; }
+/* Buttons match the Workout Logger's Add Exercise / Finish Workout. */
+#page-run-session-preview .rsp-actions { display: flex; gap: 12px; padding: 14px 16px 12px; }
+#page-run-session-preview .rsp-actions .btn { flex: 1 1 0; justify-content: center; min-height: 48px; padding: 13px 12px; font-size: 16px; border-radius: 2px; background: #121212; color: var(--text2); }
+#page-run-session-preview .rsp-actions .rsp-back { border: 1px solid #5C5C5C; }
+#page-run-session-preview .rsp-actions .rsp-back:only-child { flex: 0 0 calc(50% - 6px); margin-left: auto; }
+#page-run-session-preview .rsp-actions .rsp-open { border: 1px solid #FF6A00; }
+#page-run-session-preview .rsp-actions .btn:focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; }

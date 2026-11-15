@@ -1243,18 +1243,30 @@ function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRul
   var blockedByEnd = occInProgress && typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId);
   var canOpenLogger = occInProgress && !blockedByEnd;
   var html = '<div class="page-title-zone"><div class="page-title-zone-title">' + escapeHtml(planRunUiFormatOccurrenceName(occurrence.nameSnapshot, 'Session Preview')) + '</div></div>';
+  // One action row directly below the session title, above the exercise
+  // list, so both are visible on first load: Start Workout (when available)
+  // on the left, Back on the right. Written in that same order so keyboard
+  // focus order matches what is seen. Same data-planrun-action values as
+  // before, so Start Workout (formerly "Open Logger") and Back do exactly
+  // what they did.
+  html += '<div class="rsp-actions" data-testid="planrun-preview-actions">';
+  if (canOpenLogger) {
+    html += '<button type="button" class="btn rsp-open" data-testid="planrun-open-logger-btn" data-planrun-action="open-logger">Start Workout</button>';
+  }
+  html += '<button type="button" class="btn rsp-back" data-testid="planrun-preview-back-btn" data-planrun-action="back">Back</button>';
+  html += '</div>';
   if (blockedByEnd) {
     html += '<div data-testid="planrun-open-logger-blocked" style="padding:0 16px 8px;color:var(--text2);font-size:13px">This Program Run is being ended — the logger is unavailable until that finishes.</div>';
   } else {
-    html += canOpenLogger
-      ? '<div style="padding:0 16px 8px;color:var(--text2);font-size:13px">Open the logger to record this Session.</div>'
-      : '<div style="padding:0 16px 8px;color:var(--text2);font-size:13px">Read-only preview — no changes are saved from this screen.</div>';
+    // TRAIN SESSION PREVIEW LAYOUT: the "Open the logger to record this
+    // Session." line is removed; the read-only note is unchanged.
+    if (!canOpenLogger) html += '<div style="padding:0 16px 8px;color:var(--text2);font-size:13px">Read-only preview — no changes are saved from this screen.</div>';
   }
-  html += '<div style="padding:0 16px 16px">';
+  html += '<div class="rsp-list" data-testid="planrun-preview-list">';
   (occurrence.assignments || []).forEach(function (a) {
     var effectiveExerciseId = planRunUiPreviewEffectiveExerciseId(a, seriesValuesByRuleId);
     var exName = (typeof planCanonicalGetExerciseName === 'function') ? planCanonicalGetExerciseName(effectiveExerciseId) : effectiveExerciseId;
-    html += '<div style="margin-bottom:12px" data-testid="planrun-preview-exercise" data-exercise-id="' + escapeHtml(effectiveExerciseId) + '"><div style="font-weight:600;margin-bottom:4px">' + escapeHtml(exName) + '</div>';
+    html += '<div class="rsp-ex" data-testid="planrun-preview-exercise" data-exercise-id="' + escapeHtml(effectiveExerciseId) + '"><div class="rsp-ex-name">' + escapeHtml(exName) + '</div>';
     (a.orderedSets || []).forEach(function (s) {
       // planFormatSetSummary is the existing, UNMODIFIED descriptive-text
       // formatter (app-plan.js) -- it needs only the prescribed sub-object
@@ -1265,15 +1277,11 @@ function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRul
       // fabricate a numeric value. Disclosed as a stopped-and-reported gap
       // in the implementation report, not guessed at here.
       var summary = (typeof planFormatSetSummary === 'function') ? planFormatSetSummary(s.prescribed, false, false) : '';
-      html += '<div style="font-size:13px;color:var(--text2);padding-left:8px">' + escapeHtml(summary) + '</div>';
+      html += '<div class="rsp-set">' + escapeHtml(summary) + '</div>';
     });
     html += '</div>';
   });
   html += '</div>';
-  html += '<div style="padding:0 16px 24px">';
-  if (canOpenLogger) {
-    html += '<button class="btn-primary" data-testid="planrun-open-logger-btn" data-planrun-action="open-logger">Open Logger</button> ';
-  }
-  html += '<button class="btn-secondary" data-planrun-action="back">Back</button></div>';
+
   container.innerHTML = html;
 }
