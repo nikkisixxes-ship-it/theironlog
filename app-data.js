@@ -523,7 +523,7 @@ function showToast(msg, type='') {
   setTimeout(() => t.className = '', 2500);
 }
 
-function confirm2(title, msg, cb, acceptLabel='Delete', danger=true, onReject, showCancel=true) {
+function confirm2(title, msg, cb, acceptLabel='Delete', danger=true, onReject, showCancel=true, cancelLabel='Cancel') {
   document.getElementById('confirm-title').textContent = title;
   document.getElementById('confirm-msg').textContent = msg;
   const acceptBtn = document.getElementById('confirm-accept-btn');
@@ -532,7 +532,12 @@ function confirm2(title, msg, cb, acceptLabel='Delete', danger=true, onReject, s
   // Reset on every invocation -- an OK-only informational dialog must never
   // leave Cancel hidden for a later, ordinary confirmation.
   const cancelBtn = document.querySelector('#confirm-overlay .btns .btn-secondary');
-  if (cancelBtn) cancelBtn.style.display = showCancel ? '' : 'none';
+  if (cancelBtn) {
+    cancelBtn.style.display = showCancel ? '' : 'none';
+    // Optional label (e.g. PLAN's "Keep Editing"); reset every time so other
+    // confirmations keep "Cancel".
+    cancelBtn.textContent = cancelLabel;
+  }
   confirmCallback = cb;
   confirmRejectCallback = onReject || null;
   document.getElementById('confirm-overlay').classList.add('open');

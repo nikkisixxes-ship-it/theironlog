@@ -698,6 +698,9 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 #confirm-box h3 { font-family: var(--font-display); font-size: 20px; font-weight: 800; text-transform: uppercase; margin-bottom: 8px; }
 #confirm-box p { font-size: 15px; color: var(--text2); margin-bottom: 20px; line-height: 1.5; }
 #confirm-box .btns { display: flex; gap: 10px; }
+/* Longer button labels (e.g. PLAN's "Discard Changes") wrap inside the
+   button instead of running past the dialog edge. */
+#confirm-box .btns .btn { min-width: 0; white-space: normal; justify-content: center; text-align: center; line-height: 1.2; }
 
 /* Copy output */
 .copy-output { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; font-size: 14px; line-height: 1.7; white-space: pre-wrap; font-family: monospace; color: var(--text); max-height: 300px; overflow-y: auto; }
@@ -2382,3 +2385,6 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 #page-run-session-preview .rsp-actions .rsp-back:only-child { flex: 0 0 calc(50% - 6px); margin-left: auto; }
 #page-run-session-preview .rsp-actions .rsp-open { border: 1px solid #FF6A00; }
 #page-run-session-preview .rsp-actions .btn:focus-visible { outline: 2px solid var(--accent2); outline-offset: 2px; }
+
+/* PLAN: Gateway set needs a new selection */
+.pl-note.pl-note-warn { color: #ffb3ab; font-weight: 600; }

@@ -746,8 +746,12 @@ function planProgressionSummaryText(ex) {
   const sets = ex.sets || [];
   let gatewayIdx = prog.gatewaySetIndex || 0;
   if (gatewayIdx < 0 || gatewayIdx >= sets.length) gatewayIdx = 0;
+  // GATEWAY SET IDENTITY: a selection the PLAN editor cleared (null, after
+  // its Gateway set was removed) is shown as needing a choice -- never as a
+  // silent Set 1. Saved data never holds null, so stored rules are unaffected.
+  const gatewayCleared = prog.gatewaySetIndex === null;
   const evalLabel = prog.evaluationType === 'volume' ? 'Volume Total'
-    : prog.evaluationType === 'gateway' ? `Gateway Set ${gatewayIdx + 1}`
+    : prog.evaluationType === 'gateway' ? (gatewayCleared ? 'Gateway Set: select a new set' : `Gateway Set ${gatewayIdx + 1}`)
     : 'Strict Match';
 
   if (prog.adjustmentType === 'increaseTM') {
@@ -9159,7 +9163,26 @@ function planCanonicalAdaptStructure(source, carryIds) {
 // planEnsureDraftIdentities's job, called by the orchestration layer below,
 // never here.
 function planAdaptEditorStateToCanonicalDraft(editorState) {
-  return planCanonicalAdaptStructure(editorState, true);
+  var draft = planCanonicalAdaptStructure(editorState, true);
+  // GATEWAY SET IDENTITY (save direction only): an editor-only cleared
+  // Gateway selection (null in the editor; '' after the adapter) on a rule
+  // that does not use Gateway is written as the existing default
+  // (PLAN_CANONICAL_PROGRESSION_DEFAULTS.gatewaySetIndex) -- exactly what
+  // was stored before this change, and the whole number TRAIN requires on
+  // every rule. A Gateway rule with no selection never gets here
+  // (planCanonicalEditorValidateBeforeSave blocks the save). Reopening is
+  // untouched.
+  (draft.microcycles || []).forEach(function (mc) {
+    (mc.sessions || []).forEach(function (s) {
+      (s.exercises || []).forEach(function (ex) {
+        var p = ex && ex.progression;
+        if (p && (p.gatewaySetIndex === '' || p.gatewaySetIndex === null || p.gatewaySetIndex === undefined) && !(p.enabled && p.evaluationType === 'gateway')) {
+          p.gatewaySetIndex = PLAN_CANONICAL_PROGRESSION_DEFAULTS.gatewaySetIndex;
+        }
+      });
+    });
+  });
+  return draft;
 }
 
 // ---- planAdaptCanonicalDraftToEditorState(draft) ----
@@ -11454,17 +11477,14 @@ function planCanonicalEditorHandleRemoveSet(mi, si, ei, seti) {
     return;
   }
   ex.sets.splice(seti, 1);
-  // Integrity housekeeping, not new progression-evaluation behavior: a
-  // gateway index that pointed past the end of the (now shorter) sets array
-  // is clamped back into range, mirroring the legacy editor's own
-  // gatewayIdx clamp ("if (gatewayIdx < 0 || gatewayIdx >= sets.length)
-  // gatewayIdx = 0", app-plan.js ~line 772) -- never called from here, just
-  // the same clamp idea applied to this module's own state.
-  if (ex.progression && (ex.progression.gatewaySetIndex === null || ex.progression.gatewaySetIndex === undefined || ex.progression.gatewaySetIndex >= ex.sets.length || ex.progression.gatewaySetIndex < 0)) {
-    ex.progression.gatewaySetIndex = 0;
-  }
+  // GATEWAY SET IDENTITY: the Gateway stays tied to the same prescribed set.
+  // Removing a set before it shifts it down one; removing the Gateway set
+  // itself clears the selection (never silently moving it to another set).
+  var gatewayCleared = planGatewayRemapAfterRemove(ex, seti);
   planCanonicalEditorPruneDuplicationLineage(planCanonicalEditorState.editorState);
-  planCanonicalEditorState.validationMessage = null;
+  planCanonicalEditorState.validationMessage = (gatewayCleared && planGatewayNeedsSelection(ex))
+    ? 'Set ' + (seti + 1) + ' was the Gateway set for ' + planGatewayExerciseName(ex) + '. Select a new Gateway set.'
+    : null;
   planCanonicalEditorRender();
 }
 
@@ -11512,7 +11532,46 @@ function planCanonicalEditorHandleMoveSet(mi, si, ei, seti, delta) {
   var target = seti + delta;
   if (target < 0 || target >= ex.sets.length) return;
   planCanonicalEditorSwap(ex.sets, seti, target);
+  planGatewayRemapAfterSwap(ex, seti, target);
   planCanonicalEditorRender();
+}
+
+// ---- GATEWAY SET IDENTITY helpers ----
+// The saved format stores the Gateway as the set's position
+// (progression.gatewaySetIndex, 0-based) -- that already represents the
+// right set as long as the editor keeps the number in step with the set it
+// names while sets are removed or reordered. These helpers do exactly that.
+// A cleared selection is null in the draft only; it is never saved for a
+// Gateway rule (blocked before save) and is written as the existing
+// default 0 for any other rule (planAdaptEditorStateToCanonicalDraft).
+function planGatewayIsValidIndex(ex) {
+  var g = ex && ex.progression ? ex.progression.gatewaySetIndex : null;
+  return typeof g === 'number' && Number.isInteger(g) && g >= 0 && Array.isArray(ex.sets) && g < ex.sets.length;
+}
+function planGatewayNeedsSelection(ex) {
+  var prog = ex && ex.progression;
+  return !!(prog && prog.enabled && prog.evaluationType === 'gateway' && !planGatewayIsValidIndex(ex));
+}
+function planGatewayExerciseName(ex) {
+  var e = ex && ex.exerciseId && typeof getExercise === 'function' ? getExercise(ex.exerciseId) : null;
+  return (e && e.name) || 'this exercise';
+}
+// Returns true when the removed set WAS the Gateway (selection cleared).
+function planGatewayRemapAfterRemove(ex, removedIdx) {
+  var prog = ex && ex.progression;
+  if (!prog) return false;
+  var g = prog.gatewaySetIndex;
+  if (typeof g !== 'number' || !Number.isInteger(g)) return false;
+  if (g === removedIdx) { prog.gatewaySetIndex = null; return true; }
+  if (g > removedIdx) prog.gatewaySetIndex = g - 1;
+  if (!planGatewayIsValidIndex(ex)) prog.gatewaySetIndex = null;
+  return false;
+}
+function planGatewayRemapAfterSwap(ex, a, b) {
+  var prog = ex && ex.progression;
+  if (!prog) return;
+  if (prog.gatewaySetIndex === a) prog.gatewaySetIndex = b;
+  else if (prog.gatewaySetIndex === b) prog.gatewaySetIndex = a;
 }
 
 // ---- planCanonicalEditorValidateBeforeSave(es) ----
@@ -11549,6 +11608,19 @@ function planCanonicalEditorValidateBeforeSave(es) {
         }
         if (!Array.isArray(ex.sets) || ex.sets.length === 0) {
           return 'Every exercise needs at least one set before saving (Microcycle ' + (mi + 1) + ', Session ' + (si + 1) + ').';
+        }
+      }
+    }
+  }
+  // GATEWAY SET IDENTITY: while Gateway is the selected evaluation rule, a
+  // valid Gateway set is required. Resolve by selecting a set, or by
+  // changing or turning off the rule.
+  for (var gmi = 0; gmi < es.microcycles.length; gmi++) {
+    for (var gsi = 0; gsi < es.microcycles[gmi].sessions.length; gsi++) {
+      var gexs = es.microcycles[gmi].sessions[gsi].exercises;
+      for (var gei = 0; gei < gexs.length; gei++) {
+        if (planGatewayNeedsSelection(gexs[gei])) {
+          return 'Select a new Gateway set for ' + planGatewayExerciseName(gexs[gei]) + ' (Microcycle ' + (gmi + 1) + ', Session ' + (gsi + 1) + ') before saving -- or change or turn off its Progression rule.';
         }
       }
     }
@@ -11707,6 +11779,10 @@ async function planCanonicalEditorApplySaveResult(st, result, perf) {
   }
 
   if ((result.status === 'success' || result.status === 'alreadyCommitted') && result.draft && typeof result.draft.planTemplateId === 'string' && result.draft.planTemplateId) {
+    // UNSAVED-CHANGES PROMPT: the draft on screen is now saved -- it becomes
+    // the clean baseline (a successful follow-up reopen replaces it with the
+    // reopened copy, which re-baselines on the next render).
+    planUiDraftMarkClean(st);
     st.lastSavedTemplateId = result.draft.planTemplateId;
     st.reopenTemplateIdInput = result.draft.planTemplateId;
     st.savePhase = 'verifyingReopen';
@@ -12277,6 +12353,14 @@ async function planCanonicalEditorHandleReopen(templateId) {
     planCanonicalEditorRender();
   }
 }
+function planUiReopenFromMore(lastSaved) {
+  planCanonicalEditorRequireBooted('planUiReopenFromMore');
+  var st = planCanonicalEditorState;
+  var run = function () { return lastSaved ? planCanonicalEditorHandleReopenLastSaved() : planCanonicalEditorHandleReopen(); };
+  var tid = lastSaved ? st.lastSavedTemplateId : st.reopenTemplateIdInput;
+  if (!tid) return run();
+  return planUiConfirmDiscardThen(run);
+}
 function planCanonicalEditorHandleReopenLastSaved() {
   planCanonicalEditorRequireBooted('planCanonicalEditorHandleReopenLastSaved');
   return planCanonicalEditorHandleReopen(planCanonicalEditorState.lastSavedTemplateId);
@@ -12715,7 +12799,62 @@ function planUiEditorBack() {
   if (nav.screen === 'microcycle') return planCanonicalEditorNavBackToProgram();
   return planUiLeaveEditor();
 }
+// =============================================================================
+// UNSAVED-CHANGES PROMPT
+// A draft is "changed" when its content differs from the baseline: the
+// draft as it was opened (new blank program, Edit Template, Reopen) or as it
+// was last successfully saved. The baseline is a fingerprint of the editor's
+// content only -- navigation, the expanded exercise, the open set, Program
+// details / More options disclosure and the Reopen input all live outside
+// editorState (st.nav / st), and internal bookkeeping fields (leading "_")
+// are skipped, so moving around the editor never marks it changed.
+// Actions that would discard or replace a changed draft ask first, using
+// the app's existing confirmation dialog: Keep Editing (nothing happens)
+// or Discard Changes (the requested action continues). Existing save
+// safeguards come first: while a save is running, unconfirmed or being
+// checked, those actions keep their current blocked behavior and no prompt
+// is shown. Switching tabs already keeps the draft, so it never prompts.
+// =============================================================================
+function planUiDraftFingerprint(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value === undefined ? null : value);
+  if (Array.isArray(value)) return '[' + value.map(planUiDraftFingerprint).join(',') + ']';
+  return '{' + Object.keys(value).filter(function (k) { return k.charAt(0) !== '_' && value[k] !== undefined && typeof value[k] !== 'function'; }).sort()
+    .map(function (k) { return JSON.stringify(k) + ':' + planUiDraftFingerprint(value[k]); }).join(',') + '}';
+}
+function planUiDraftMarkClean(st) {
+  if (!st || !st.editorState) return;
+  st._draftBaselineFor = st.editorState;
+  st._draftBaseline = planUiDraftFingerprint(st.editorState);
+}
+function planUiDraftSyncBaseline(st) {
+  if (st && st.editorState && st._draftBaselineFor !== st.editorState) planUiDraftMarkClean(st);
+}
+function planUiDraftIsChanged(st) {
+  if (!st || !st.editorState) return false;
+  planUiDraftSyncBaseline(st);
+  return planUiDraftFingerprint(st.editorState) !== st._draftBaseline;
+}
+// Runs proceed() now, or after Discard Changes. Returns
+// { status: 'needsConfirmation' } while the dialog is open.
+function planUiConfirmDiscardThen(proceed) {
+  var st = planCanonicalEditorState;
+  if (!st || !planCanonicalEditorIsSafeToLeave() || !planUiDraftIsChanged(st) || typeof confirm2 !== 'function') return proceed();
+  var token = {};
+  st._discardPrompt = token;
+  confirm2('Unsaved changes', 'This program has changes that haven’t been saved. Discard them?', function () {
+    if (planCanonicalEditorState !== st || st._discardPrompt !== token) return;
+    st._discardPrompt = null;
+    proceed();
+  }, 'Discard Changes', true, function () {
+    if (st._discardPrompt === token) st._discardPrompt = null;
+  }, true, 'Keep Editing');
+  return { status: 'needsConfirmation' };
+}
+
 function planUiLeaveEditor() {
+  return planUiConfirmDiscardThen(planUiLeaveEditorNow);
+}
+function planUiLeaveEditorNow() {
   var st = planCanonicalEditorState;
   var returnTo = st && st.returnTo ? st.returnTo : null;
   var result = planCanonicalEditorHandleBackToPrograms();
@@ -12733,6 +12872,9 @@ function planUiLeaveEditor() {
 // was not opened from any Profile, so Back from it returns to the Library.
 function planUiNewBlank() {
   planCanonicalEditorRequireBooted('planUiNewBlank');
+  return planUiConfirmDiscardThen(planUiNewBlankNow);
+}
+function planUiNewBlankNow() {
   var st = planCanonicalEditorState;
   var before = st.editorState;
   planCanonicalEditorHandleNew();
@@ -12895,6 +13037,9 @@ function planOpenCanonicalEditorFromPlanNavigation() {
 function planCanonicalEditorRender() {
   if (typeof document === 'undefined') return;
   if (!planCanonicalEditorState) return;
+  // UNSAVED-CHANGES PROMPT: a newly opened/replaced draft becomes the
+  // clean baseline the first time it is shown.
+  planUiDraftSyncBaseline(planCanonicalEditorState);
   var root = document.getElementById(PLAN_CANONICAL_EDITOR_CONTAINER_ID);
   if (!root) {
     root = document.createElement('div');
@@ -13044,9 +13189,14 @@ function planCanonicalEditorRender() {
     }
     var call = function (field) { return 'planCanonicalEditorHandleSetProgressionField(' + mi + ',' + si + ',' + ei + ',\'' + field + '\',this.value)'; };
     var setCount = ex.sets.length;
-    var gatewayOptions = ex.sets.map(function (s, i) { return '<option value="' + i + '" ' + (prog.gatewaySetIndex === i ? 'selected' : '') + '>Set ' + (i + 1) + '</option>'; }).join('');
-    var gwIdx = (typeof prog.gatewaySetIndex === 'number' && prog.gatewaySetIndex >= 0 && prog.gatewaySetIndex < setCount) ? prog.gatewaySetIndex : 0;
-    var gatewayNote = setCount ? '<p class="pl-note" data-testid="progression-gateway-set-summary">Set ' + (gwIdx + 1) + ' · ' + escapeHtml(planUiSetText(ex.sets[gwIdx], planUiWorkingLoadEligible(ex))) + '</p>' : '';
+    // GATEWAY SET IDENTITY: a cleared selection shows a "Select a set"
+    // placeholder and an actionable note -- never a silent Set 1.
+    var gwValid = planGatewayIsValidIndex(ex);
+    var gatewayOptions = (gwValid ? '' : '<option value="" selected disabled>Select a set</option>') +
+      ex.sets.map(function (s, i) { return '<option value="' + i + '" ' + (gwValid && prog.gatewaySetIndex === i ? 'selected' : '') + '>Set ' + (i + 1) + '</option>'; }).join('');
+    var gatewayNote = !setCount ? '' : gwValid
+      ? '<p class="pl-note" data-testid="progression-gateway-set-summary">Set ' + (prog.gatewaySetIndex + 1) + ' · ' + escapeHtml(planUiSetText(ex.sets[prog.gatewaySetIndex], planUiWorkingLoadEligible(ex))) + '</p>'
+      : '<p class="pl-note pl-note-warn" role="alert" data-testid="progression-gateway-needs-selection">Select a new Gateway set.</p>';
     var evalLabels = { strict: 'Strict Match', volume: 'Volume Total', gateway: 'Gateway Set' };
     return '<div class="pl-prog pl-fields" data-testid="progression-panel"' + idx + '>' +
       '<p class="pl-note" data-testid="progression-summary">' + escapeHtml(planUiProgressionShort(ex) || 'On') + '</p>' +
@@ -13225,8 +13375,8 @@ function planCanonicalEditorRender() {
       '<p class="pl-note">Replaces this draft with a new blank program. Unsaved changes here are discarded.</p>' +
       '<div class="pl-fields" data-testid="reopen-diagnostic-area">' +
       '<label class="pl-field"><span>Reopen Template Id (diagnostic)</span><input type="text" data-testid="reopen-template-id-input" ' + reopenLockedAttr + ' value="' + escapeHtml(st.reopenTemplateIdInput || '') + '" oninput="planCanonicalEditorState.reopenTemplateIdInput = this.value"></label>' +
-      '<div class="pl-actions"><button type="button" class="pl-btn" data-testid="reopen-btn" ' + reopenLockedAttr + ' onclick="planCanonicalEditorHandleReopen()">Reopen</button>' +
-      '<button type="button" class="pl-btn" data-testid="reopen-last-saved-btn" ' + (reopenLockedAttr || (!st.lastSavedTemplateId ? 'disabled' : '')) + ' onclick="planCanonicalEditorHandleReopenLastSaved()">Reopen Last Saved</button></div>' +
+      '<div class="pl-actions"><button type="button" class="pl-btn" data-testid="reopen-btn" ' + reopenLockedAttr + ' onclick="planUiReopenFromMore(false)">Reopen</button>' +
+      '<button type="button" class="pl-btn" data-testid="reopen-last-saved-btn" ' + (reopenLockedAttr || (!st.lastSavedTemplateId ? 'disabled' : '')) + ' onclick="planUiReopenFromMore(true)">Reopen Last Saved</button></div>' +
       '</div></div></details>';
 
   // ===========================================================================
@@ -13300,6 +13450,9 @@ function planCanonicalEditorRender() {
           '<h3 class="pl-h">Sets</h3>' +
           (setRows ? '<div class="pl-rows">' + setRows + '</div>' : '<p class="pl-note">No sets yet.</p>') +
           '<button type="button" class="pl-add" data-testid="add-set"' + eIdx + ' ' + lockedAttr + ' onclick="planUiAddSet(' + mi2 + ',' + si2 + ',' + ei + ')">+ Add Set</button>' +
+          // GATEWAY SET IDENTITY: next to the sets, where a removed Gateway set
+          // was just deleted -- the Progression row below opens the choice.
+          (planGatewayNeedsSelection(ex) ? '<p class="pl-note pl-note-warn" role="alert" data-testid="gateway-needs-selection-inline"' + eIdx + '>Select a new Gateway set: open Progression below.</p>' : '') +
           '<h3 class="pl-h">Progression</h3>' +
           '<div class="pl-rows" data-testid="progression-row"' + eIdx + '>' +
           planUiRow(' data-testid="open-progression"' + eIdx + ' onclick="planCanonicalEditorNavOpenProgression(' + mi2 + ',' + si2 + ',' + ei + ')"', 'Progression', escapeHtml(progOn ? planUiProgressionShort(ex) : 'Off')) +
