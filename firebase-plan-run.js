@@ -2552,6 +2552,21 @@
         ctx: { isSeries: pkg.stateKind === 'series', state: state, entry: entry, seriesId: pkg.stateKind === 'series' ? pkg.key : null, remainingOccurrenceIds: run.remainingOccurrenceIds, memberOccurrences: memberOccurrences, successIncrease: successIncrease }
       };
     }
+    // Compares what the lifter was shown with what the save would do, by
+    // VALUE. Field order is ignored: Firestore does not keep map keys in a
+    // stable order (a read inside a transaction can list the same fields in
+    // a different order than a normal read), so comparing JSON text made
+    // every approval look "changed" and nothing could be saved.
+    function frCanonicalJson(v) {
+      if (Array.isArray(v)) return '[' + v.map(function (x) { return x === undefined ? 'null' : frCanonicalJson(x); }).join(',') + ']';
+      if (v && typeof v === 'object') {
+        return '{' + Object.keys(v).filter(function (k) { return v[k] !== undefined; }).sort().map(function (k) {
+          return JSON.stringify(k) + ':' + frCanonicalJson(v[k]);
+        }).join(',') + '}';
+      }
+      return JSON.stringify(v);
+    }
+    function frSameEffects(a, b) { return frCanonicalJson(a) === frCanonicalJson(b); }
     function frPkgOk(pkg) {
       return M('planRunIsPlainObject')(pkg) && M('planRunIsId')(pkg.ownerUid) && M('planRunIsId')(pkg.planRunId) &&
         (pkg.stateKind === 'series' || pkg.stateKind === 'rule') && M('planRunIsId')(pkg.key) && M('planRunIsId')(pkg.decisionId);
@@ -2587,7 +2602,7 @@
           if (!M('planRunDecisionResponseValid')(c.entry.kind, pkg.response)) return { outcome: 'invalidInput', reason: 'responseDoesNotMatchDecision' };
           var plan = M('planRunDecisionPlanResponse')(c.ctx, pkg.response);
           if (!plan.ok) return { outcome: 'responseNotApplicable', reason: plan.reason, message: plan.message };
-          if (pkg.expectedEffects !== undefined && JSON.stringify(pkg.expectedEffects) !== JSON.stringify(plan.effects)) {
+          if (pkg.expectedEffects !== undefined && !frSameEffects(pkg.expectedEffects, plan.effects)) {
             return { outcome: 'changedSincePreview' };
           }
           var now = deps.timestamp();

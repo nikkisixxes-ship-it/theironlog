@@ -106,10 +106,13 @@ function planRunFailureUiOpenForRun(planRunId) {
     planRunFailureUi.phase = 'error'; planRunFailureUiRender();
   });
 }
-function planRunFailureUiOpenDecision(item) {
+// keepMessage (optional): a message to keep showing after the decision is
+// reloaded, e.g. why a save was refused -- otherwise it would be cleared and
+// the button would appear to do nothing.
+function planRunFailureUiOpenDecision(item, keepMessage) {
   var uid = planRunFailureUiUid();
   var epoch = ++planRunFailureUi.epoch;
-  planRunFailureUi.current = item; planRunFailureUi.phase = 'loading'; planRunFailureUi.mode = 'review'; planRunFailureUi.message = null;
+  planRunFailureUi.current = item; planRunFailureUi.phase = 'loading'; planRunFailureUi.mode = 'review'; planRunFailureUi.message = keepMessage || null;
   planRunFailureUi.other = null; planRunFailureUi.ctx = null;
   planRunFailureUiRender();
   Promise.resolve(fsPlanRunPersistence.fsPlanRunReadFailureDecisionContext({ ownerUid: uid, planRunId: planRunFailureUi.planRunId, stateKind: item.stateKind, key: item.key, decisionId: item.decision.decisionId })).then(function (r) {
@@ -188,8 +191,7 @@ function planRunFailureUiSend(op) {
       planRunFailureUi.phase = 'decided';
       planRunFailureUi.message = 'This was already decided (perhaps on another device). Nothing else was changed.';
     } else if (r && r.outcome === 'changedSincePreview') {
-      planRunFailureUi.message = 'This Program changed while you were deciding, so nothing was saved. Review the updated details and decide again.';
-      planRunFailureUiOpenDecision(cur);
+      planRunFailureUiOpenDecision(cur, 'This Program changed while you were deciding, so nothing was saved. Review the updated details and decide again.');
       return;
     } else if (r && r.outcome === 'responseNotApplicable') {
       planRunFailureUi.phase = 'decide';
