@@ -189,6 +189,7 @@ function planRunUiHandleHomeSectionClick(event) {
   else if (action === 'toggle-menu') { planRunUiToggleRunMenu(btn.getAttribute('data-planrun-run-id')); }
   // VISUAL-ALIGNMENT CORRECTION: the card's ••• opens the shared dropdown.
   else if (action === 'open-menu') { planRunUiOpenRunMenu(btn, btn.getAttribute('data-planrun-run-id')); }
+  else if (action === 'failure-decisions') { if (typeof planRunFailureUiOpenForRun === 'function') planRunFailureUiOpenForRun(btn.getAttribute('data-planrun-run-id')); }
 }
 function planRunUiWireHomeSectionEvents(el) {
   if (!el || el.__planRunUiWired) return;
@@ -200,6 +201,7 @@ function planRunUiHandlePreviewClick(event) {
   if (!btn) return;
   var action = btn.getAttribute('data-planrun-action');
   if (action === 'back') { if (typeof planRunTmDropGate === 'function') planRunTmDropGate(); showPage('page-home'); return; }
+  if (action === 'failure-decisions') { if (planRunUiLastPreviewRunOccurrence && typeof planRunFailureUiOpenForRun === 'function') planRunFailureUiOpenForRun(planRunUiLastPreviewRunOccurrence.run.planRunId); return; }
   if (action === 'open-logger') {
     // Hands the SAME already-verified run/occurrence this screen already
     // has (planRunUiLastPreviewRunOccurrence, stamped by
@@ -819,6 +821,16 @@ function planRunUiRenderRunCard(run, dotsHtml) {
     }
   }
   if (endHtml && !endIsPlainIdleButton) extra += endHtml;
+  // FAILURE RECOMMENDATIONS: a decision waiting after a miss.
+  if (typeof planRunFailureUiEnabled === 'function' && planRunFailureUiEnabled()) {
+    planRunFailureUiEnsureCount(run.planRunId, planRunUiListEpoch);
+    var frPending = planRunFailureUiPendingCount(run.planRunId);
+    if (frPending > 0) {
+      var frKindsPending = (typeof planRunFailureUiPendingKinds === 'function') ? planRunFailureUiPendingKinds(run.planRunId) : ['failure'];
+      var frBtnText = frKindsPending.length > 1 ? 'Decisions needed' : (frKindsPending[0] === 'success' ? 'Approve progression increase' : 'Decision needed after a miss');
+      extra += '<button type="button" class="btn fr-card-btn" data-testid="planrun-decision-needed" data-planrun-action="failure-decisions" data-planrun-run-id="' + runIdAttr + '">' + frBtnText + '</button>';
+    }
+  }
 
   var cardAttrs = 'data-testid="planrun-carousel-card" data-carousel-key="' + escapeHtml('run:' + run.planRunId) + '" data-planrun-run-id="' + runIdAttr + '"';
   if (action) {
@@ -1241,7 +1253,10 @@ function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRul
   // enforces this independently too; this is the rendered-control half of
   // that same guard.
   var blockedByEnd = occInProgress && typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId);
-  var canOpenLogger = occInProgress && !blockedByEnd;
+  // FAILURE RECOMMENDATIONS: a series waiting for the lifter's decision
+  // holds this Session until it is made.
+  var frPendingSeries = seriesValuesByRuleId ? Object.keys(seriesValuesByRuleId).map(function (k) { return seriesValuesByRuleId[k]; }).filter(function (v) { return v.pendingDecisionIds && v.pendingDecisionIds.length; }) : [];
+  var canOpenLogger = occInProgress && !blockedByEnd && !frPendingSeries.length;
   var html = '<div class="page-title-zone"><div class="page-title-zone-title">' + escapeHtml(planRunUiFormatOccurrenceName(occurrence.nameSnapshot, 'Session Preview')) + '</div></div>';
   // One action row directly below the session title, above the exercise
   // list, so both are visible on first load: Start Workout (when available)
@@ -1255,6 +1270,19 @@ function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRul
   }
   html += '<button type="button" class="btn rsp-back" data-testid="planrun-preview-back-btn" data-planrun-action="back">Back</button>';
   html += '</div>';
+  if (frPendingSeries.length) {
+    var frPd = (frPendingSeries[0].pendingDecisions || [])[0];
+    var frGateText;
+    if (frPd && frPd.kind === 'success') {
+      var frNoun = frPd.valueAtEvaluation.kind === 'trainingMax' ? 'Training Max' : 'Working Load';
+      frGateText = 'You passed the last Session of “' + escapeHtml(frPendingSeries[0].seriesName) + '”. Approve or decline the proposed increase before starting this Session.</p>' +
+        '<p data-testid="planrun-decision-gate-values">If you approve, this Session uses a ' + frNoun + ' of ' + escapeHtml(planRunFailureFormatValue(frPd.proposedValue)) + '. If you decline, it uses ' + escapeHtml(planRunFailureFormatValue(frPd.valueAtEvaluation)) + '.';
+    } else {
+      frGateText = 'Decide what to do after your last miss in “' + escapeHtml(frPendingSeries[0].seriesName) + '” before starting this Session.';
+    }
+    html += '<div class="fr-preview-gate" data-testid="planrun-decision-gate"><p>' + frGateText + '</p>' +
+      '<button type="button" class="btn fr-card-btn" data-testid="planrun-review-decision-btn" data-planrun-action="failure-decisions">Review decision</button></div>';
+  }
   if (blockedByEnd) {
     html += '<div data-testid="planrun-open-logger-blocked" style="padding:0 16px 8px;color:var(--text2);font-size:13px">This Program Run is being ended — the logger is unavailable until that finishes.</div>';
   } else {
@@ -1267,7 +1295,15 @@ function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRul
     var effectiveExerciseId = planRunUiPreviewEffectiveExerciseId(a, seriesValuesByRuleId);
     var exName = (typeof planCanonicalGetExerciseName === 'function') ? planCanonicalGetExerciseName(effectiveExerciseId) : effectiveExerciseId;
     html += '<div class="rsp-ex" data-testid="planrun-preview-exercise" data-exercise-id="' + escapeHtml(effectiveExerciseId) + '"><div class="rsp-ex-name">' + escapeHtml(exName) + '</div>';
-    (a.orderedSets || []).forEach(function (s) {
+    // FAILURE RECOMMENDATIONS: show what the logger will actually open.
+    var frSv = seriesValuesByRuleId && typeof planRunLoggerSeriesValueForAssignment === 'function' ? planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId) : null;
+    var frSets = (frSv && frSv.value.scheduleOverride) ? frSv.value.scheduleOverride.orderedSets : a.orderedSets;
+    if (frSv && frSv.value.scheduleOverride) html += '<div class="rsp-note" data-testid="planrun-preview-shifted" data-evaluation-type="' + escapeHtml(frSv.value.scheduleOverride.evaluation.evaluationType) + '" data-gateway-index="' + escapeHtml(String(frSv.value.scheduleOverride.evaluation.gatewaySetIndex)) + '">Moved here by your decision after a miss (originally planned for another Session) — ' + escapeHtml(planRunFailureEvaluationText(frSv.value.scheduleOverride.evaluation)) + '.</div>';
+    var frAdj = frSv ? (frSv.value.temporaryAdjustments || []).map(function (x) { return { a: x, t: 'this Session only' }; }).concat((frSv.value.loadAdjustments || []).map(function (x) { return { a: x, t: 'ongoing' }; })) : [];
+    frAdj.forEach(function (x) {
+      html += '<div class="rsp-note" data-testid="planrun-preview-reduction">Reduced ' + (x.a.target === 'trainingMax' ? 'Training Max' : 'working loads') + ' by ' + x.a.amount + (x.a.unit === '%' ? '%' : ' ' + x.a.unit) + ' (' + x.t + ').</div>';
+    });
+    (frSets || []).forEach(function (s) {
       // planFormatSetSummary is the existing, UNMODIFIED descriptive-text
       // formatter (app-plan.js) -- it needs only the prescribed sub-object
       // itself, no %TM/%1RM/working-load NUMERIC resolution. No canonical

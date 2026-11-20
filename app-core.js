@@ -4490,13 +4490,13 @@ function toggleHistoryCard(wid) {
   document.querySelectorAll('[id^="hist-expanded-"]').forEach(el => { el.style.display = 'none'; });
   document.querySelectorAll('[id^="hist-highlights-"]').forEach(el => { el.style.display = ''; });
   document.querySelectorAll('[id^="hist-collapsed-"] .recent-card-chevron').forEach(el => { el.style.transform = ''; });
-  if (!isOpen) { expanded.innerHTML = buildRecentExpandedHtml(wid); expanded.style.display = 'block'; if (highlights) highlights.style.display = 'none'; if (chevron) chevron.style.transform = 'rotate(180deg)'; }
+  if (!isOpen) { expanded.innerHTML = buildRecentExpandedHtml(wid); expanded.style.display = 'block'; if (highlights) highlights.style.display = 'none'; if (chevron) chevron.style.transform = 'rotate(180deg)'; if (typeof planRunFailureUiHistoryFill === 'function') planRunFailureUiHistoryFill(wid, expanded); }
 }
 function toggleRecentCard(wid) {
   const expanded = document.getElementById(`recent-expanded-${wid}`); const chevron = document.querySelector(`#recent-collapsed-${wid} .recent-card-chevron`);
   if (!expanded) return; const isOpen = expanded.style.display !== 'none';
   document.querySelectorAll('.recent-card-expanded').forEach(el => { el.style.display = 'none'; }); document.querySelectorAll('.recent-card-chevron').forEach(el => { el.style.transform = ''; });
-  if (!isOpen) { expanded.innerHTML = buildRecentExpandedHtml(wid); expanded.style.display = 'block'; if (chevron) chevron.style.transform = 'rotate(180deg)'; }
+  if (!isOpen) { expanded.innerHTML = buildRecentExpandedHtml(wid); expanded.style.display = 'block'; if (chevron) chevron.style.transform = 'rotate(180deg)'; if (typeof planRunFailureUiHistoryFill === 'function') planRunFailureUiHistoryFill(wid, expanded); }
 }
 function buildRecentExpandedHtml(wid) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return '';
@@ -4555,7 +4555,12 @@ function buildRecentExpandedHtml(wid) {
   const editOrNotice = isCanonical
     ? `<span style="flex:1;text-align:center;font-size:12px;color:var(--text3);align-self:center">Completed via Program Run — not editable here</span>`
     : `<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="editHistoricalWorkout('${wid}');event.stopPropagation()">Edit</button>`;
-  return `<div class="recent-expanded-inner"><div class="recent-ex-list">${exercisesHtml}</div><div class="recent-expanded-actions">${editOrNotice}<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="openCopyModal('${wid}');event.stopPropagation()">Export</button></div></div>`;
+  // FAILURE RECOMMENDATIONS / SUCCESS APPROVAL (release-gated): a Program
+  // Run workout gets a "Program details" panel, filled from the persisted
+  // Run records after the card opens (planRunFailureUiHistoryFill).
+  const progPanel = (isCanonical && w.planRunId && w.planOccurrenceId && typeof planRunFailureUiHistoryEnabled === 'function' && planRunFailureUiHistoryEnabled())
+    ? `<div class="hist-prog" data-testid="hist-prog" data-hist-prog="${wid}"><div class="hist-prog-h">Program details</div><div class="fr-muted">Loading…</div></div>` : '';
+  return `<div class="recent-expanded-inner"><div class="recent-ex-list">${exercisesHtml}</div>${progPanel}<div class="recent-expanded-actions">${editOrNotice}<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="openCopyModal('${wid}');event.stopPropagation()">Export</button></div></div>`;
 }
 function openExpandedVideosModal(wid, exIdx) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return;

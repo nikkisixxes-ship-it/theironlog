@@ -449,6 +449,17 @@ function planRunLoggerLaunch(run, occurrence) {
       showToast('This Session\u2019s Progression series values can\u2019t be confirmed right now, so it wasn\u2019t opened. Nothing was changed.', 'error');
       return false;
     }
+    // FAILURE RECOMMENDATIONS: a series with an undecided miss waits for the
+    // lifter's decision before its next Session opens.
+    var pendingSeries = Object.keys(result.valuesByRuleId).map(function (k) { return result.valuesByRuleId[k]; }).filter(function (v) { return v.pendingDecisionIds && v.pendingDecisionIds.length; });
+    if (pendingSeries.length) {
+      var frKinds = (pendingSeries[0].pendingDecisions || []).map(function (d) { return d.kind; });
+      showToast(frKinds.indexOf('failure') === -1
+        ? 'Approve or decline the proposed increase for “' + pendingSeries[0].seriesName + '” before starting this Session.'
+        : 'Decide what to do after your last miss in “' + pendingSeries[0].seriesName + '” before starting this Session.', 'error');
+      if (typeof planRunFailureUiOpenForRun === 'function') planRunFailureUiOpenForRun(run.planRunId);
+      return false;
+    }
     return planRunLoggerOpenOccurrence(run, occurrence, result.valuesByRuleId);
   }, function () {
     if (planRunLoggerSeriesLaunchPending !== token) return false;
@@ -523,8 +534,20 @@ function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
         progressionCtx = { enabled: true, adjustmentType: sv.rule.adjustmentType };
       }
     }
-    var sets = (a.orderedSets || []).map(function (os) {
+    // FAILURE RECOMMENDATIONS: an accepted Repeat Prescription may have moved
+    // a different prescription into this Session for this series; accepted
+    // reductions adjust the loads filled in below. Both come from the same
+    // verified series read; the Session snapshot itself is unchanged.
+    var frOrderedSets = (sv && sv.value.scheduleOverride) ? sv.value.scheduleOverride.orderedSets : a.orderedSets;
+    var frAdjusting = !!(sv && sv.usable && typeof planRunFailureResolveSetLoad === 'function' &&
+      ((sv.value.temporaryAdjustments && sv.value.temporaryAdjustments.length) || (sv.value.loadAdjustments && sv.value.loadAdjustments.length)));
+    var frCtx = frAdjusting ? { valueKind: sv.value.valueKind, amount: sv.value.currentValue.amount, unit: sv.value.currentValue.unit, temps: sv.value.temporaryAdjustments || [], persistent: sv.value.loadAdjustments || [] } : null;
+    var sets = (frOrderedSets || []).map(function (os) {
       var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, rowExerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
+      if (frCtx) {
+        var frLoad = planRunFailureResolveSetLoad(os.prescribed, frCtx);
+        if (frLoad !== null && String(frLoad) !== loggerSet.weight) { loggerSet.weight = String(frLoad); loggerSet.autoFilled = true; loggerSet.failureAdjusted = true; }
+      }
       loggerSet.planSetId = os.planSetId;
       loggerSet.isPR = false;
       loggerSet.isNew1RM = false;
@@ -900,6 +923,12 @@ function planRunLoggerFinishCommit(pkg, result) {
       showToast('Workout saved!', 'success');
     }
     showPage('page-home');
+    // FAILURE RECOMMENDATIONS: an evaluated miss with a program
+    // recommendation goes straight to the decision (it can also be reached
+    // later from the Program's card on TRAIN).
+    if (result && Array.isArray(result.progressionDecisions) && result.progressionDecisions.length && typeof planRunFailureUiOpenForRun === 'function') {
+      planRunFailureUiOpenForRun(pkg.planRunId);
+    }
   } else {
     // Not on #page-log right now -- no toast, no redirect (issue 2's
     // explicit requirement). #plan-run-finish-status and the Finish button
@@ -1081,6 +1110,7 @@ function planRunLoggerFinishOutcomeMessage(phase, st) {
   if (phase === 'budgetExceeded') return 'This Session is too large to finish in one operation.';
   if (phase === 'conflict') return 'We found a conflict with this Run’s saved data and blocked this Finish. Nothing was saved.';
   if (phase === 'competing') return 'This Session was already resolved by another attempt (e.g. another open tab). Nothing further was saved by this one.';
+  if (phase === 'error' && st && st.reason === 'progressionDecisionsRequireFeatureBuild') return 'This Session was started by a newer version of the app that asks you to approve progression changes. This version can’t record those decisions, so nothing was saved. Your workout is still open.';
   if (phase === 'error') return 'This Session couldn’t be prepared to finish right now.';
   return 'Nothing was saved.';
 }

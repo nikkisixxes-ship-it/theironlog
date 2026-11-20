@@ -481,6 +481,232 @@ function planRunPrescribedValid(v) {
 // one optional `progressionSeriesId`, snapshotted from PLAN at Start. Absent on
 // every pre-existing Session (unchanged shape, unchanged validation).
 var PLAN_RUN_RULE_ENTRY_KEYS_WITH_SERIES = Object.freeze(PLAN_RUN_RULE_ENTRY_KEYS.concat(['progressionSeriesId']));
+// =============================================================================
+// FAILURE RECOMMENDATIONS -- Workout Logger support (Run side).
+//
+// PLAN stores the program writer's recommendation for ONE evaluated miss.
+// Start freezes it into the Run's rule entry (`failureRecommendation`).
+// Finish turns an evaluated miss ('failed') into a PENDING decision recorded
+// on the state document that governs the Rule (the series state for a
+// series-linked Rule; the Rule's own progression state otherwise). The
+// lifter then approves, declines or chooses another response; that write
+// (fsPlanRunDecideFailure) applies it exactly once.
+//
+// New OPTIONAL fields (absent on every pre-existing document; every
+// existing reader is unaffected):
+//   series state:     progressionDecisions, decisionTimes, memberPrescriptions,
+//                     scheduleRefs, omittedPrescriptions, temporaryAdjustments,
+//                     loadAdjustments, successRequiresApproval
+//   progression state: progressionDecisions, decisionTimes, prescription,
+//                     successRequiresApproval
+//
+// SCHEDULE MODEL (rules-verifiable): Start freezes every member Session's own
+// prescription (sets + evaluation) in memberPrescriptions, and scheduleRefs
+// (aligned with memberOccurrenceIds) names, for each member, whose
+// prescription it runs -- initially itself. Repeat Prescription is then one
+// list operation (insert the missed member's reference after it, drop the
+// last), which the database Rules can check exactly without a loop.
+// DECISION TIMES: recordedAt / decidedAt live in decisionTimes (a map), not in
+// the list entries, because only map values can carry the server's own time.
+// =============================================================================
+var PLAN_RUN_FAILURE_ACTIONS = Object.freeze(['none', 'continue', 'repeatPrescription', 'reduceWorkingLoadFixed', 'reduceWorkingLoadPercent', 'reduceTrainingMaxFixed', 'reduceTrainingMaxPercent']);
+var PLAN_RUN_FAILURE_DURATIONS = Object.freeze(['nextSession', 'carryForward']);
+var PLAN_RUN_FAILURE_DECISION_STATUSES = Object.freeze(['pending', 'accepted', 'declined', 'chosen', 'superseded']);
+var PLAN_RUN_FAILURE_EFFECT_KINDS = Object.freeze(['none', 'noRemainingOccurrence', 'scheduleShift', 'valueChange', 'temporaryAdjustment', 'loadAdjustment']);
+var PLAN_RUN_SERIES_FAILURE_KEYS = Object.freeze(['progressionDecisions', 'decisionTimes', 'memberPrescriptions', 'scheduleRefs', 'omittedPrescriptions', 'temporaryAdjustments', 'loadAdjustments', 'successRequiresApproval', 'prescription']);
+var PLAN_RUN_RULE_STATE_FAILURE_KEYS = Object.freeze(['progressionDecisions', 'decisionTimes', 'prescription', 'successRequiresApproval']);
+var PLAN_RUN_SERIES_ONLY_FAILURE_KEYS = Object.freeze(['progressionDecisions', 'decisionTimes', 'memberPrescriptions', 'scheduleRefs', 'omittedPrescriptions', 'temporaryAdjustments', 'loadAdjustments', 'successRequiresApproval']);
+var PLAN_RUN_FAILURE_MAX_DECISIONS = 400;
+function planRunFailureIsReduction(a) { return typeof a === 'string' && a.indexOf('reduce') === 0; }
+function planRunFailureIsPercent(a) { return a === 'reduceWorkingLoadPercent' || a === 'reduceTrainingMaxPercent'; }
+function planRunFailureAmountOk(n, percent) {
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return false;
+  if (Math.round(n * 100) / 100 !== n) return false;            // two decimals, exactly (PLAN rule)
+  return percent ? n < 100 : n <= 1000;
+}
+// Same shape PLAN saves (app-plan.js planNormalizeFailureRecommendation).
+function planRunFailureRecommendationValid(fr) {
+  if (!planRunIsPlainObject(fr) || PLAN_RUN_FAILURE_ACTIONS.indexOf(fr.action) === -1) return false;
+  if (!planRunFailureIsReduction(fr.action)) return planRunExactKeys(fr, ['action']);
+  if (!planRunExactKeys(fr, ['action', 'amount', 'unit', 'duration'])) return false;
+  var pct = planRunFailureIsPercent(fr.action);
+  if (!planRunFailureAmountOk(fr.amount, pct)) return false;
+  if (pct ? fr.unit !== '%' : (fr.unit !== 'lb' && fr.unit !== 'kg')) return false;
+  return PLAN_RUN_FAILURE_DURATIONS.indexOf(fr.duration) !== -1;
+}
+// The lifter's response: the same shape, or 'decline'.
+// The lifter's response to a FAILURE decision: the recommendation shape, or
+// 'declined'.
+function planRunFailureResponseValid(r) {
+  if (!planRunIsPlainObject(r) || ['accepted', 'declined', 'chosen'].indexOf(r.choice) === -1) return false;
+  var rest = {}; Object.keys(r).forEach(function (k) { if (k !== 'choice') rest[k] = r[k]; });
+  if (r.choice === 'declined') return Object.keys(rest).length === 0;
+  return planRunFailureRecommendationValid(rest);
+}
+// SUCCESS APPROVAL: the response to a proposed increase is simply accept or
+// decline -- nothing else can be chosen.
+function planRunSuccessResponseValid(r) {
+  return planRunIsPlainObject(r) && Object.keys(r).length === 1 && (r.choice === 'accepted' || r.choice === 'declined');
+}
+function planRunDecisionResponseValid(kind, r) {
+  return kind === 'success' ? planRunSuccessResponseValid(r) : planRunFailureResponseValid(r);
+}
+function planRunFailureOrderedSetsValid(list) {
+  return Array.isArray(list) && list.length > 0 && list.length <= PLAN_RUN_SAFETY_CAPS.maxOrderedSetsPerAssignment && list.every(planRunOrderedSetValid);
+}
+// REPEAT PRESCRIPTION COHERENCE: the evaluation information that travels
+// WITH a prescription when it is retried in another Session. It is the
+// source Rule's own way of judging (and responding to) those exact sets, so
+// a retry is judged as the program writer intended -- never by the
+// destination Session's gateway index or evaluation type. Identity
+// (planRuleId, revision, adjustment type, series) stays with the running
+// series; see plan-run-failure-model.js planRunFailureEvaluationFromRule.
+var PLAN_RUN_FAILURE_EVALUATION_KEYS = Object.freeze(['sourcePlanRuleId', 'sourceRuleRevisionId', 'sourcePlanAssignmentId', 'evaluationType', 'gatewaySetIndex', 'loadIncrease', 'tmIncrease']);
+function planRunFailureEvaluationValid(ev, orderedSets) {
+  if (!planRunIsPlainObject(ev)) return false;
+  var hasFr = Object.prototype.hasOwnProperty.call(ev, 'failureRecommendation');
+  if (!planRunExactKeys(ev, PLAN_RUN_FAILURE_EVALUATION_KEYS.concat(hasFr ? ['failureRecommendation'] : []))) return false;
+  if (!planRunIsId(ev.sourcePlanRuleId) || !planRunIsId(ev.sourceRuleRevisionId) || !planRunIsId(ev.sourcePlanAssignmentId)) return false;
+  if (['strict', 'volume', 'gateway'].indexOf(ev.evaluationType) === -1) return false;
+  if (!planRunIsInteger(ev.gatewaySetIndex) || ev.gatewaySetIndex < 0) return false;
+  // The gateway Set must exist in THESE sets (the coherence the finding
+  // asked for: a two-Set prescription can never carry a Set-3 gateway).
+  if (ev.evaluationType === 'gateway' && Array.isArray(orderedSets) && ev.gatewaySetIndex >= orderedSets.length) return false;
+  if (typeof ev.loadIncrease !== 'number' || !Number.isFinite(ev.loadIncrease)) return false;
+  if (typeof ev.tmIncrease !== 'number' || !Number.isFinite(ev.tmIncrease)) return false;
+  if (hasFr && !planRunFailureRecommendationValid(ev.failureRecommendation)) return false;
+  return true;
+}
+function planRunFailureCarriedPrescriptionValid(o, extraKeys) {
+  return planRunExactKeys(o, ['sourceOccurrenceId', 'orderedSets', 'evaluation'].concat(extraKeys || [])) &&
+    planRunIsId(o.sourceOccurrenceId) && planRunFailureOrderedSetsValid(o.orderedSets) && planRunFailureEvaluationValid(o.evaluation, o.orderedSets);
+}
+function planRunFailureAdjustmentValid(a) {
+  if (!planRunExactKeys(a, ['decisionId', 'target', 'mode', 'amount', 'unit'])) return false;
+  if (!planRunIsId(a.decisionId) || ['workingLoad', 'trainingMax'].indexOf(a.target) === -1 || ['fixed', 'percent'].indexOf(a.mode) === -1) return false;
+  if (!planRunFailureAmountOk(a.amount, a.mode === 'percent')) return false;
+  return a.mode === 'percent' ? a.unit === '%' : (a.unit === 'lb' || a.unit === 'kg');
+}
+function planRunFailureEffectsValid(e) {
+  if (e === null) return true;
+  if (!planRunIsPlainObject(e) || PLAN_RUN_FAILURE_EFFECT_KINDS.indexOf(e.kind) === -1) return false;
+  var allowed = ['kind', 'previousValue', 'newValue', 'adjustment', 'shiftedOccurrenceIds', 'omittedSourceOccurrenceId', 'consumedByOccurrenceId', 'consumedByWorkoutId', 'note'];
+  if (!Object.keys(e).every(function (k) { return allowed.indexOf(k) !== -1; })) return false;
+  if (e.previousValue !== undefined && !planRunCurrentValueValid(e.previousValue)) return false;
+  if (e.newValue !== undefined && !planRunCurrentValueValid(e.newValue)) return false;
+  if (e.adjustment !== undefined && !planRunFailureAdjustmentValid(e.adjustment)) return false;
+  if (e.shiftedOccurrenceIds !== undefined && !(Array.isArray(e.shiftedOccurrenceIds) && e.shiftedOccurrenceIds.every(planRunIsId))) return false;
+  if (e.omittedSourceOccurrenceId !== undefined && !planRunIsId(e.omittedSourceOccurrenceId)) return false;
+  if (e.consumedByOccurrenceId !== undefined && !planRunIsId(e.consumedByOccurrenceId)) return false;
+  if (e.consumedByWorkoutId !== undefined && !planRunIsId(e.consumedByWorkoutId)) return false;
+  if (e.note !== undefined && !(typeof e.note === 'string' && e.note.length <= 500)) return false;
+  return true;
+}
+// One decision entry. kind 'failure': an evaluated miss with the program's
+// recommendation. kind 'success': an evaluated pass with the PROPOSED
+// increase, which changes nothing until the lifter approves it.
+var PLAN_RUN_DECISION_KINDS = Object.freeze(['failure', 'success']);
+var PLAN_RUN_FAILURE_DECISION_KEYS = Object.freeze([
+  'decisionId', 'sequence', 'kind', 'occurrenceId', 'workoutId', 'finishOperationId', 'planRuleId', 'planAssignmentId',
+  'evaluatedPrescription', 'valueAtEvaluation', 'adjustmentsInEffect', 'recommendation', 'proposal', 'remainingOccurrenceIds',
+  'status', 'response', 'effects', 'decidedOperationId', 'occurrenceIndex'
+]);
+function planRunSuccessProposalValid(p, valueAtEvaluation) {
+  if (!planRunExactKeys(p, ['increase', 'proposedValue'])) return false;
+  if (!planRunExactKeys(p.increase, ['amount', 'unit']) || typeof p.increase.amount !== 'number' || !Number.isFinite(p.increase.amount) || p.increase.amount === 0) return false;
+  if (p.increase.unit !== valueAtEvaluation.unit) return false;
+  if (!planRunCurrentValueValid(p.proposedValue) || p.proposedValue.kind !== valueAtEvaluation.kind || p.proposedValue.unit !== valueAtEvaluation.unit) return false;
+  if (typeof valueAtEvaluation.amount !== 'number') return false;
+  return p.proposedValue.amount === Math.round((valueAtEvaluation.amount + p.increase.amount) * 1000000) / 1000000;
+}
+function planRunFailureDecisionValid(d) {
+  if (!planRunExactKeys(d, PLAN_RUN_FAILURE_DECISION_KEYS)) return false;
+  var ids = ['decisionId', 'occurrenceId', 'workoutId', 'finishOperationId', 'planRuleId', 'planAssignmentId'];
+  for (var i = 0; i < ids.length; i++) if (!planRunIsId(d[ids[i]])) return false;
+  if (!planRunIsInteger(d.sequence) || d.sequence < 1) return false;
+  if (PLAN_RUN_DECISION_KINDS.indexOf(d.kind) === -1) return false;
+  if (!planRunFailureCarriedPrescriptionValid(d.evaluatedPrescription)) return false;
+  if (!planRunCurrentValueValid(d.valueAtEvaluation)) return false;
+  if (!Array.isArray(d.adjustmentsInEffect) || !d.adjustmentsInEffect.every(planRunFailureAdjustmentValid)) return false;
+  if (d.kind === 'failure') {
+    if (!planRunFailureRecommendationValid(d.recommendation) || d.proposal !== null) return false;
+  } else {
+    if (d.recommendation !== null || !planRunSuccessProposalValid(d.proposal, d.valueAtEvaluation)) return false;
+    if (d.status === 'chosen') return false;
+  }
+  if (!Array.isArray(d.remainingOccurrenceIds) || !d.remainingOccurrenceIds.every(planRunIsId)) return false;
+  if (PLAN_RUN_FAILURE_DECISION_STATUSES.indexOf(d.status) === -1) return false;
+  // Series entries name the missed member's position (null for a standalone Rule).
+  if (!(d.occurrenceIndex === null || (planRunIsInteger(d.occurrenceIndex) && d.occurrenceIndex >= 0))) return false;
+  if (d.status === 'pending') {
+    if (d.response !== null || d.effects !== null || d.decidedOperationId !== null) return false;
+  } else if (d.status === 'superseded') {
+    if (d.response !== null || !planRunFailureEffectsValid(d.effects) || d.decidedOperationId !== null) return false;
+  } else {
+    if (!planRunDecisionResponseValid(d.kind, d.response) || d.response.choice !== d.status) return false;
+    if (!planRunFailureEffectsValid(d.effects) || d.effects === null) return false;
+    if (!planRunIsId(d.decidedOperationId)) return false;
+  }
+  return true;
+}
+// One frozen prescription (a member Session's own sets + evaluation).
+function planRunFailurePrescriptionValid(p) {
+  return planRunExactKeys(p, ['orderedSets', 'evaluation']) && planRunFailureOrderedSetsValid(p.orderedSets) && planRunFailureEvaluationValid(p.evaluation, p.orderedSets);
+}
+function planRunFailureMemberPrescriptionsValid(m) {
+  return planRunIsPlainObject(m) && Object.keys(m).length > 0 && Object.keys(m).every(function (occId) { return planRunIsId(occId) && planRunFailurePrescriptionValid(m[occId]); });
+}
+function planRunFailureOmittedValid(list) {
+  return Array.isArray(list) && list.every(function (o) {
+    return planRunExactKeys(o, ['decisionId', 'sourceOccurrenceId']) && planRunIsId(o.decisionId) && planRunIsId(o.sourceOccurrenceId);
+  });
+}
+// decisionTimes: { decisionId: { recordedAt, decidedAt } } -- server times.
+function planRunFailureDecisionTimesValid(times, decisions) {
+  if (!planRunIsPlainObject(times)) return false;
+  var ids = (decisions || []).map(function (d) { return d.decisionId; });
+  if (Object.keys(times).length !== ids.length) return false;
+  return (decisions || []).every(function (d) {
+    var t = times[d.decisionId];
+    if (!planRunExactKeys(t, ['recordedAt', 'decidedAt']) || !planRunIsTimestamp(t.recordedAt)) return false;
+    return d.status === 'pending' ? t.decidedAt === null : planRunIsTimestamp(t.decidedAt);
+  });
+}
+// Validates any of the new optional fields present on a state document and
+// returns { ok, rest } where `rest` is the document WITHOUT them (so each
+// existing exact-keys validator checks the original shape, unchanged).
+function planRunFailureSplitStateFields(v, allowedKeys) {
+  if (!planRunIsPlainObject(v)) return { ok: true, rest: v };
+  var present = Object.keys(v).filter(function (k) { return PLAN_RUN_SERIES_FAILURE_KEYS.indexOf(k) !== -1; });
+  if (!present.length) return { ok: true, rest: v };
+  if (!present.every(function (k) { return allowedKeys.indexOf(k) !== -1; })) return { ok: false };
+  if (present.indexOf('progressionDecisions') !== -1) {
+    var fd = v.progressionDecisions;
+    if (!Array.isArray(fd) || fd.length > PLAN_RUN_FAILURE_MAX_DECISIONS || !fd.every(planRunFailureDecisionValid)) return { ok: false };
+    if (planRunArrayHasDuplicates(fd.map(function (d) { return d.decisionId; }))) return { ok: false };
+    for (var q = 0; q < fd.length; q++) if (fd[q].sequence !== q + 1) return { ok: false };
+    // At most ONE decision is ever waiting, and it is the newest: Finish only
+    // appends, and the next Session of a series is held (or supersedes it)
+    // until it is decided. This is also what lets the Firestore Rules check a
+    // decision write by comparing only the last list entry.
+    for (var q2 = 0; q2 < fd.length - 1; q2++) if (fd[q2].status === 'pending') return { ok: false };
+  }
+  // SUCCESS APPROVAL marker (written once at Start; never changes).
+  if (present.indexOf('successRequiresApproval') !== -1 && v.successRequiresApproval !== true) return { ok: false };
+  // Decisions and their server times always travel together.
+  if ((present.indexOf('progressionDecisions') !== -1) !== (present.indexOf('decisionTimes') !== -1)) return { ok: false };
+  if (present.indexOf('decisionTimes') !== -1 && !planRunFailureDecisionTimesValid(v.decisionTimes, v.progressionDecisions)) return { ok: false };
+  if (present.indexOf('memberPrescriptions') !== -1 && !planRunFailureMemberPrescriptionsValid(v.memberPrescriptions)) return { ok: false };
+  if (present.indexOf('prescription') !== -1 && !planRunFailurePrescriptionValid(v.prescription)) return { ok: false };
+  if (present.indexOf('scheduleRefs') !== -1 && !(Array.isArray(v.scheduleRefs) && v.scheduleRefs.every(planRunIsId))) return { ok: false };
+  if (present.indexOf('omittedPrescriptions') !== -1 && !planRunFailureOmittedValid(v.omittedPrescriptions)) return { ok: false };
+  if (present.indexOf('temporaryAdjustments') !== -1 && !(Array.isArray(v.temporaryAdjustments) && v.temporaryAdjustments.every(planRunFailureAdjustmentValid))) return { ok: false };
+  if (present.indexOf('loadAdjustments') !== -1 && !(Array.isArray(v.loadAdjustments) && v.loadAdjustments.every(planRunFailureAdjustmentValid))) return { ok: false };
+  var rest = {};
+  Object.keys(v).forEach(function (k) { if (present.indexOf(k) === -1) rest[k] = v[k]; });
+  return { ok: true, rest: rest };
+}
+
 function planRunRuleEntrySeriesId(v) {
   return (planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId')) ? v.progressionSeriesId : null;
 }
@@ -498,8 +724,21 @@ function planRunRuleEntryValid(v) {
   if (!planRunIsPlainObject(v)) return false;
   var hasSeries = Object.prototype.hasOwnProperty.call(v, 'progressionSeriesId');
   var hasRec = Object.prototype.hasOwnProperty.call(v, 'recommendedExerciseIds');
-  var keys = PLAN_RUN_RULE_ENTRY_KEYS.concat(hasSeries ? ['progressionSeriesId'] : []).concat(hasRec ? ['recommendedExerciseIds'] : []);
+  var hasFr = Object.prototype.hasOwnProperty.call(v, 'failureRecommendation');
+  var hasSa = Object.prototype.hasOwnProperty.call(v, 'successRequiresApproval');
+  var keys = PLAN_RUN_RULE_ENTRY_KEYS.concat(hasSeries ? ['progressionSeriesId'] : []).concat(hasRec ? ['recommendedExerciseIds'] : []).concat(hasFr ? ['failureRecommendation'] : []).concat(hasSa ? ['successRequiresApproval'] : []);
   if (!planRunExactKeys(v, keys)) return false;
+  // SUCCESS APPROVAL: Start marks every enabled Rule of a Run started by the
+  // build that asks for approval. Absent -> the Run predates the feature and
+  // keeps automatic success increases (documented compatibility behavior).
+  if (hasSa && (v.successRequiresApproval !== true || v.enabled !== true)) return false;
+  // FAILURE RECOMMENDATIONS: the Run's frozen copy of the PLAN rule's saved
+  // recommendation (Start snapshots it only in the build that can act on
+  // it). Absent on every pre-existing Session -> legacy behavior.
+  if (hasFr) {
+    if (!planRunFailureRecommendationValid(v.failureRecommendation)) return false;
+    if (v.enabled !== true) return false;
+  }
   if (hasSeries) {
     if (!planRunIsId(v.progressionSeriesId)) return false;
     // PLAN only ever emits a series link on an enabled Rule.
@@ -618,7 +857,16 @@ function planRunDocValid(v) {
   return true;
 }
 
+// A standalone Rule's decisions are judged against its own frozen
+// prescription and never name a series position.
+function planRunFailureRuleStateExtrasOk(v) {
+  if (!planRunIsPlainObject(v) || !Object.prototype.hasOwnProperty.call(v, 'progressionDecisions')) return true;
+  return Object.prototype.hasOwnProperty.call(v, 'prescription') && v.progressionDecisions.every(function (d) { return d.occurrenceIndex === null; });
+}
 function planRunProgressionStateDocValid(v) {
+  var fsplit = planRunFailureSplitStateFields(v, PLAN_RUN_RULE_STATE_FAILURE_KEYS);
+  if (!fsplit.ok || !planRunFailureRuleStateExtrasOk(v)) return false;
+  v = fsplit.rest;
   if (!planRunExactKeys(v, PLAN_RUN_STATE_KEYS)) return false;
   if (!planRunIsId(v.ownerUid) || !planRunIsId(v.planRunId) || !planRunIsId(v.planTemplateId)) return false;
   if (!planRunIsId(v.headRevisionId) || !planRunIsId(v.planAssignmentId) || !planRunIsId(v.planRuleId)) return false;
@@ -651,6 +899,9 @@ function planRunProgressionStateDocValid(v) {
 // any write; the rules layer is a second, independent enforcement surface,
 // never the only one).
 function planRunProgressionStateDocValidV2(v) {
+  var fsplit = planRunFailureSplitStateFields(v, PLAN_RUN_RULE_STATE_FAILURE_KEYS);
+  if (!fsplit.ok || !planRunFailureRuleStateExtrasOk(v)) return false;
+  v = fsplit.rest;
   if (!planRunExactKeys(v, PLAN_RUN_STATE_KEYS_V2)) return false;
   if (!planRunIsId(v.ownerUid) || !planRunIsId(v.planRunId) || !planRunIsId(v.planTemplateId)) return false;
   if (!planRunIsId(v.headRevisionId) || !planRunIsId(v.planAssignmentId) || !planRunIsId(v.planRuleId)) return false;
@@ -764,6 +1015,26 @@ function planRunSeriesReplacementHistoryValid(v) {
 }
 
 function planRunSeriesStateDocValid(v) {
+  var fsplit = planRunFailureSplitStateFields(v, PLAN_RUN_SERIES_ONLY_FAILURE_KEYS);
+  if (!fsplit.ok) return false;
+  if (fsplit.rest !== v) {
+    var original = v;
+    v = fsplit.rest;
+    // Overrides and decisions may only name this series' own member Sessions.
+    var members = Array.isArray(v.memberOccurrenceIds) ? v.memberOccurrenceIds : [];
+    // Feature series carry the whole schedule model together.
+    var hasMp = Object.prototype.hasOwnProperty.call(original, 'memberPrescriptions');
+    if (hasMp !== Object.prototype.hasOwnProperty.call(original, 'scheduleRefs')) return false;
+    if (hasMp) {
+      var mpKeys = Object.keys(original.memberPrescriptions);
+      if (mpKeys.length !== members.length || !members.every(function (o) { return mpKeys.indexOf(o) !== -1; })) return false;
+      if (original.scheduleRefs.length !== members.length || !original.scheduleRefs.every(function (o) { return members.indexOf(o) !== -1; })) return false;
+    }
+    if ((original.progressionDecisions || original.omittedPrescriptions) && !hasMp) return false;
+    if (original.omittedPrescriptions && !original.omittedPrescriptions.every(function (o) { return members.indexOf(o.sourceOccurrenceId) !== -1; })) return false;
+    if (original.progressionDecisions && !original.progressionDecisions.every(function (d) { return d.occurrenceIndex !== null && members[d.occurrenceIndex] === d.occurrenceId; })) return false;
+
+  }
   var isReplaced = planRunIsPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'replacementHistory');
   if (!planRunExactKeys(v, isReplaced ? PLAN_RUN_SERIES_STATE_KEYS_REPLACED : PLAN_RUN_SERIES_STATE_KEYS)) return false;
   if (isReplaced && !planRunIsId(v.activeExerciseId)) return false;

@@ -394,19 +394,34 @@
           // persisted); `lastEstablishOperationId` starts `null` on every
           // document and is set exactly once, only by the explicit
           // training-max establishment operation (below).
+          // SUCCESS APPROVAL: a state document whose Rule(s) were snapshotted
+          // with successRequiresApproval carries the same marker, so the
+          // database Rules can refuse an automatic increase on it.
+          var approvalRuleIds = {};
+          // Each enabled Rule's own frozen prescription (sets + evaluation),
+          // keyed by occurrence and Rule, for the decision schedule model.
+          var frozenByOccRule = {};
+          pkg.occurrences.forEach(function (o) { (o.assignments || []).forEach(function (a) { (a.rules || []).forEach(function (rl) {
+            if (rl.successRequiresApproval === true) approvalRuleIds[rl.planRuleId] = true;
+            if (rl.enabled) frozenByOccRule[o.occurrenceId + '|' + rl.planRuleId] = { orderedSets: M('planRunDeepClone')(a.orderedSets), evaluation: M('planRunFailureEvaluationFromRule')(rl, a) };
+          }); }); });
+          var ruleOccurrence = {};
+          pkg.occurrences.forEach(function (o) { (o.assignments || []).forEach(function (a) { (a.rules || []).forEach(function (rl) { ruleOccurrence[rl.planRuleId] = o.occurrenceId; }); }); });
           var stateWrites = pkg.progressionInitialValues.map(function (v) {
             var stateId = M('planRunBuildRuleStateId')(pkg.planRunId, v.planRuleId);
-            return {
-              path: colPath(pkg.ownerUid, 'progressionState', stateId),
-              data: {
+            var sData = {
                 ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planTemplateId: pkg.planTemplateId, headRevisionId: pkg.headRevisionId,
                 planAssignmentId: v.planAssignmentId, planRuleId: v.planRuleId, ruleRevisionId: v.ruleRevisionId, exerciseId: v.exerciseId,
                 currentValue: { kind: v.kind, amount: v.amount, unit: v.unit }, status: 'active', needsManualReviewReason: null,
                 initializationSource: v.initializationSource, lastProcessedWorkoutId: null, lastEvaluatedAt: null,
                 schemaVersion: 2, createdAt: now, updatedAt: now,
                 lastEstablishOperationId: null, isCurrentValueUnresolved: v.amount === null
-              }
             };
+            if (approvalRuleIds[v.planRuleId]) {
+              sData.successRequiresApproval = true;
+              sData.prescription = frozenByOccRule[ruleOccurrence[v.planRuleId] + '|' + v.planRuleId];
+            }
+            return { path: colPath(pkg.ownerUid, 'progressionState', stateId), data: sData };
           });
           // ROUND 5 CORRECTION (amendment Rounds 2+3): activeSlotId is
           // populated at genuine Start from the SAME `slotId` variable
@@ -431,8 +446,9 @@
               memberRuleRevisionIds[m.occurrenceId] = m.ruleRevisionId;
             });
             var memberOccurrenceIds = e.members.map(function (m) { return m.occurrenceId; }).sort(function (x, y) { return occOrderIndex[x] - occOrderIndex[y]; });
+            var needsApproval = e.members.some(function (m) { return approvalRuleIds[m.planRuleId]; });
             var build = function (ts) {
-              return {
+              var sd = {
                 recordType: 'planProgramRunSeriesState', schemaVersion: 1, ownerUid: pkg.ownerUid, planRunId: pkg.planRunId,
                 planTemplateId: pkg.planTemplateId, headRevisionId: pkg.headRevisionId, manifestId: pkg.manifestId,
                 seriesId: e.seriesId, seriesName: e.seriesName, exerciseId: e.exerciseId, valueKind: e.valueKind,
@@ -443,6 +459,15 @@
                 appliedOccurrenceIds: [], lastProcessedOccurrenceId: null, lastProcessedWorkoutId: null, lastOperationId: null,
                 lastEvaluatedAt: null, createdAt: ts, updatedAt: ts
               };
+              if (needsApproval) {
+                sd.successRequiresApproval = true;
+                // Every member Session's own prescription, frozen, and the
+                // schedule: whose prescription each member runs (itself).
+                sd.memberPrescriptions = {};
+                e.members.forEach(function (m) { sd.memberPrescriptions[m.occurrenceId] = frozenByOccRule[m.occurrenceId + '|' + m.planRuleId]; });
+                sd.scheduleRefs = memberOccurrenceIds.slice();
+              }
+              return sd;
             };
             return { path: colPath(pkg.ownerUid, 'seriesState', M('planRunBuildSeriesStateId')(pkg.planRunId, e.seriesId)), data: build(seriesServerTs), byteData: build(now) };
           });
@@ -1085,6 +1110,32 @@
           var runDoc = r.runDoc, occurrenceDoc = r.occurrenceDoc;
           // Step 9.
           if (runDoc.status !== 'active') return { outcome: 'integrityConflict', reason: 'terminalRunWithUnfinishedOccurrence' };
+          // FAILURE RECOMMENDATIONS: an accepted Repeat Prescription may have
+          // moved a different prescription into this Session for one series.
+          // Every check and the evaluation below use that EFFECTIVE copy; the
+          // stored Session snapshot itself is never changed.
+          var frSeriesDocs = {};
+          Object.keys(r.seriesIdByRuleId).forEach(function (rid0) { frSeriesDocs[r.seriesIdByRuleId[rid0]] = r.stateRaw[rid0].data; });
+          var effectiveOccurrenceDoc = M('planRunFailureEffectiveOccurrence')(occurrenceDoc, frSeriesDocs);
+          var frEffAsgById = {};
+          effectiveOccurrenceDoc.assignments.forEach(function (a0) { frEffAsgById[a0.planAssignmentId] = a0; });
+          // The effective rule entry carries the retried prescription's own
+          // evaluation (type, gateway index, increase, recommendation); its
+          // identity (Rule, revision, series) is the destination's.
+          r.enabledRules = r.enabledRules.map(function (er) {
+            var effA = frEffAsgById[er.assignment.planAssignmentId];
+            var effR = (effA.rules || []).filter(function (x) { return x.planRuleId === er.ruleEntry.planRuleId; })[0] || er.ruleEntry;
+            return { ruleEntry: effR, assignment: effA };
+          });
+          var frEnabled = M('planRunFailureFeatureEnabled')();
+          // A Session started by the build that asks for decisions can't be
+          // finished by a build that can't record them (e.g. after a
+          // rollback): refused before any write, instead of silently
+          // applying increases automatically.
+          if (!frEnabled && r.enabledRules.some(function (er) { return er.ruleEntry.successRequiresApproval === true || Object.prototype.hasOwnProperty.call(er.ruleEntry, 'failureRecommendation'); })) {
+            return { outcome: 'invalidInput', reason: 'progressionDecisionsRequireFeatureBuild' };
+          }
+          var frNewDecisions = [];
           // RECOMMENDED REPLACEMENTS: a Run-level replacement is applied only
           // by the feature build, only to a series-linked Rule of THIS
           // Session, only to a different exercise than the one the series
@@ -1105,7 +1156,7 @@
             }
           }
           // Step 10.
-          if (!M('planRunWorkoutContextMatchesOccurrence')(pkg.workout, occurrenceDoc, r.activeByAssignmentId)) return { outcome: 'integrityConflict', reason: 'workoutContextMismatch' };
+          if (!M('planRunWorkoutContextMatchesOccurrence')(pkg.workout, effectiveOccurrenceDoc, r.activeByAssignmentId)) return { outcome: 'integrityConflict', reason: 'workoutContextMismatch' };
           // FOUNDATION SLICE ADDITION -- the amended shape's own
           // completionState discriminator now makes it structurally
           // possible for a caller to pass a `historyOnly`-flagged workout
@@ -1149,7 +1200,7 @@
               var sUnresolved = !sReview && sDoc.currentValue.amount === null;
               var sDecision = null, sEstAmount = null, sEstUnit = null;
               if (!sReview && !sUnresolved) {
-                var sTriple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, occurrenceDoc, pkg.workout, pkg.workoutId, r.activeByRuleId[rid], true);
+                var sTriple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, effectiveOccurrenceDoc, pkg.workout, pkg.workoutId, r.activeByRuleId[rid], true);
                 var sValidation = M('planValidateProgressionEvaluationInput')(sTriple.rule, sTriple.evidence, sTriple.basis);
                 if (!sValidation.ok) { sReview = 'notEvaluable'; }
                 else {
@@ -1180,7 +1231,12 @@
                 stagedRecordWrites.push({ path: sRecPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'notAttempted', decision: null, reviewReason: null, recordedAt: now } });
                 notAttemptedIds.push(rid);
               } else if (!sUnresolved) {
-                sPatch.currentValue = sDecision.nextValue; sPatch.status = 'active'; sPatch.needsManualReviewReason = null;
+                // SUCCESS APPROVAL: a pass in a Run that asks for approval
+                // records the evaluation but leaves the approved value as
+                // it is; the increase becomes a pending proposal below.
+                var sNeedsApproval = frEnabled && ruleEntry.successRequiresApproval === true && sDecision.decision === 'passed';
+                if (!sNeedsApproval) sPatch.currentValue = sDecision.nextValue;
+                sPatch.status = 'active'; sPatch.needsManualReviewReason = null;
                 stagedRecordWrites.push({ path: sRecPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'applied', decision: sDecision.decision, reviewReason: null, recordedAt: now } });
                 appliedIds.push(rid);
               } else if (sEstAmount !== null) {
@@ -1216,7 +1272,71 @@
                 sPatch.status = 'active'; sPatch.needsManualReviewReason = null;
                 replacedIds.push(rid);
               }
-              stagedSeriesWrites.push({ path: r.seriesPathByRuleId[rid], ruleId: rid, patch: sPatch });
+              // FAILURE RECOMMENDATIONS (series):
+              //  - this member Session ran, so any temporary adjustment is
+              //    used up now (whatever the evaluation outcome);
+              //  - a decision still undecided is closed as superseded (a
+              //    later member already ran without it);
+              //  - an evaluated miss with a frozen recommendation records a
+              //    new PENDING decision for the lifter.
+              var frDecisions = Array.isArray(sDoc.progressionDecisions) ? sDoc.progressionDecisions.map(function (d) { return Object.assign({}, d); }) : null;
+              // Decision times live in a map so they can carry the server's
+              // own time (marked here; set to the server time at write).
+              var frTimes = sDoc.decisionTimes ? Object.assign({}, sDoc.decisionTimes) : null;
+              var frServerMarks = [];
+              var frTouched = false;
+              if (Array.isArray(sDoc.temporaryAdjustments) && sDoc.temporaryAdjustments.length) {
+                var usedIds = sDoc.temporaryAdjustments.map(function (a) { return a.decisionId; });
+                sPatch.temporaryAdjustments = [];
+                (frDecisions || []).forEach(function (d) {
+                  if (usedIds.indexOf(d.decisionId) !== -1 && d.effects) { d.effects = Object.assign({}, d.effects, { consumedByOccurrenceId: pkg.occurrenceId, consumedByWorkoutId: pkg.workoutId }); frTouched = true; }
+                });
+              }
+              (frDecisions || []).forEach(function (d) {
+                if (d.status !== 'pending') return;
+                d.status = 'superseded'; d.effects = { kind: 'none', note: d.kind === 'success' ? 'A later Session of this series was finished before this was decided, so the increase was not applied.' : 'A later Session of this series was finished before this was decided, so it no longer applies.' };
+                frTimes[d.decisionId] = { recordedAt: frTimes[d.decisionId].recordedAt, decidedAt: now };
+                frServerMarks.push({ id: d.decisionId, field: 'decidedAt' });
+                frTouched = true;
+              });
+              // A decision is recorded only for the exercise the series kept:
+              // when this same Finish switches the series to a replacement
+              // exercise, its fresh starting value stands and no proposal
+              // or recommendation is attached to the old exercise's result.
+              var frKind = null;
+              if (frEnabled && !sReview && !sUnresolved && sDecision && !Object.prototype.hasOwnProperty.call(replByRuleId, rid)) {
+                if (sDecision.decision === 'failed' && Object.prototype.hasOwnProperty.call(ruleEntry, 'failureRecommendation')) frKind = 'failure';
+                else if (sDecision.decision === 'passed' && ruleEntry.successRequiresApproval === true && sDecision.nextValue.amount !== sDoc.currentValue.amount) frKind = 'success';
+              }
+              if (frKind && !sDoc.memberPrescriptions) frKind = null;
+              if (frKind) {
+                var frList = frDecisions || [];
+                var frEff = M('planRunFailureEffectivePrescription')(sDoc, occurrenceDoc, r.seriesIdByRuleId[rid]);
+                var frEntry = M('planRunFailureBuildPendingEntry')({
+                  kind: frKind,
+                  sequence: frList.length + 1, occurrenceId: pkg.occurrenceId, workoutId: pkg.workoutId, finishOperationId: pkg.operationId,
+                  occurrenceIndex: sDoc.memberOccurrenceIds.indexOf(pkg.occurrenceId),
+                  planRuleId: rid, planAssignmentId: assignment.planAssignmentId,
+                  sourceOccurrenceId: frEff.sourceOccurrenceId, orderedSets: frEff.orderedSets, evaluation: frEff.evaluation,
+                  value: sDoc.currentValue,
+                  adjustmentsInEffect: (sDoc.temporaryAdjustments || []).concat(sDoc.loadAdjustments || []),
+                  recommendation: frKind === 'failure' ? frEff.evaluation.failureRecommendation : null,
+                  // The increase the governing (possibly retried) prescription
+                  // earns -- it travels with its sets.
+                  increase: frKind === 'success' ? M('planRunFailureEvaluationIncrease')(frEff.evaluation, sDoc.valueKind) : null,
+                  proposedValue: frKind === 'success' ? sDecision.nextValue : null,
+                  remainingOccurrenceIds: M('planRunFailureLaterMembers')(sDoc, pkg.occurrenceId),
+                  now: now
+                });
+                frDecisions = frList.concat([frEntry]);
+                frTimes = Object.assign(frTimes || {}, {});
+                frTimes[frEntry.decisionId] = { recordedAt: now, decidedAt: null };
+                frServerMarks.push({ id: frEntry.decisionId, field: 'recordedAt' });
+                frTouched = true;
+                frNewDecisions.push({ stateKind: 'series', key: r.seriesIdByRuleId[rid], planRuleId: rid, decisionId: frEntry.decisionId, kind: frKind });
+              }
+              if (frTouched) { sPatch.progressionDecisions = frDecisions; sPatch.decisionTimes = frTimes; }
+              stagedSeriesWrites.push({ path: r.seriesPathByRuleId[rid], ruleId: rid, patch: sPatch, serverMarks: frServerMarks });
               continue;
             }
             var reviewReason = null;
@@ -1248,7 +1368,7 @@
             var isUnresolved = !reviewReason && stateData.currentValue.amount === null;
             var establishedAmount = null, establishedUnit = null;
             if (!reviewReason && !isUnresolved) {
-              var triple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, occurrenceDoc, pkg.workout, pkg.workoutId);
+              var triple = M('planRunBuildProgressionTriple')(ruleEntry, assignment, effectiveOccurrenceDoc, pkg.workout, pkg.workoutId);
               var validation = M('planValidateProgressionEvaluationInput')(triple.rule, triple.evidence, triple.basis);
               if (!validation.ok) { reviewReason = 'notEvaluable'; }
               else {
@@ -1316,7 +1436,39 @@
               stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'notAttempted', decision: null, reviewReason: null, recordedAt: now } });
               notAttemptedIds.push(rid);
             } else if (!isUnresolved) {
-              stagedStateWrites.push({ path: statePath, ruleId: rid, data: { currentValue: evaluatedDecision.nextValue, status: 'active', needsManualReviewReason: null, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now } });
+              // FAILURE RECOMMENDATIONS (standalone Rule): an evaluated miss
+              // with a frozen recommendation records a pending decision on
+              // the Rule's own state. Its scope is this one Session, so the
+              // decision screen explains there is no later Session for it.
+              var frRuleData = null;
+              var rKind = null;
+              if (frEnabled && evaluatedDecision.decision === 'failed' && Object.prototype.hasOwnProperty.call(ruleEntry, 'failureRecommendation')) rKind = 'failure';
+              else if (frEnabled && evaluatedDecision.decision === 'passed' && ruleEntry.successRequiresApproval === true && evaluatedDecision.nextValue.amount !== stateData.currentValue.amount) rKind = 'success';
+              if (rKind && !stateData.prescription) rKind = null;
+              if (rKind) {
+                var frPrior = Array.isArray(stateData.progressionDecisions) ? stateData.progressionDecisions : [];
+                var frRuleEntry = M('planRunFailureBuildPendingEntry')({
+                  kind: rKind,
+                  sequence: frPrior.length + 1, occurrenceId: pkg.occurrenceId, workoutId: pkg.workoutId, finishOperationId: pkg.operationId,
+                  occurrenceIndex: null,
+                  planRuleId: rid, planAssignmentId: assignment.planAssignmentId,
+                  // The Rule's own prescription as frozen at Start.
+                  sourceOccurrenceId: pkg.occurrenceId, orderedSets: stateData.prescription.orderedSets, evaluation: stateData.prescription.evaluation,
+                  value: stateData.currentValue, adjustmentsInEffect: [],
+                  recommendation: rKind === 'failure' ? ruleEntry.failureRecommendation : null,
+                  increase: rKind === 'success' ? M('planRunFailureEvaluationIncrease')(stateData.prescription.evaluation, stateData.currentValue.kind) : null,
+                  proposedValue: rKind === 'success' ? evaluatedDecision.nextValue : null,
+                  remainingOccurrenceIds: [], now: now
+                });
+                var frRuleTimes = Object.assign({}, stateData.decisionTimes || {});
+                frRuleTimes[frRuleEntry.decisionId] = { recordedAt: now, decidedAt: null };
+                frRuleData = { progressionDecisions: frPrior.concat([frRuleEntry]), decisionTimes: frRuleTimes };
+                frRuleData.__serverMarks = [{ id: frRuleEntry.decisionId, field: 'recordedAt' }];
+                frNewDecisions.push({ stateKind: 'rule', key: rid, planRuleId: rid, decisionId: frRuleEntry.decisionId, kind: rKind });
+              }
+              // SUCCESS APPROVAL: the approved value stays until accepted.
+              var rKeepValue = frEnabled && ruleEntry.successRequiresApproval === true && evaluatedDecision.decision === 'passed';
+              stagedStateWrites.push({ path: statePath, ruleId: rid, data: Object.assign({ currentValue: rKeepValue ? stateData.currentValue : evaluatedDecision.nextValue, status: 'active', needsManualReviewReason: null, lastProcessedWorkoutId: pkg.workoutId, lastEvaluatedAt: now, updatedAt: now }, frRuleData || {}) });
               stagedRecordWrites.push({ path: recPath, data: { ownerUid: pkg.ownerUid, planRunId: pkg.planRunId, planRuleId: rid, workoutId: pkg.workoutId, outcome: 'applied', decision: evaluatedDecision.decision, reviewReason: null, recordedAt: now } });
               appliedIds.push(rid);
             } else if (establishedAmount !== null) {
@@ -1353,7 +1505,7 @@
           }
 
           // Step 12.
-          if (!M('planRunOccurrenceEligibleForCompletion')(occurrenceDoc, pkg.workout)) return { outcome: 'notEligibleForCompletion' };
+          if (!M('planRunOccurrenceEligibleForCompletion')(effectiveOccurrenceDoc, pkg.workout)) return { outcome: 'notEligibleForCompletion' };
 
           // Step 13 -- resolve EVERY conditional (including the slot release
           // decision) before issuing a single tx.set/tx.update, so a
@@ -1421,7 +1573,7 @@
             // produced exactly one state write, which was true in every
             // prior round but is no longer true here). Each push above now
             // carries its own `ruleId`, read directly here instead.
-            return { path: w.path, kind: 'progressionState', data: Object.assign({}, r.stateRaw[w.ruleId].data, w.data) };
+            return { path: w.path, kind: 'progressionState', data: frStripMarks(Object.assign({}, r.stateRaw[w.ruleId].data, w.data)) };
           })).concat(stagedSeriesWrites.map(function (w) {
             return { path: w.path, kind: 'seriesState', data: Object.assign({}, r.stateRaw[w.ruleId].data, w.patch, { updatedAt: now }) };
           })).concat(stagedRecordWrites.map(function (w) {
@@ -1436,13 +1588,13 @@
 
           tx.set(workoutPath(pkg.ownerUid, pkg.workoutId), pkg.workout);
           tx.update(r.occPath, { status: 'completed', workoutId: pkg.workoutId, completedAt: now, updatedAt: now });
-          stagedStateWrites.forEach(function (w) { tx.update(w.path, w.data); });
-          stagedSeriesWrites.forEach(function (w) { tx.update(w.path, Object.assign({}, w.patch, { updatedAt: seriesServerTs })); });
+          stagedStateWrites.forEach(function (w) { tx.update(w.path, frWithServerTimes(w.data, w.data.__serverMarks)); });
+          stagedSeriesWrites.forEach(function (w) { tx.update(w.path, frWithServerTimes(Object.assign({}, w.patch, { updatedAt: seriesServerTs }), w.serverMarks)); });
           stagedRecordWrites.forEach(function (w) { tx.set(w.path, w.data); });
           tx.update(r.runPath, runUpdate);
           if (runBecomesComplete) tx.update(r.slotPath, { activePlanRunId: null, updatedAt: now });
           tx.set(r.receiptPath, receiptWriteData);
-          return { outcome: 'committed', resultRefs: resultRefs };
+          return frNewDecisions.length ? { outcome: 'committed', resultRefs: resultRefs, progressionDecisions: frNewDecisions } : { outcome: 'committed', resultRefs: resultRefs };
         });
       } catch (err) { throw classifyRunTransactionFailure(err); }
     }
@@ -2284,10 +2436,254 @@
           activeExerciseId: M('planRunSeriesActiveExerciseId')(raw.data),
           hasFutureMember: raw.data.memberOccurrenceIds.some(function (o) { return o !== occ.occurrenceId && raw.data.appliedOccurrenceIds.indexOf(o) === -1; }),
           currentValue: { kind: raw.data.currentValue.kind, amount: raw.data.currentValue.amount, unit: raw.data.currentValue.unit },
-          status: raw.data.status, needsManualReviewReason: raw.data.needsManualReviewReason
+          status: raw.data.status, needsManualReviewReason: raw.data.needsManualReviewReason,
+          // FAILURE RECOMMENDATIONS (absent fields -> nothing changes):
+          scheduleOverride: M('planRunDeepClone')(M('planRunFailureScheduleOverride')(raw.data, occ.occurrenceId)),
+          temporaryAdjustments: M('planRunDeepClone')(raw.data.temporaryAdjustments || []),
+          loadAdjustments: M('planRunDeepClone')(raw.data.loadAdjustments || []),
+          pendingDecisionIds: (raw.data.progressionDecisions || []).filter(function (d) { return d.status === 'pending'; }).map(function (d) { return d.decisionId; }),
+          // What each waiting decision is, so the held Session can explain
+          // what it will use after accepting or declining.
+          pendingDecisions: (raw.data.progressionDecisions || []).filter(function (d) { return d.status === 'pending'; }).map(function (d) {
+            return { decisionId: d.decisionId, kind: d.kind, valueAtEvaluation: M('planRunDeepClone')(d.valueAtEvaluation), proposedValue: d.proposal ? M('planRunDeepClone')(d.proposal.proposedValue) : null };
+          })
         };
       }
       return { outcome: 'verified', valuesByRuleId: valuesByRuleId };
+    }
+
+    // =========================================================================
+    // FAILURE RECOMMENDATIONS -- decision reads and the decision write.
+    // =========================================================================
+    // Decision times are written with the server's own time (the database
+    // Rules require it); validation above used the local `now` in its place.
+    function frStripMarks(data) {
+      if (!data || !Object.prototype.hasOwnProperty.call(data, '__serverMarks')) return data;
+      var out = Object.assign({}, data); delete out.__serverMarks; return out;
+    }
+    function frWithServerTimes(data, marks) {
+      var out = frStripMarks(data);
+      if (!marks || !marks.length || !out.decisionTimes) return out;
+      var ts = deps.serverTimestamp ? deps.serverTimestamp() : null;
+      if (!ts) return out;
+      var times = Object.assign({}, out.decisionTimes);
+      marks.forEach(function (m) { times[m.id] = Object.assign({}, times[m.id]); times[m.id][m.field] = ts; });
+      return Object.assign({}, out, { decisionTimes: times });
+    }
+    function frStatePath(ownerUid, planRunId, stateKind, key) {
+      return stateKind === 'series'
+        ? colPath(ownerUid, 'seriesState', M('planRunBuildSeriesStateId')(planRunId, key))
+        : colPath(ownerUid, 'progressionState', M('planRunBuildRuleStateId')(planRunId, key));
+    }
+    function frStateValid(stateKind, data, ownerUid, planRunId, key) {
+      return stateKind === 'series'
+        ? (M('planRunSeriesStateDocValid')(data) && M('planRunSeriesStateIdentityOk')(data, ownerUid, planRunId, key))
+        : (M('planRunProgressionStateDocValidAnyVersion')(data) && M('planRunStateIdentityOk')(data, ownerUid, planRunId, key));
+    }
+    // Every decision recorded for a Run (pending first). The caller passes
+    // the Run's known Session ids (its finished workouts + remaining list);
+    // only plain document reads are used -- no new query or index.
+    async function fsPlanRunListFailureDecisions(pkg) {
+      disabledGate();
+      if (!M('planRunIsPlainObject')(pkg) || !M('planRunIsId')(pkg.ownerUid) || !M('planRunIsId')(pkg.planRunId) || !Array.isArray(pkg.occurrenceIds)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      if (pkg.ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      var ownerUid = pkg.ownerUid, planRunId = pkg.planRunId;
+      try {
+        var runRaw = await deps.getDoc(colPath(ownerUid, 'runs', planRunId));
+        if (!runRaw.exists || !M('planRunDocValid')(runRaw.data) || runRaw.data.ownerUid !== ownerUid) return { outcome: 'runUnavailable' };
+        var occIds = pkg.occurrenceIds.concat(runRaw.data.remainingOccurrenceIds).filter(function (o, i, arr) { return M('planRunIsId')(o) && arr.indexOf(o) === i; });
+        var targets = {}, names = {};
+        for (var i = 0; i < occIds.length; i++) {
+          var oRaw = await deps.getDoc(colPath(ownerUid, 'occurrences', occIds[i]));
+          if (!oRaw.exists || !M('planRunOccurrenceDocValid')(oRaw.data) || !M('planRunOccurrenceIdentityOk')(oRaw.data, ownerUid, planRunId, occIds[i])) continue;
+          names[occIds[i]] = oRaw.data.nameSnapshot;
+          oRaw.data.assignments.forEach(function (a) {
+            a.rules.forEach(function (rl) {
+              if (!rl.enabled || (!Object.prototype.hasOwnProperty.call(rl, 'failureRecommendation') && rl.successRequiresApproval !== true)) return;
+              var sid = M('planRunRuleEntrySeriesId')(rl);
+              var t = sid !== null ? { stateKind: 'series', key: sid } : { stateKind: 'rule', key: rl.planRuleId };
+              targets[t.stateKind + ':' + t.key] = Object.assign(t, { exerciseId: a.exerciseId });
+            });
+          });
+        }
+        var out = [];
+        var keys = Object.keys(targets);
+        for (var k = 0; k < keys.length; k++) {
+          var t = targets[keys[k]];
+          var sRaw = await deps.getDoc(frStatePath(ownerUid, planRunId, t.stateKind, t.key));
+          if (!sRaw.exists || !frStateValid(t.stateKind, sRaw.data, ownerUid, planRunId, t.key)) continue;
+          (sRaw.data.progressionDecisions || []).forEach(function (d) {
+            out.push({ stateKind: t.stateKind, key: t.key, exerciseId: t.stateKind === 'series' ? sRaw.data.exerciseId : t.exerciseId, seriesName: t.stateKind === 'series' ? sRaw.data.seriesName : null, decision: M('planRunDeepClone')(d), occurrenceName: names[d.occurrenceId] || null });
+          });
+        }
+        out.sort(function (a, b) { return (a.decision.status === 'pending' ? 0 : 1) - (b.decision.status === 'pending' ? 0 : 1); });
+        return { outcome: 'verified', decisions: out, run: M('planRunDeepClone')(runRaw.data) };
+      } catch (err) { throw classifyRunTransactionFailure(err); }
+    }
+    // Shared by the context read and the decision write: loads everything
+    // the planner needs for one decision.
+    async function frLoadContext(get, pkg) {
+      var runRaw = await get(colPath(pkg.ownerUid, 'runs', pkg.planRunId));
+      if (!runRaw.exists || !M('planRunDocValid')(runRaw.data) || runRaw.data.ownerUid !== pkg.ownerUid) return { error: { outcome: 'runUnavailable' } };
+      var path = frStatePath(pkg.ownerUid, pkg.planRunId, pkg.stateKind, pkg.key);
+      var sRaw = await get(path);
+      if (!sRaw.exists || !frStateValid(pkg.stateKind, sRaw.data, pkg.ownerUid, pkg.planRunId, pkg.key)) return { error: { outcome: 'stateUnavailable' } };
+      var state = sRaw.data;
+      var entry = (state.progressionDecisions || []).filter(function (d) { return d.decisionId === pkg.decisionId; })[0];
+      if (!entry) return { error: { outcome: 'decisionMissing' } };
+      var run = runRaw.data;
+      var memberOccurrences = {}, successIncrease = null;
+      var missedRaw = await get(colPath(pkg.ownerUid, 'occurrences', entry.occurrenceId));
+      var missed = (missedRaw.exists && M('planRunOccurrenceDocValid')(missedRaw.data)) ? missedRaw.data : null;
+      if (pkg.stateKind === 'series') {
+        var later = M('planRunFailureLaterMembers')(state, entry.occurrenceId, run.remainingOccurrenceIds);
+        for (var i = 0; i < later.length; i++) {
+          var oRaw = await get(colPath(pkg.ownerUid, 'occurrences', later[i]));
+          if (oRaw.exists && M('planRunOccurrenceDocValid')(oRaw.data) && M('planRunOccurrenceIdentityOk')(oRaw.data, pkg.ownerUid, pkg.planRunId, later[i])) memberOccurrences[later[i]] = oRaw.data;
+        }
+        if (later.length && memberOccurrences[later[0]]) {
+          var nxt = M('planRunFailureSeriesAssignment')(memberOccurrences[later[0]], pkg.key);
+          var nxtEff = M('planRunFailureEffectivePrescription')(state, memberOccurrences[later[0]], pkg.key);
+          if (nxt && nxtEff) successIncrease = { amount: nxt.rule.adjustmentType === 'increaseTM' ? nxtEff.evaluation.tmIncrease : nxtEff.evaluation.loadIncrease };
+        }
+      }
+      return {
+        path: path, state: state, entry: entry, run: run, missed: missed,
+        ctx: { isSeries: pkg.stateKind === 'series', state: state, entry: entry, seriesId: pkg.stateKind === 'series' ? pkg.key : null, remainingOccurrenceIds: run.remainingOccurrenceIds, memberOccurrences: memberOccurrences, successIncrease: successIncrease }
+      };
+    }
+    function frPkgOk(pkg) {
+      return M('planRunIsPlainObject')(pkg) && M('planRunIsId')(pkg.ownerUid) && M('planRunIsId')(pkg.planRunId) &&
+        (pkg.stateKind === 'series' || pkg.stateKind === 'rule') && M('planRunIsId')(pkg.key) && M('planRunIsId')(pkg.decisionId);
+    }
+    async function fsPlanRunReadFailureDecisionContext(pkg) {
+      disabledGate();
+      if (!frPkgOk(pkg)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      if (pkg.ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      try {
+        var c = await frLoadContext(deps.getDoc, pkg);
+        if (c.error) return c.error;
+        return { outcome: 'verified', ctx: M('planRunDeepClone')(c.ctx), missed: M('planRunDeepClone')(c.missed) };
+      } catch (err) { throw classifyRunTransactionFailure(err); }
+    }
+    // Applies the lifter's response ONCE. Retrying with the same operationId
+    // after an interrupted save is safe (returns committed, alreadyApplied);
+    // any other attempt on a decided entry returns alreadyDecided.
+    // expectedEffects: what the lifter was shown -- if the Run changed in
+    // between, nothing is written (changedSincePreview).
+    async function fsPlanRunDecideFailure(pkg) {
+      disabledGate();
+      if (!frPkgOk(pkg) || !M('planRunIsId')(pkg.operationId) || !(M('planRunFailureResponseValid')(pkg.response) || M('planRunSuccessResponseValid')(pkg.response))) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      if (pkg.ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      if (!M('planRunFailureFeatureEnabled')()) return { outcome: 'invalidInput', reason: 'failureRecommendationsRequireFeatureBuild' };
+      try {
+        return await deps.transaction(async function (tx) {
+          var c = await frLoadContext(function (path) { return tx.get(path); }, pkg);
+          if (c.error) return c.error;
+          if (c.entry.status !== 'pending') {
+            if (c.entry.decidedOperationId === pkg.operationId) return { outcome: 'committed', alreadyApplied: true, decision: M('planRunDeepClone')(c.entry) };
+            return { outcome: 'alreadyDecided', decision: M('planRunDeepClone')(c.entry) };
+          }
+          if (!M('planRunDecisionResponseValid')(c.entry.kind, pkg.response)) return { outcome: 'invalidInput', reason: 'responseDoesNotMatchDecision' };
+          var plan = M('planRunDecisionPlanResponse')(c.ctx, pkg.response);
+          if (!plan.ok) return { outcome: 'responseNotApplicable', reason: plan.reason, message: plan.message };
+          if (pkg.expectedEffects !== undefined && JSON.stringify(pkg.expectedEffects) !== JSON.stringify(plan.effects)) {
+            return { outcome: 'changedSincePreview' };
+          }
+          var now = deps.timestamp();
+          var decided = Object.assign({}, c.entry, { status: plan.status, response: M('planRunDeepClone')(pkg.response), effects: plan.effects, decidedOperationId: pkg.operationId });
+          var decisions = c.state.progressionDecisions.map(function (d) { return d.decisionId === pkg.decisionId ? decided : d; });
+          var times = Object.assign({}, c.state.decisionTimes);
+          times[pkg.decisionId] = { recordedAt: times[pkg.decisionId].recordedAt, decidedAt: now };
+          var patch = Object.assign({}, plan.patch, { progressionDecisions: decisions, decisionTimes: times, updatedAt: now });
+          // The database Rules require a decision write to carry the server's
+          // own time -- both updatedAt and this decision's decidedAt equal
+          // request.time; the checks below use the local `now` in their place.
+          var sts = deps.serverTimestamp ? deps.serverTimestamp() : now;
+          var wTimes = Object.assign({}, times); wTimes[pkg.decisionId] = { recordedAt: times[pkg.decisionId].recordedAt, decidedAt: sts };
+          var writePatch = Object.assign({}, patch, { decisionTimes: wTimes, updatedAt: sts });
+          var finalDoc = Object.assign({}, c.state, patch);
+          var ok = pkg.stateKind === 'series' ? M('planRunSeriesStateDocValid')(finalDoc) : M('planRunProgressionStateDocValidAnyVersion')(finalDoc);
+          if (!ok) return { outcome: 'integrityConflict', reason: 'resultingStateInvalid' };
+          var byteBudget = M('planRunCheckStagedTransactionBytes')([{ path: c.path, kind: pkg.stateKind === 'series' ? 'seriesState' : 'progressionState', data: finalDoc }]);
+          if (!byteBudget.ok) return { outcome: 'budgetExceeded', reasons: byteBudget.reasons };
+          tx.update(c.path, writePatch);
+          return { outcome: 'committed', alreadyApplied: false, decision: M('planRunDeepClone')(decided) };
+        });
+      } catch (err) { throw classifyRunTransactionFailure(err); }
+    }
+
+    // HISTORY: everything the persisted records say about how ONE finished
+    // Run workout was governed, judged and decided. Read-only; plain document
+    // reads (the workout's Session, its Rules' state documents, their
+    // per-workout application records, and the Sessions named by them).
+    async function fsPlanRunReadWorkoutProgressionHistory(pkg) {
+      disabledGate();
+      if (!M('planRunIsPlainObject')(pkg) || !M('planRunIsId')(pkg.ownerUid) || !M('planRunIsId')(pkg.planRunId) || !M('planRunIsId')(pkg.occurrenceId) || !M('planRunIsId')(pkg.workoutId)) return { outcome: 'invalidInput', reason: 'malformedInput' };
+      if (pkg.ownerUid !== deps.currentUid()) return { outcome: 'invalidInput', reason: 'ownerMismatch' };
+      var ownerUid = pkg.ownerUid, planRunId = pkg.planRunId;
+      try {
+        var occRaw = await deps.getDoc(colPath(ownerUid, 'occurrences', pkg.occurrenceId));
+        if (!occRaw.exists || !M('planRunOccurrenceDocValid')(occRaw.data) || !M('planRunOccurrenceIdentityOk')(occRaw.data, ownerUid, planRunId, pkg.occurrenceId)) return { outcome: 'occurrenceUnavailable' };
+        var occ = occRaw.data;
+        var names = {}; names[occ.occurrenceId] = occ.nameSnapshot;
+        var nameOf = async function (occId) {
+          if (Object.prototype.hasOwnProperty.call(names, occId)) return names[occId];
+          var r0 = await deps.getDoc(colPath(ownerUid, 'occurrences', occId));
+          names[occId] = (r0.exists && M('planRunOccurrenceDocValid')(r0.data)) ? r0.data.nameSnapshot : null;
+          return names[occId];
+        };
+        var items = [];
+        for (var ai = 0; ai < occ.assignments.length; ai++) {
+          var a = occ.assignments[ai];
+          for (var ri = 0; ri < a.rules.length; ri++) {
+            var rl = a.rules[ri];
+            if (!rl.enabled) continue;
+            var sid = M('planRunRuleEntrySeriesId')(rl);
+            var stateKind = sid !== null ? 'series' : 'rule';
+            var key = sid !== null ? sid : rl.planRuleId;
+            var sRaw = await deps.getDoc(frStatePath(ownerUid, planRunId, stateKind, key));
+            var state = (sRaw.exists && frStateValid(stateKind, sRaw.data, ownerUid, planRunId, key)) ? sRaw.data : null;
+            var appRaw = await deps.getDoc(colPath(ownerUid, 'applications', M('planRunBuildApplicationId')(planRunId, rl.planRuleId, pkg.workoutId)));
+            var app = (appRaw.exists && M('planRunApplicationDocValid')(appRaw.data)) ? appRaw.data : null;
+            var planned = { orderedSets: M('planRunDeepClone')(a.orderedSets), evaluation: M('planRunFailureEvaluationFromRule')(rl, a) };
+            // A finished member's place in the schedule never changes again
+            // (a retry only moves members after the missed one, all still
+            // unfinished), so this is the prescription it actually ran.
+            var ov = (state && stateKind === 'series') ? M('planRunFailureScheduleOverride')(state, occ.occurrenceId) : null;
+            var governing = ov
+              ? { retried: true, sourceOccurrenceId: ov.sourceOccurrenceId, sourceName: await nameOf(ov.sourceOccurrenceId), orderedSets: M('planRunDeepClone')(ov.orderedSets), evaluation: M('planRunDeepClone')(ov.evaluation), decisionId: null }
+              : { retried: false, sourceOccurrenceId: occ.occurrenceId, sourceName: occ.nameSnapshot, orderedSets: planned.orderedSets, evaluation: planned.evaluation, decisionId: null };
+            var all = (state && state.progressionDecisions) || [];
+            var decisions = all.filter(function (d) { return d.workoutId === pkg.workoutId; }).map(function (d) { return M('planRunDeepClone')(d); });
+            var ids = decisions.map(function (d) { return d.decisionId; });
+            var used = all.filter(function (d) { return d.effects && d.effects.consumedByWorkoutId === pkg.workoutId; });
+            var adjustmentsUsed = [];
+            for (var ui = 0; ui < used.length; ui++) adjustmentsUsed.push({ decisionId: used[ui].decisionId, adjustment: M('planRunDeepClone')(used[ui].effects.adjustment), fromName: await nameOf(used[ui].occurrenceId) });
+            var omitted = [];
+            var om = (state && state.omittedPrescriptions) || [];
+            for (var oi = 0; oi < om.length; oi++) {
+              if (ids.indexOf(om[oi].decisionId) === -1) continue;
+              omitted.push({ decisionId: om[oi].decisionId, sourceOccurrenceId: om[oi].sourceOccurrenceId, sourceName: await nameOf(om[oi].sourceOccurrenceId), orderedSets: M('planRunDeepClone')(state.memberPrescriptions[om[oi].sourceOccurrenceId].orderedSets), evaluation: M('planRunDeepClone')(state.memberPrescriptions[om[oi].sourceOccurrenceId].evaluation) });
+            }
+            var shiftedNames = {};
+            for (var di = 0; di < decisions.length; di++) {
+              var ef = decisions[di].effects;
+              if (ef && ef.shiftedOccurrenceIds) for (var si2 = 0; si2 < ef.shiftedOccurrenceIds.length; si2++) shiftedNames[ef.shiftedOccurrenceIds[si2]] = await nameOf(ef.shiftedOccurrenceIds[si2]);
+            }
+            items.push({
+              planRuleId: rl.planRuleId, exerciseId: a.exerciseId, planAssignmentId: a.planAssignmentId, stateKind: stateKind, key: key,
+              seriesName: state && stateKind === 'series' ? state.seriesName : null,
+              valueKind: rl.adjustmentType === 'increaseTM' ? 'trainingMax' : 'workingLoad',
+              planned: planned, governing: governing,
+              evaluation: app ? { outcome: app.outcome, decision: app.decision, reviewReason: app.reviewReason } : null,
+              decisions: decisions, adjustmentsUsed: adjustmentsUsed, omitted: omitted, shiftedNames: shiftedNames,
+              stateReadable: !!state
+            });
+          }
+        }
+        return { outcome: 'verified', occurrenceName: occ.nameSnapshot, items: items };
+      } catch (err) { throw classifyRunTransactionFailure(err); }
     }
 
     async function fsPlanRunReadForDisplay(pkg) {
@@ -2464,6 +2860,10 @@
       fsPlanRunCheckTrainingMaxEstablishStatus: fsPlanRunCheckTrainingMaxEstablishStatus,
       fsPlanRunListUnresolvedTrainingMaxStates: fsPlanRunListUnresolvedTrainingMaxStates,
       fsPlanRunReadSeriesForOccurrence: fsPlanRunReadSeriesForOccurrence,
+      fsPlanRunListFailureDecisions: fsPlanRunListFailureDecisions,
+      fsPlanRunReadFailureDecisionContext: fsPlanRunReadFailureDecisionContext,
+      fsPlanRunDecideFailure: fsPlanRunDecideFailure,
+      fsPlanRunReadWorkoutProgressionHistory: fsPlanRunReadWorkoutProgressionHistory,
       CanonicalPlanRunWriterDisabledError: CanonicalPlanRunWriterDisabledError,
       CanonicalPlanRunAuthorizationError: CanonicalPlanRunAuthorizationError,
       CanonicalPlanRunUnavailableError: CanonicalPlanRunUnavailableError,

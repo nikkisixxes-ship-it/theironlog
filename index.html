@@ -6,6 +6,7 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>IRON LOG</title>
+<script>window.__ironlogPreviewFeatures = { failureRecommendations: true };</script>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="styles.css">
 <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
@@ -197,6 +198,7 @@
          planRunUiRenderSessionPreviewContent(); no Save or Start control of
          any kind lives on this page. -->
     <div class="page" id="page-run-session-preview"></div>
+    <div class="page" id="page-run-failure-decision"></div>
 
     <!-- START-FLOW SLICE ADDITION -- the deferred canonical Program Run
          "Start" flow. Content injected entirely by
@@ -677,6 +679,7 @@
      not a new finding), so loading these scripts DOES change what a real
      user sees today. -->
 <script src="plan-run-model.js"></script>
+<script src="plan-run-failure-model.js"></script>
 <script src="firebase-plan-run.js"></script>
 <script src="app-plan-run-ui.js"></script>
 <script src="app-plan-run-start-ui.js"></script>
@@ -697,6 +700,7 @@
      wrong, same correction as above: the capability has been enabled since
      Stage 6, so this DOES change what a real user sees today. -->
 <script src="app-plan-run-logger-ui.js"></script>
+<script src="app-plan-run-failure-ui.js"></script>
 <!-- END RUN SLICE ADDITION -- the End Run control on the active-Run card
      (see this file's own header). ROUND 5 CORRECTION: this previously said
      loading it "changes nothing a real user sees until CANONICAL_PLAN_RUN_

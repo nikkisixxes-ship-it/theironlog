@@ -304,6 +304,19 @@ function planRunStartBuildPackage(profile, planRunId, operationId, progressionIn
           // recommendation list into this Run (never re-resolved later).
           var recIds = (r.enabled === true && r.recommendedReplacements && Array.isArray(r.recommendedReplacements.exerciseIds)) ? r.recommendedReplacements.exerciseIds.filter(function (id) { return id !== a.exerciseId; }) : [];
           if (recIds.length) entry.recommendedExerciseIds = recIds.slice();
+          // FAILURE RECOMMENDATIONS: freeze the saved recommendation into
+          // this Run -- only in the build that can act on it (the release
+          // gate). Runs started without it behave exactly as before.
+          if (r.enabled === true && r.failureRecommendation && typeof planRunFailureFeatureEnabled === 'function' && planRunFailureFeatureEnabled() &&
+              typeof planRunFailureRecommendationValid === 'function' && planRunFailureRecommendationValid(r.failureRecommendation)) {
+            entry.failureRecommendation = JSON.parse(JSON.stringify(r.failureRecommendation));
+          }
+          // SUCCESS APPROVAL: a Run started by this build asks the lifter
+          // to approve every success increase. Runs started before it keep
+          // automatic increases (their entries never carry this marker).
+          if (r.enabled === true && typeof planRunFailureFeatureEnabled === 'function' && planRunFailureFeatureEnabled()) {
+            entry.successRequiresApproval = true;
+          }
           return entry;
         });
         return {

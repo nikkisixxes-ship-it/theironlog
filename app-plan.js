@@ -2063,7 +2063,11 @@ function planNormalizeCanonicalGraph(draft) {
             progressionSeriesName: planNormalizeAbsent(prog.progressionSeriesName),
             // RECOMMENDED REPLACEMENTS: optional (omitted when the author
             // defined none, so older Programs hash byte-identically).
-            recommendedReplacements: planNormalizeRecommendedReplacements(prog.recommendedReplacements, ex.exerciseId, fieldPathBase + '.progression.recommendedReplacements')
+            recommendedReplacements: planNormalizeRecommendedReplacements(prog.recommendedReplacements, ex.exerciseId, fieldPathBase + '.progression.recommendedReplacements'),
+            // PROGRESSION FAILURE RECOMMENDATIONS: optional (omitted when
+            // the author never chose one, so older Programs hash
+            // byte-identically).
+            failureRecommendation: planNormalizeFailureRecommendation(prog.failureRecommendation, fieldPathBase + '.progression.failureRecommendation')
           }, []); // Rule carries assignmentId as a back-reference only; Assignment depends on Rule, not vice versa.
         }
       }
@@ -6561,7 +6565,7 @@ var PLAN_READER_SEMANTIC_FIELDS = Object.freeze({
   // RECOMMENDED REPLACEMENTS: one more OPTIONAL trailing field,
   // `recommendedReplacements` -- absent on every Rule saved without
   // recommendations (those extract and re-hash exactly as before).
-  planRuleRevision: Object.freeze(['templateId', 'assignmentId', 'ruleId', 'enabled', 'evaluationType', 'gatewaySetIndex', 'adjustmentType', 'loadIncrease', 'tmIncrease', 'failBehavior', 'authority', 'scope', 'effectiveBoundary', 'requiredTracks', 'inputContract', 'outputContract', 'progressionSeriesId', 'progressionSeriesName', 'recommendedReplacements']),
+  planRuleRevision: Object.freeze(['templateId', 'assignmentId', 'ruleId', 'enabled', 'evaluationType', 'gatewaySetIndex', 'adjustmentType', 'loadIncrease', 'tmIncrease', 'failBehavior', 'authority', 'scope', 'effectiveBoundary', 'requiredTracks', 'inputContract', 'outputContract', 'progressionSeriesId', 'progressionSeriesName', 'recommendedReplacements', 'failureRecommendation']),
   planImplementationRelationshipRevision: Object.freeze(['templateId', 'assignmentId', 'relationshipId', 'exerciseId', 'eligibilityMode', 'sourceRevisionSemantics', 'constraints', 'resolver', 'resolutionTiming', 'permittedBindingScope', 'acceptancePolicy', 'lifecycleInterval'])
 });
 
@@ -8564,7 +8568,10 @@ function planBuildCanonicalTemplateEditSession(input) {
                   progressionSeriesName: (progressionRule && progressionRule.progressionSeriesName) || undefined,
                   // RECOMMENDED REPLACEMENTS: carried through as saved
                   // (never re-resolved on reopen).
-                  recommendedReplacements: (progressionRule && progressionRule.recommendedReplacements) ? planDeepClonePlain(progressionRule.recommendedReplacements) : undefined
+                  recommendedReplacements: (progressionRule && progressionRule.recommendedReplacements) ? planDeepClonePlain(progressionRule.recommendedReplacements) : undefined,
+                  // PROGRESSION FAILURE RECOMMENDATIONS: carried through as
+                  // saved (absent -> undefined -> omitted on re-normalize).
+                  failureRecommendation: (progressionRule && progressionRule.failureRecommendation) ? planDeepClonePlain(progressionRule.failureRecommendation) : undefined
                 }
               };
             })
@@ -9067,6 +9074,7 @@ function planCanonicalAdaptProgressionField(prog) {
   if (typeof prog.progressionSeriesName === 'string' && prog.progressionSeriesName) out.progressionSeriesName = prog.progressionSeriesName;
   // RECOMMENDED REPLACEMENTS: preserved exactly; never created here.
   if (prog.recommendedReplacements && typeof prog.recommendedReplacements === 'object') out.recommendedReplacements = planDeepClonePlain(prog.recommendedReplacements);
+  if (prog.failureRecommendation && typeof prog.failureRecommendation === 'object') out.failureRecommendation = planDeepClonePlain(prog.failureRecommendation);
   return out;
 }
 
@@ -11107,6 +11115,11 @@ function planCanonicalEditorHandleSetSetField(mi, si, ei, seti, field, rawValue)
     }
     set[field] = parsed.value;
   } else if (PLAN_CANONICAL_EDITOR_SET_STRING_FIELDS.indexOf(field) !== -1) {
+    if (field === 'loadType' && rawValue !== set.loadType) {
+      var lex = planCanonicalEditorResolveExercise(mi, si, ei);
+      var nextSets = lex.sets.map(function (x) { return x === set ? Object.assign({}, x, { loadType: rawValue }) : x; });
+      if (!planFailureAllowSetEdit(lex, nextSets, 'Changing Set ' + (seti + 1) + ' to this load type')) return;
+    }
     set[field] = rawValue;
   } else {
     planCanonicalAdapterRequire(false, 'planCanonicalEditorHandleSetSetField: unsupported field ' + field);
@@ -11119,6 +11132,252 @@ function planCanonicalEditorHandleSetSetField(mi, si, ei, seti, field, rawValue)
     planCanonicalEditorRender();
   }
 }
+// =============================================================================
+// PROGRESSION FAILURE RECOMMENDATIONS -- PLAN authoring slice.
+//
+// What the program writer recommends after ONE evaluated miss of a
+// Progression rule. PLAN only STORES the recommendation; the lifter decides
+// in TRAIN (approve, decline, or another response). A skipped session, or a
+// session without enough evidence to evaluate the rule, never triggers it.
+//
+// Storage: an OPTIONAL trailing field `failureRecommendation` on the
+// progression / canonical Rule revision (same pattern as progression series
+// and recommended replacements). Absent on every Rule saved before this
+// feature -- those read, re-hash and run exactly as before.
+//   { action: 'none' | 'continue' | 'repeatPrescription' }            or
+//   { action: 'reduceWorkingLoadFixed' | 'reduceWorkingLoadPercent' |
+//             'reduceTrainingMaxFixed' | 'reduceTrainingMaxPercent',
+//     amount: number > 0 (percent: < 100), unit: 'lb' | 'kg' | '%',
+//     duration: 'nextSession' | 'carryForward' }
+// The failure target (Working Load or Training Max) is independent of the
+// Rule's success adjustment: a %TM exercise may recommend a Working Load
+// reduction and keep its Training Max.
+//
+// COMPATIBILITY: the existing `failBehavior` field is left exactly as it is
+// ('repeat' on every Rule). TRAIN's Program Run start and progression engine
+// accept only that value, and what it actually does on a miss is keep the
+// current Working Load / TM and move on to the next planned session (each
+// %TM set uses its own planned percent) -- i.e. "Continue as Planned".
+// So a Rule with no `failureRecommendation` is shown as Continue as Planned.
+//
+// RELEASE GATE: these choices stay hidden in production until the Workout
+// Logger can honor them end to end. They appear only where a page opts in
+// (window.__ironlogPreviewFeatures.failureRecommendations === true -- the
+// test-data preview). With the gate off the editor is exactly as before and
+// never writes the field; a Rule that already has it still reads and
+// round-trips intact in either build.
+// =============================================================================
+var PLAN_FAILURE_ACTIONS = Object.freeze(['none', 'continue', 'repeatPrescription', 'reduceWorkingLoadFixed', 'reduceWorkingLoadPercent', 'reduceTrainingMaxFixed', 'reduceTrainingMaxPercent']);
+var PLAN_FAILURE_ACTION_LABELS = Object.freeze({
+  none: 'No Recommendation',
+  'continue': 'Continue as Planned',
+  repeatPrescription: 'Repeat Prescription',
+  reduceWorkingLoadFixed: 'Reduce Working Load by a Fixed Amount',
+  reduceWorkingLoadPercent: 'Reduce Working Load by a Percentage',
+  reduceTrainingMaxFixed: 'Reduce Training Max by a Fixed Amount',
+  reduceTrainingMaxPercent: 'Reduce Training Max by a Percentage'
+});
+var PLAN_FAILURE_DURATIONS = Object.freeze(['nextSession', 'carryForward']);
+var PLAN_FAILURE_DURATION_LABELS = Object.freeze({ nextSession: 'Next applicable session only', carryForward: 'Carry forward' });
+var PLAN_FAILURE_MAX_FIXED_AMOUNT = 1000;
+// Reduction amounts accept at most 2 decimal places (e.g. 2.5 lb, 1.25 kg,
+// 7.5%). Validation, storage and every summary use the same accepted value
+// -- nothing is rounded for display.
+var PLAN_FAILURE_MAX_DECIMALS = 2;
+function planFailureHasAllowedPrecision(n) {
+  // Exact: the value must equal itself rounded to 2 decimals (no tolerance),
+  // so 0.0000000001 and 1.250000001 are rejected while 0.01, 1.25 and 7.55
+  // (whose binary forms round-trip) are accepted.
+  if (typeof n !== 'number' || !Number.isFinite(n)) return false;
+  var f = Math.pow(10, PLAN_FAILURE_MAX_DECIMALS);
+  return Math.round(n * f) / f === n;
+}
+function planFailureRecommendationsEnabled() {
+  return !!(typeof window !== 'undefined' && window.__ironlogPreviewFeatures && window.__ironlogPreviewFeatures.failureRecommendations === true);
+}
+function planFailureIsReduction(action) { return typeof action === 'string' && action.indexOf('reduce') === 0; }
+function planFailureIsPercent(action) { return action === 'reduceWorkingLoadPercent' || action === 'reduceTrainingMaxPercent'; }
+function planFailureTarget(action) { return /TrainingMax/.test(action) ? 'trainingMax' : (/WorkingLoad/.test(action) ? 'workingLoad' : null); }
+// Structural check shared by the editor and the normalizer. Returns a plain
+// message, or null. `fr` absent is valid (legacy / Continue as Planned).
+function planFailureRecommendationShapeProblem(fr) {
+  if (fr === undefined || fr === null) return null;
+  if (typeof fr !== 'object' || Array.isArray(fr)) return 'The failure recommendation is malformed.';
+  if (PLAN_FAILURE_ACTIONS.indexOf(fr.action) === -1) return 'Choose a failure recommendation.';
+  if (!planFailureIsReduction(fr.action)) return null;
+  var a = fr.amount;
+  if (typeof a !== 'number' || !Number.isFinite(a) || a <= 0) return 'Enter a reduction amount greater than 0.';
+  if (!planFailureHasAllowedPrecision(a)) return 'Use at most ' + PLAN_FAILURE_MAX_DECIMALS + ' decimal places (for example 2.5 or 1.25).';
+  if (planFailureIsPercent(fr.action)) {
+    if (a >= 100) return 'Enter a percentage below 100.';
+    if (fr.unit !== '%') return 'The reduction unit is malformed.';
+  } else {
+    if (a > PLAN_FAILURE_MAX_FIXED_AMOUNT) return 'Enter a reduction of ' + PLAN_FAILURE_MAX_FIXED_AMOUNT + ' or less.';
+    if (fr.unit !== 'lb' && fr.unit !== 'kg') return 'The reduction unit is malformed.';
+  }
+  if (PLAN_FAILURE_DURATIONS.indexOf(fr.duration) === -1) return 'Choose how long the reduction lasts.';
+  return null;
+}
+// Editor-level check: the shape, plus whether this exercise has anything the
+// chosen target can change. Returns a message, or null.
+function planFailureRecommendationProblem(ex) {
+  var prog = ex && ex.progression;
+  var fr = prog && prog.failureRecommendation;
+  var shape = planFailureRecommendationShapeProblem(fr);
+  if (shape) return shape;
+  if (!fr || !planFailureIsReduction(fr.action)) return null;
+  var sets = (ex && ex.sets) || [];
+  if (planFailureTarget(fr.action) === 'trainingMax' && !sets.some(function (st) { return st.loadType === 'percentTM'; })) {
+    return 'A Training Max reduction needs at least one %TM set in this exercise. Choose a Working Load reduction, or change a set to %TM.';
+  }
+  if (planFailureTarget(fr.action) === 'workingLoad' && !sets.some(function (st) { return st.loadType === 'fixed' || st.loadType === 'percentTM'; })) {
+    return 'A Working Load reduction needs at least one set with a fixed load or a %TM load. %1RM sets and bodyweight sets (with or without added weight) are not changed by it. Choose another recommendation, or change a set to a fixed or %TM load.';
+  }
+  return null;
+}
+// What a recommendation needs from the exercise's sets, in plain words.
+function planFailureRequirementText(fr) {
+  return planFailureTarget(fr && fr.action) === 'trainingMax'
+    ? 'at least one %TM set'
+    : 'at least one set with a fixed load or a %TM load (not %1RM or bodyweight)';
+}
+// Would these sets satisfy this recommendation? (null fr -> always yes)
+function planFailureSetsFit(fr, sets) {
+  if (!fr || !planFailureIsReduction(fr.action)) return true;
+  var target = planFailureTarget(fr.action);
+  return (sets || []).some(function (st) { return target === 'trainingMax' ? st.loadType === 'percentTM' : (st.loadType === 'fixed' || st.loadType === 'percentTM'); });
+}
+// PRESCRIPTION EDITS WHILE THE CONTROLS ARE HIDDEN: a set edit that would
+// leave a saved recommendation with nothing to act on is not applied -- the
+// writer can't reach the recommendation to change it, and the draft must
+// stay saveable for unrelated edits. With the controls shown the edit goes
+// through and the existing inline warning / blocked-save dialog lead to the
+// recommendation editor. Returns true when the edit may proceed.
+function planFailureAllowSetEdit(ex, nextSets, describe) {
+  var prog = ex && ex.progression;
+  var fr = prog && prog.failureRecommendation;
+  if (planFailureRecommendationsEnabled() || !prog || !prog.enabled || !fr) return true;
+  if (!planFailureSetsFit(fr, ex.sets)) return true;      // already incompatible: any edit may help
+  if (planFailureSetsFit(fr, nextSets)) return true;
+  var msg = planGatewayExerciseName(ex) + ' has a saved recommendation on miss (' + PLAN_FAILURE_ACTION_LABELS[fr.action] + ') that needs ' + planFailureRequirementText(fr) + '. ' +
+    describe + ' would remove the last one, so the prescription was kept as it is. Your other changes are unaffected and can still be saved.';
+  planCanonicalEditorState.validationMessage = msg;
+  planCanonicalEditorRender();
+  if (typeof confirm2 === 'function') confirm2('Prescription kept', msg, function () {}, 'OK', false, null, false);
+  return false;
+}
+function planFailureFormatAmount(fr) {
+  // Exactly the accepted value (validation allows at most 2 decimals).
+  var n = String(fr.amount);
+  return planFailureIsPercent(fr.action) ? n + '%' : n + ' ' + fr.unit;
+}
+// WORKING LOAD ELIGIBILITY (intended scope for this slice): sets whose load
+// type is Fixed (with or without a written weight) or %TM. Not %1RM sets,
+// and not bodyweight sets with or without added weight. Any expansion is a
+// separate decision.
+var PLAN_FAILURE_WORKING_LOAD_SETS_TEXT = 'sets with a fixed load or a %TM load (not %1RM or bodyweight sets)';
+function planFailureScopeLabel(prog) {
+  return (prog && prog.progressionSeriesName) ? 'the “' + prog.progressionSeriesName + '” Progression series' : 'this Progression';
+}
+// One plain sentence: what changes, by how much, and for how long.
+function planFailureRecommendationSentence(ex) {
+  var prog = (ex && ex.progression) || {};
+  var fr = prog.failureRecommendation;
+  var scope = planFailureScopeLabel(prog);
+  if (!fr) return 'After a miss: continue as planned. The next applicable session uses its own planned prescription with the current Working Load / Training Max (the existing setting).';
+  if (fr.action === 'none') return 'After a miss: no recommendation from the program.';
+  if (fr.action === 'continue') return 'After a miss: continue as planned. The next applicable session uses its own planned prescription with the current Working Load / Training Max.';
+  if (fr.action === 'repeatPrescription') return 'After a miss: retry the missed prescription (as written in PLAN) at the next applicable session in ' + scope + '. The remaining prescriptions shift back one session within the series’ existing schedule, and any displaced beyond the program’s end is omitted.';
+  if (planFailureRecommendationShapeProblem(fr)) return 'After a miss: finish setting the reduction (amount and duration).';
+  var target = planFailureTarget(fr.action) === 'trainingMax' ? 'Training Max' : 'Working Load';
+  var when = fr.duration === 'carryForward'
+    ? 'starting at the next applicable session and carried forward'
+    : 'for the next applicable session only';
+  var applies = planFailureTarget(fr.action) === 'trainingMax'
+    ? 'Applies to %TM sets that use this Training Max in ' + scope + ' (they are recalculated from it).'
+    : 'Applies to ' + PLAN_FAILURE_WORKING_LOAD_SETS_TEXT + ' in ' + scope + ((ex && (ex.sets || []).some(function (st) { return st.loadType === 'percentTM'; })) ? '; the Training Max itself is kept.' : '.');
+  return 'After a miss: reduce the ' + target + ' by ' + planFailureFormatAmount(fr) + ' ' + when + '. ' + applies;
+}
+function planFailureRecommendationShort(ex) {
+  var fr = ex && ex.progression && ex.progression.failureRecommendation;
+  if (!fr || fr.action === 'continue') return 'Miss: continue as planned';
+  if (fr.action === 'none') return 'Miss: no recommendation';
+  if (fr.action === 'repeatPrescription') return 'Miss: repeat prescription';
+  if (planFailureRecommendationShapeProblem(fr)) return 'Miss: reduction not finished';
+  return 'Miss: ' + (planFailureTarget(fr.action) === 'trainingMax' ? 'TM' : 'Working Load') + ' −' + planFailureFormatAmount(fr) + ', ' + (fr.duration === 'carryForward' ? 'carried forward' : 'next session only');
+}
+function planCanonicalEditorHandleSetFailureRecommendation(mi, si, ei, field, rawValue) {
+  if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetFailureRecommendation')) return;
+  if (!planFailureRecommendationsEnabled()) return;
+  var ex = planCanonicalEditorResolveExercise(mi, si, ei);
+  planCanonicalAdapterRequire(ex.progression, 'planCanonicalEditorHandleSetFailureRecommendation: progression is not enabled at [' + mi + '][' + si + '][' + ei + ']');
+  var prog = ex.progression;
+  var prev = prog.failureRecommendation || null;
+  // One series, one recommendation: copy this member's choice to the rest.
+  var syncSeries = function () {
+    if (!prog.progressionSeriesId) return;
+    var es = planCanonicalEditorState.editorState;
+    planCanonicalEditorListProgressionSeries(es).filter(function (x) { return x.seriesId === prog.progressionSeriesId; }).forEach(function (series) {
+      series.members.forEach(function (m) {
+        var other = es.microcycles[m.mi].sessions[m.si].exercises[m.ei].progression;
+        if (other !== prog) other.failureRecommendation = planDeepClonePlain(prog.failureRecommendation);
+      });
+    });
+  };
+  if (field === 'action') {
+    planCanonicalAdapterRequire(PLAN_FAILURE_ACTIONS.indexOf(rawValue) !== -1, 'planCanonicalEditorHandleSetFailureRecommendation: unsupported action ' + rawValue);
+    if (!planFailureIsReduction(rawValue)) {
+      prog.failureRecommendation = { action: rawValue };
+    } else {
+      var keepAmount = prev && planFailureIsReduction(prev.action) && planFailureIsPercent(prev.action) === planFailureIsPercent(rawValue);
+      prog.failureRecommendation = {
+        action: rawValue,
+        amount: keepAmount ? prev.amount : null,
+        unit: planFailureIsPercent(rawValue) ? '%' : (keepAmount ? prev.unit : planUiUnit()),
+        duration: (prev && PLAN_FAILURE_DURATIONS.indexOf(prev.duration) !== -1) ? prev.duration : 'nextSession'
+      };
+    }
+    syncSeries();
+    planCanonicalEditorState.validationMessage = null;
+    planCanonicalEditorRender();
+    return;
+  }
+  planCanonicalAdapterRequire(prev && planFailureIsReduction(prev.action), 'planCanonicalEditorHandleSetFailureRecommendation: ' + field + ' needs a reduction');
+  if (field === 'amount') {
+    var parsed = planCanonicalEditorParseOptionalNumber(rawValue);
+    prev.amount = parsed.ok ? parsed.value : null;
+  } else if (field === 'duration') {
+    planCanonicalAdapterRequire(PLAN_FAILURE_DURATIONS.indexOf(rawValue) !== -1, 'planCanonicalEditorHandleSetFailureRecommendation: unsupported duration ' + rawValue);
+    prev.duration = rawValue;
+  } else {
+    planCanonicalAdapterRequire(false, 'planCanonicalEditorHandleSetFailureRecommendation: unsupported field ' + field);
+  }
+  syncSeries();
+  var hadMsg = !!planCanonicalEditorState.validationMessage;
+  planCanonicalEditorState.validationMessage = null;
+  if (hadMsg || field === 'duration') { planCanonicalEditorRender(); return; }
+  // Typing an amount: refresh the summary text in place (keeps focus).
+  if (typeof document !== 'undefined') {
+    var el = document.querySelector('[data-testid="failure-summary"][data-mi="' + mi + '"][data-si="' + si + '"][data-ei="' + ei + '"]');
+    if (el) el.textContent = planFailureRecommendationSentence(ex);
+    var top = document.querySelector('[data-testid="progression-panel"][data-mi="' + mi + '"][data-si="' + si + '"][data-ei="' + ei + '"] [data-testid="progression-summary"]');
+    if (top) top.textContent = planUiProgressionShort(ex) || 'On';
+    var warn = document.querySelector('[data-testid="failure-problem"][data-mi="' + mi + '"][data-si="' + si + '"][data-ei="' + ei + '"]');
+    if (warn) { var pr = planFailureRecommendationProblem(ex); warn.textContent = pr || ''; warn.hidden = !pr; }
+  }
+}
+
+// Canonical normalizer (save direction). Absent stays absent (older Rules
+// hash byte-identically); anything present is validated and written in one
+// fixed shape.
+function planNormalizeFailureRecommendation(fr, fieldPath) {
+  if (fr === undefined || fr === null) return undefined;
+  var problem = planFailureRecommendationShapeProblem(fr);
+  if (problem) throw new PlanCanonicalNormalizationError('planNormalizeFailureRecommendation: ' + problem + ' at ' + fieldPath, { fieldPath: fieldPath });
+  if (!planFailureIsReduction(fr.action)) return { action: fr.action };
+  return { action: fr.action, amount: fr.amount, unit: fr.unit, duration: fr.duration };
+}
+
 function planCanonicalEditorHandleSetProgressionField(mi, si, ei, field, rawValue) {
   if (!planCanonicalEditorGuardMutable('planCanonicalEditorHandleSetProgressionField')) return;
   var ex = planCanonicalEditorResolveExercise(mi, si, ei);
@@ -11242,8 +11501,33 @@ function planCanonicalEditorHandleLinkProgressionSeries(mi, si, ei, seriesId) {
   var reason = planCanonicalEditorSeriesLinkBlockReason(es, mi, si, ei, series);
   if (reason) { st.validationMessage = reason; planCanonicalEditorRender(); return { status: 'blocked', reason: reason }; }
   var p = es.microcycles[mi].sessions[si].exercises[ei].progression;
+  // PROGRESSION FAILURE RECOMMENDATIONS: check the incoming member BEFORE
+  // linking (gate on or off). If its sets can't use the series'
+  // recommendation, nothing changes and the writer is told what's needed.
+  if (series.members.length) {
+    var seriesFr = es.microcycles[series.members[0].mi].sessions[series.members[0].si].exercises[series.members[0].ei].progression.failureRecommendation;
+    var joining = es.microcycles[mi].sessions[si].exercises[ei];
+    if (seriesFr && !planFailureSetsFit(seriesFr, joining.sets)) {
+      var why = 'Can’t add ' + planGatewayExerciseName(joining) + ' to “' + series.seriesName + '”: the series’ recommendation on miss (' + PLAN_FAILURE_ACTION_LABELS[seriesFr.action] + ') needs ' + planFailureRequirementText(seriesFr) + ', and this exercise has none. It was left as it was.';
+      st.validationMessage = why;
+      planCanonicalEditorRender();
+      if (typeof confirm2 === 'function') confirm2('Couldn’t join the series', why, function () {}, 'OK', false, null, false);
+      return { status: 'blocked', reason: 'incompatibleFailureRecommendation' };
+    }
+  }
   p.progressionSeriesId = series.seriesId;
   p.progressionSeriesName = series.seriesName;
+  // PROGRESSION FAILURE RECOMMENDATIONS: a joining member takes the series'
+  // recommendation (one series, one recommendation) -- whether or not the
+  // authoring controls are shown, because save validation always requires
+  // members to agree. No recommendation on the series -> none on the member.
+  // A member whose sets can't use the series' recommendation is NOT linked:
+  // its membership and recommendation stay exactly as they were.
+  if (series.members.length) {
+    var first = es.microcycles[series.members[0].mi].sessions[series.members[0].si].exercises[series.members[0].ei].progression;
+    if (first.failureRecommendation) p.failureRecommendation = planDeepClonePlain(first.failureRecommendation);
+    else delete p.failureRecommendation;
+  }
   st.validationMessage = null;
   planCanonicalEditorRender();
   return { status: 'linked', seriesId: series.seriesId };
@@ -11294,6 +11578,11 @@ function planCanonicalEditorValidateProgressionSeries(es) {
       if (ex.exerciseId !== s.exerciseId) return label + ' links different exercises (Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + '). Remove it from the series or change the exercise back.';
       if (p.adjustmentType !== s.adjustmentType) return label + ' mixes Progression types (Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + ').';
       if ((p.progressionSeriesName || '') !== s.seriesName) return label + ' has members with different names. Rename the series to make them match.';
+      // PROGRESSION FAILURE RECOMMENDATIONS: one series, one recommendation
+      // (a carried-forward reduction changes the series' shared value).
+      var frKey = planUiDraftFingerprint(p.failureRecommendation || null);
+      if (m === 0) s._frKey = frKey;
+      else if (frKey !== s._frKey) return label + ' has members with different failure recommendations (Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + '). Give every member the same one.';
       if (!s.seriesName || s.seriesName.length > PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH) return 'Every Progression series needs a name of 1–' + PLAN_PROGRESSION_SERIES_MAX_NAME_LENGTH + ' characters.';
       var key = mem.mi + ':' + mem.si;
       if (seenSession[key]) return label + ' has two exercises in Microcycle ' + (mem.mi + 1) + ', Session ' + (mem.si + 1) + '. A series can have at most one per Session.';
@@ -11476,6 +11765,7 @@ function planCanonicalEditorHandleRemoveSet(mi, si, ei, seti) {
     planCanonicalEditorRender();
     return;
   }
+  if (!planFailureAllowSetEdit(ex, ex.sets.filter(function (x, i) { return i !== seti; }), 'Removing Set ' + (seti + 1))) return;
   ex.sets.splice(seti, 1);
   // GATEWAY SET IDENTITY: the Gateway stays tied to the same prescribed set.
   // Removing a set before it shifts it down one; removing the Gateway set
@@ -11587,7 +11877,57 @@ function planGatewayRemapAfterSwap(ex, a, b) {
 // performs its own independent check); a defensive try/catch/finally
 // around that call (planCanonicalEditorHandleSave, below) still guards
 // against anything this pass does not catch.
+// Every enabled Rule whose failure recommendation can't be saved, with where
+// it is (names as the writer sees them).
+var planFailureLastSaveBlocks = null;
+function planFailureRecommendationBlocks(es) {
+  var out = [];
+  (es.microcycles || []).forEach(function (mc, mi) {
+    (mc.sessions || []).forEach(function (se, si) {
+      (se.exercises || []).forEach(function (ex, ei) {
+        if (!ex.progression || !ex.progression.enabled) return;
+        var problem = planFailureRecommendationProblem(ex);
+        if (!problem) return;
+        out.push({ mi: mi, si: si, ei: ei, exerciseName: planGatewayExerciseName(ex), problem: problem,
+          where: (mc.name || ('Microcycle ' + (mi + 1))) + ' · ' + (se.name || ('Session ' + (si + 1))) });
+      });
+    });
+  });
+  return out;
+}
+// "Template couldn't be saved" -- shown right away when a save is blocked
+// by a recommendation that doesn't fit. The draft and the inline warning
+// stay; "Go to progression" opens the first affected Progression screen.
+function planFailureShowSaveBlockedDialog(blocks) {
+  if (!blocks || !blocks.length || typeof confirm2 !== 'function') return;
+  var b = blocks[0];
+  var st0 = planCanonicalEditorState;
+  if (!planFailureRecommendationsEnabled()) {
+    // Controls hidden (e.g. a draft that reached this state some other way):
+    // point to what the writer CAN change -- the sets -- never the hidden
+    // recommendation control.
+    var hfr = st0.editorState.microcycles[b.mi].sessions[b.si].exercises[b.ei].progression.failureRecommendation;
+    var hmsg = b.exerciseName + ' in ' + b.where + ' has a saved recommendation on miss that needs ' + planFailureRequirementText(hfr) + '. Change a set’s load type so at least one qualifies, or turn off this exercise’s Progression.';
+    confirm2('Template couldn’t be saved', hmsg, function () {
+      if (planCanonicalEditorState !== st0) return;
+      var nav = planCanonicalEditorNavEnsure();
+      nav.screen = 'session'; nav.microcycle = planCanonicalEditorResolveMicrocycle(b.mi); nav.session = planCanonicalEditorResolveSession(b.mi, b.si);
+      nav.exercise = planCanonicalEditorResolveExercise(b.mi, b.si, b.ei); nav.set = null; nav.staleNotice = null; nav.scrollTarget = { top: true };
+      planCanonicalEditorRender();
+    }, 'Go to sets', false, null, true, 'Close');
+    return;
+  }
+  var msg = b.exerciseName + ' in ' + b.where + ': ' + b.problem;
+  if (blocks.length > 1) msg += ' Also needs a fix: ' + blocks.slice(1).map(function (x) { return x.exerciseName + ' (' + x.where + ')'; }).join(', ') + '.';
+  var st = planCanonicalEditorState;
+  confirm2('Template couldn’t be saved', msg, function () {
+    if (planCanonicalEditorState !== st) return;
+    planCanonicalEditorNavOpenProgression(b.mi, b.si, b.ei);
+  }, 'Go to progression', false, null, true, 'Close');
+}
+
 function planCanonicalEditorValidateBeforeSave(es) {
+  planFailureLastSaveBlocks = null;
   if (!es || !Array.isArray(es.microcycles) || es.microcycles.length === 0) {
     return 'Add at least one microcycle before saving.';
   }
@@ -11625,6 +11965,12 @@ function planCanonicalEditorValidateBeforeSave(es) {
       }
     }
   }
+  // PROGRESSION FAILURE RECOMMENDATIONS: a chosen recommendation must be
+  // complete and fit the exercise (enabled Rules only -- an off Rule is not
+  // saved).
+  var frBlocks = planFailureRecommendationBlocks(es);
+  planFailureLastSaveBlocks = frBlocks.length ? frBlocks : null;
+  if (frBlocks.length) return frBlocks[0].exerciseName + ' (' + frBlocks[0].where + '), recommendation on miss: ' + frBlocks[0].problem;
   // PROGRESSION SERIES FOUNDATION.
   return planCanonicalEditorValidateProgressionSeries(es);
 }
@@ -11922,6 +12268,8 @@ async function planCanonicalEditorHandleSave() {
     st.outcome = { status: 'blocked', validation: true, message: fieldProblem };
     st.validationMessage = fieldProblem;
     planCanonicalEditorRender();
+    // PROGRESSION FAILURE RECOMMENDATIONS: say so at once, with a way there.
+    if (planFailureLastSaveBlocks) planFailureShowSaveBlockedDialog(planFailureLastSaveBlocks);
     return st.outcome;
   }
 
@@ -12982,6 +13330,7 @@ function planUiProgressionShort(ex) {
   if (!prog || !prog.enabled) return '';
   var txt = planProgressionSummaryText(ex).replace(/\s*•\s*Repeat on fail\s*$/, '').replace(/\s*•\s*/g, ' · ');
   if (prog.progressionSeriesName) txt += ' · ' + prog.progressionSeriesName;
+  if (planFailureRecommendationsEnabled()) txt += ' · ' + planFailureRecommendationShort(ex);
   return txt;
 }
 function planUiExerciseRowSub(ex) {
@@ -13210,9 +13559,10 @@ function planCanonicalEditorRender() {
       (prog.adjustmentType === 'increaseTM'
         ? '<label class="pl-field"><span>Training max increase (' + unit + ')</span><input type="number" inputmode="decimal" step="any" data-testid="progression-tmIncrease"' + idx + ' ' + lockedAttr + ' value="' + (prog.tmIncrease === null || prog.tmIncrease === undefined ? '' : prog.tmIncrease) + '" oninput="' + call('tmIncrease') + '"></label>'
         : '<label class="pl-field"><span>Fixed load increase (' + unit + ')</span><input type="number" inputmode="decimal" step="any" data-testid="progression-loadIncrease"' + idx + ' ' + lockedAttr + ' value="' + (prog.loadIncrease === null || prog.loadIncrease === undefined ? '' : prog.loadIncrease) + '" oninput="' + call('loadIncrease') + '"></label>') +
+      (planFailureRecommendationsEnabled() ? failureRecommendationHtml(mi, si, ei, ex) :
       '<label class="pl-field"><span>On failure</span><select data-testid="progression-failBehavior"' + idx + ' ' + lockedAttr + ' onchange="' + call('failBehavior') + '">' +
         '<option value="repeat" ' + (prog.failBehavior === 'repeat' ? 'selected' : '') + '>Repeat Prescription</option>' +
-        '</select></label>' +
+        '</select></label>') +
       '<h3 class="pl-h">Progression series</h3>' +
       progressionSeriesHtml(mi, si, ei, ex) +
       '<h3 class="pl-h">Recommended replacements</h3>' +
@@ -13229,6 +13579,36 @@ function planCanonicalEditorRender() {
   // RECOMMENDED REPLACEMENTS -- same controls, handlers, testids and copy as
   // before (sources with Remove, resolved list, missing warning, Add
   // exercise, Refresh, Add filter, Add a Collection, compatibility notice).
+  // PROGRESSION FAILURE RECOMMENDATIONS (release-gated; see
+  // planFailureRecommendationsEnabled).
+  function failureRecommendationHtml(mi, si, ei, ex) {
+    var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
+    var prog = ex.progression;
+    var fr = prog.failureRecommendation || null;
+    var current = fr ? fr.action : 'continue';
+    var fcall = function (field) { return 'planCanonicalEditorHandleSetFailureRecommendation(' + mi + ',' + si + ',' + ei + ',\'' + field + '\',this.value)'; };
+    var html = '<div class="pl-fail" data-testid="failure-recommendation"' + idx + '>' +
+      '<label class="pl-field"><span>Recommendation on miss</span><select data-testid="failure-action"' + idx + ' ' + lockedAttr + ' onchange="' + fcall('action') + '">' +
+      PLAN_FAILURE_ACTIONS.map(function (a) { return '<option value="' + a + '" ' + (a === current ? 'selected' : '') + '>' + PLAN_FAILURE_ACTION_LABELS[a] + '</option>'; }).join('') +
+      '</select></label>';
+    if (!fr) html += '<p class="pl-note" data-testid="failure-legacy-note"' + idx + '>Saved before failure recommendations. It works as Continue as Planned (the old “Repeat Prescription” label kept the current load or TM and moved on).</p>';
+    if (fr && planFailureIsReduction(fr.action)) {
+      var unitLabel = planFailureIsPercent(fr.action) ? '%' : fr.unit;
+      html += '<div class="pl-fail-row">' +
+        '<label class="pl-field"><span>Reduce by (' + unitLabel + ', up to ' + PLAN_FAILURE_MAX_DECIMALS + ' decimals)</span><input type="number" inputmode="decimal" step="any" min="0" data-testid="failure-amount"' + idx + ' ' + lockedAttr + ' value="' + (typeof fr.amount === 'number' ? fr.amount : '') + '" oninput="' + fcall('amount') + '"></label>' +
+        '<label class="pl-field"><span>For how long</span><select data-testid="failure-duration"' + idx + ' ' + lockedAttr + ' onchange="' + fcall('duration') + '">' +
+        PLAN_FAILURE_DURATIONS.map(function (d) { return '<option value="' + d + '" ' + (fr.duration === d ? 'selected' : '') + '>' + PLAN_FAILURE_DURATION_LABELS[d] + '</option>'; }).join('') +
+        '</select></label></div>' +
+        '<p class="pl-note" data-testid="failure-scope"' + idx + '>Affects: ' + escapeHtml(planFailureScopeLabel(prog)) + ' · ' + (planFailureTarget(fr.action) === 'trainingMax' ? '%TM sets that use this Training Max' : PLAN_FAILURE_WORKING_LOAD_SETS_TEXT) + '</p>';
+    }
+    var problem = planFailureRecommendationProblem(ex);
+    html += '<p class="pl-note pl-note-warn" role="alert" data-testid="failure-problem"' + idx + (problem ? '' : ' hidden') + '>' + escapeHtml(problem || '') + '</p>' +
+      '<p class="pl-fail-summary" data-testid="failure-summary"' + idx + '>' + escapeHtml(planFailureRecommendationSentence(ex)) + '</p>' +
+      '<p class="pl-note">A recommendation only: the lifter approves, declines, or chooses another response in TRAIN. A skipped session, or one without enough results to judge the rule, never triggers it.</p>' +
+      '</div>';
+    return html;
+  }
+
   function recommendedReplacementsHtml(mi, si, ei, ex) {
     var idx = planCanonicalEditorIdxAttrs(mi, si, ei);
     var rec = ex.progression.recommendedReplacements;
