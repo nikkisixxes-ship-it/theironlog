@@ -225,73 +225,6 @@ function planRunFailureUiSetsInline(orderedSets) {
 function planRunFailureUiSessionName(ns) {
   return (typeof planRunUiFormatOccurrenceName === 'function') ? planRunUiFormatOccurrenceName(ns, 'Session') : 'Session';
 }
-// ---- What an approved value does to real loads -----------------------------
-// One sentence, used everywhere an approved value is shown (approval screen,
-// waiting-Session preview, saved decision, HISTORY).
-function planRunFailureUiValueUseText(kind) {
-  return kind === 'trainingMax'
-    ? 'Your Training Max sets the load of %TM sets. Sets with a weight written in PLAN keep that weight.'
-    : 'Your Working Load fills fixed-load sets left blank in PLAN. Sets with a weight written in PLAN keep that weight.';
-}
-// The Sets one Session will open with if the series value were `amount`,
-// resolved exactly as the logger fills them (planRunLoggerRunSets), with the
-// series' active reductions. source: 'value' (filled from the Working Load /
-// Training Max), 'written' (a weight written in PLAN, kept), 'none' (not
-// filled by the Program, e.g. %1RM or bodyweight).
-function planRunFailureUiLoadsUnder(orderedSets, exerciseId, rule, v, amount) {
-  var vv = v ? Object.assign({}, v, { currentValue: Object.assign({}, v.currentValue, { amount: amount }) }) : null;
-  var ls = (typeof planRunLoggerRunSets === 'function') ? planRunLoggerRunSets(orderedSets, exerciseId, rule, vv) : [];
-  return (orderedSets || []).map(function (os, i) {
-    var p = os.prescribed || {}, s = ls[i] || {};
-    var source = (p.loadType === 'fixed' && p.weight) ? 'written'
-      : ((s.weight !== '' && s.weight !== undefined && (s.autoType === 'workingLoad' || s.autoType === 'percentTM' || s.failureAdjusted)) ? 'value' : 'none');
-    return { summary: (typeof planFormatSetSummary === 'function') ? planFormatSetSummary(p, false, false) : '', weight: s.weight || '', source: source, reduced: !!s.failureAdjusted };
-  });
-}
-// The next applicable Session of a series, from a decision context:
-// { name, orderedSets, exerciseId, rule, v } or null.
-function planRunFailureUiNextSession(ctx, occurrenceId) {
-  if (!ctx || !ctx.isSeries || !occurrenceId) return null;
-  var occ = ctx.memberOccurrences && ctx.memberOccurrences[occurrenceId];
-  if (!occ) return null;
-  var pres = planRunFailureEffectivePrescription(ctx.state, occ, ctx.seriesId);
-  var own = planRunFailureSeriesAssignment(occ, ctx.seriesId);
-  if (!pres || !own) return null;
-  var st = ctx.state;
-  return {
-    name: occ.nameSnapshot, orderedSets: pres.orderedSets, retried: !!pres.overridden,
-    exerciseId: (typeof planRunSeriesActiveExerciseId === 'function' ? planRunSeriesActiveExerciseId(st) : null) || own.assignment.exerciseId,
-    rule: own.rule,
-    v: { valueKind: st.valueKind, currentValue: st.currentValue, temporaryAdjustments: st.temporaryAdjustments || [], loadAdjustments: st.loadAdjustments || [] }
-  };
-}
-// Per-Set rows: approve/decline loads side by side (decline omitted for a
-// saved decision). Concise, and the same wording on every screen.
-function planRunFailureUiLoadRowsHtml(approveRows, declineRows, unit) {
-  var w = function (x) { return x ? x + ' ' + unit : ''; };
-  return '<ul class="fr-vloads" data-testid="fr-value-loads">' + approveRows.map(function (r, i) {
-    var dr = declineRows ? declineRows[i] : null;
-    var txt;
-    if (r.source === 'none') txt = 'not filled by the Program';
-    else if (r.source === 'written') txt = w(r.weight) + (r.reduced ? ' (written in PLAN, reduced by your reduction)' : ' (written in PLAN)') + (dr ? ' either way' : '');
-    else if (!dr || dr.weight === r.weight) txt = w(r.weight) + (dr ? ' either way' : '');
-    else txt = w(r.weight) + ' if you approve · ' + (dr.weight ? w(dr.weight) : 'not filled') + ' if you decline';
-    return '<li data-testid="fr-value-load-row" data-source="' + r.source + '" data-approve="' + planRunFailureUiEsc(r.weight) + '"' + (dr ? ' data-decline="' + planRunFailureUiEsc(dr.weight) + '"' : '') + '>Set ' + (i + 1) + ' · ' + planRunFailureUiEsc(r.summary) + ' — ' + planRunFailureUiEsc(txt) + '</li>';
-  }).join('') + '</ul>';
-}
-// The consequence block: which sets use the value, and the loads they get.
-function planRunFailureUiValueConsequencesHtml(next, kind, approvedAmount, declinedAmount) {
-  var noun = kind === 'trainingMax' ? 'Training Max' : 'Working Load';
-  var h = '<p class="fr-muted" data-testid="fr-value-use">' + planRunFailureUiEsc(planRunFailureUiValueUseText(kind)) + '</p>';
-  if (!next) return h;
-  var a = planRunFailureUiLoadsUnder(next.orderedSets, next.exerciseId, next.rule, next.v, approvedAmount);
-  var d = declinedAmount === undefined ? null : planRunFailureUiLoadsUnder(next.orderedSets, next.exerciseId, next.rule, next.v, declinedAmount);
-  h += '<div class="fr-label" data-testid="fr-next-loads-title">' + planRunFailureUiEsc(planRunFailureUiSessionName(next.name)) + (next.retried ? ' (retry)' : '') + ' — loads</div>' +
-    planRunFailureUiLoadRowsHtml(a, d, next.v.currentValue.unit);
-  if (!a.some(function (r) { return r.source === 'value'; })) h += '<p class="fr-muted" data-testid="fr-value-unused">None of these sets use your ' + noun + ', so their loads don’t depend on it.</p>';
-  if ((next.v.temporaryAdjustments || []).length || (next.v.loadAdjustments || []).length) h += '<p class="fr-muted" data-testid="fr-loads-include-reduction">These loads include your active reduction.</p>';
-  return h;
-}
 function planRunFailureUiConsequencesHtml(plan) {
   if (!plan) return '';
   if (!plan.ok) return '<p class="fr-problem" role="alert" data-testid="fr-problem">' + planRunFailureUiEsc(plan.message) + '</p>';
@@ -339,8 +272,7 @@ function planRunFailureUiOtherFormHtml() {
     '<button type="button" class="btn fr-secondary" data-testid="fr-other-cancel" data-fr-action="other-cancel">Back to recommendation</button></div>';
   return h + '</div>';
 }
-// ctx (optional): the decision context, to list the next Session's loads.
-function planRunFailureUiDecidedHtml(d, ctx) {
+function planRunFailureUiDecidedHtml(d) {
   var labels = d.kind === 'success'
     ? { accepted: 'Approved the increase', declined: 'Declined the increase', superseded: 'Not decided — a later Session ran first' }
     : { accepted: 'Accepted the recommendation', declined: 'Declined — continued as planned', chosen: 'Chose another response', superseded: 'Not decided — a later Session ran first' };
@@ -348,12 +280,7 @@ function planRunFailureUiDecidedHtml(d, ctx) {
   if (d.response && d.response.choice !== 'declined' && d.kind !== 'success') h += ': ' + planRunFailureUiEsc(PLAN_RUN_FAILURE_ACTION_LABELS[d.response.action]) + (d.response.amount != null ? ' (' + d.response.amount + (d.response.unit === '%' ? '%' : ' ' + d.response.unit) + (d.response.duration ? ', ' + (d.response.duration === 'carryForward' ? 'carried forward' : 'next session only') : '') + ')' : '');
   h += '</p>';
   if (d.effects && d.effects.note) h += '<p>' + planRunFailureUiEsc(d.effects.note) + '</p>';
-  if (d.effects && d.effects.kind === 'valueChange') {
-    var vk = d.effects.newValue.kind;
-    h += '<p data-testid="fr-approved-value">Approved ' + (vk === 'trainingMax' ? 'Training Max' : 'Working Load') + ': ' + planRunFailureUiEsc(planRunFailureFormatValue(d.effects.previousValue)) + ' → ' + planRunFailureUiEsc(planRunFailureFormatValue(d.effects.newValue)) + '</p>';
-    var nextId = (ctx && ctx.isSeries && ctx.state) ? planRunFailureLaterMembers(ctx.state, d.occurrenceId)[0] : null;
-    h += planRunFailureUiValueConsequencesHtml(nextId ? planRunFailureUiNextSession(ctx, nextId) : null, vk, d.effects.newValue.amount);
-  }
+  if (d.effects && d.effects.kind === 'valueChange') h += '<p>Approved value: ' + planRunFailureUiEsc(planRunFailureFormatValue(d.effects.previousValue)) + ' → ' + planRunFailureUiEsc(planRunFailureFormatValue(d.effects.newValue)) + '</p>';
   if (d.effects && d.effects.kind === 'scheduleShift') h += '<p>Retry scheduled; ' + d.effects.shiftedOccurrenceIds.length + ' later Session' + (d.effects.shiftedOccurrenceIds.length === 1 ? '' : 's') + ' moved back one place.' + (d.effects.omitted ? ' Left out: ' + planRunFailureUiEsc(planRunFailureUiSetsInline(d.effects.omitted.orderedSets)) + '.' : '') + '</p>';
   if (d.effects && (d.effects.kind === 'temporaryAdjustment' || d.effects.kind === 'loadAdjustment')) {
     var a = d.effects.adjustment;
@@ -393,7 +320,7 @@ function planRunFailureUiRender() {
   if (st.phase === 'decided' || st.phase === 'saved') {
     if (st.phase === 'saved') h += '<p class="fr-ok" data-testid="fr-saved" role="status">Decision saved.</p>';
     if (st.message) h += '<p class="fr-muted" data-testid="fr-message">' + planRunFailureUiEsc(st.message) + '</p>';
-    h += planRunFailureUiDecidedHtml(d, d.kind === 'success' ? ctx : null);
+    h += planRunFailureUiDecidedHtml(d);
     var more = st.items.filter(function (it) { return it.decision.status === 'pending' && it.decision.decisionId !== d.decisionId; }).length;
     h += '<div class="fr-actions">' + (more ? '<button type="button" class="btn fr-primary" data-testid="fr-next" data-fr-action="reload">Next decision</button>' : '') +
       '<button type="button" class="btn fr-secondary" data-testid="fr-back" data-fr-action="back">Back to TRAIN</button></div></div>';
@@ -449,14 +376,12 @@ function planRunFailureUiSuccessHtml(st, d) {
     ? 'Applies to the later Sessions of this series: ' + scope.names.map(function (n) { return planRunFailureUiSessionName(n); }).join(', ') + '.'
     : (scope.kind === 'seriesEnded' ? 'This series has no remaining Session, so the approved value is only recorded.' : 'This exercise’s progression belongs to this one Session, so the approved value is only recorded; no later Session uses it.');
   h += '<div class="fr-scope" data-testid="fr-scope">' + planRunFailureUiEsc(scopeText) + '</div></div>';
-  var next = scope.kind === 'series' ? planRunFailureUiNextSession(st.ctx, scope.occurrenceIds[0]) : null;
-  h += planRunFailureUiValueConsequencesHtml(next, d.valueAtEvaluation.kind, d.proposal.proposedValue.amount, sx.current.amount);
   if (plan && !plan.ok) h += '<p class="fr-problem" role="alert" data-testid="fr-problem">' + planRunFailureUiEsc(plan.message) + '</p>';
   h += '<div class="fr-label">If you decline</div><p class="fr-muted">Your approved ' + noun + ' stays ' + planRunFailureUiEsc(planRunFailureFormatValue(sx.current)) + '.</p>';
   h += '<div class="fr-actions"><button type="button" class="btn fr-primary" data-testid="fr-accept" data-fr-action="accept-success"' + (plan && plan.ok ? '' : ' disabled') + '>Approve increase</button>' +
     '<button type="button" class="btn fr-secondary" data-testid="fr-decline" data-fr-action="decline">Decline</button>' +
     '<button type="button" class="btn fr-secondary" data-testid="fr-back" data-fr-action="back">Decide later</button></div>' +
-    (scope.kind === 'series' ? '<p class="fr-muted">Until you decide, the next Session of this series waits.</p>' : '');
+    (scope.kind === 'series' ? '<p class="fr-muted">Until you decide, the next Session of this series waits. It will use ' + planRunFailureUiEsc(planRunFailureFormatValue(d.proposal.proposedValue)) + ' if you approve, or ' + planRunFailureUiEsc(planRunFailureFormatValue(sx.current)) + ' if you decline.</p>' : '');
   return h;
 }
 
@@ -546,7 +471,7 @@ function planRunFailureUiHistDecisionText(d) {
 }
 function planRunFailureUiHistChangeText(d, it) {
   var e = d.effects; if (!e) return '';
-  if (e.kind === 'valueChange') return 'Approved ' + (e.newValue.kind === 'trainingMax' ? 'Training Max' : 'Working Load') + ': ' + planRunFailureFormatValue(e.previousValue) + ' → ' + planRunFailureFormatValue(e.newValue) + '. ' + planRunFailureUiValueUseText(e.newValue.kind);
+  if (e.kind === 'valueChange') return 'Approved ' + (e.newValue.kind === 'trainingMax' ? 'Training Max' : 'Working Load') + ': ' + planRunFailureFormatValue(e.previousValue) + ' → ' + planRunFailureFormatValue(e.newValue);
   if (e.kind === 'scheduleShift') return 'Schedule: retry in ' + e.shiftedOccurrenceIds.map(function (o) { return planRunFailureUiSessionName(it.shiftedNames[o]); }).join(', then ') + ' (each later prescription moved back one Session)';
   if (e.kind === 'temporaryAdjustment' || e.kind === 'loadAdjustment') {
     var a = e.adjustment;

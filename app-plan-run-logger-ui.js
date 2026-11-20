@@ -485,38 +485,6 @@ function planRunLoggerOccurrenceSeriesLinks(occurrence) {
 function planRunLoggerAppWeightUnit() {
   return (typeof appDb !== 'undefined' && appDb && appDb.unit === 'kg') ? 'kg' : 'lb';
 }
-// The sets a Run Session opens with, as the logger fills them: the app's own
-// planSetToLoggerSet (a written weight stays; a blank fixed load takes the
-// Working Load; a %TM load comes from the Training Max), then any accepted
-// reductions from a decision after a miss. Shared by the logger and the
-// decision previews so both always agree.
-//   orderedSets: the prescription's ordered sets
-//   exerciseId:  the exercise the row opens with
-//   rule:        the series' rule entry ({ adjustmentType }), or null
-//   v:           the series value ({ valueKind, currentValue, temporaryAdjustments,
-//                loadAdjustments }), or null
-// Returns planSetToLoggerSet results (weight is '' when nothing fills it);
-// a set changed by a reduction carries failureAdjusted: true.
-function planRunLoggerRunSets(orderedSets, exerciseId, rule, v) {
-  var usable = !!(v && v.currentValue && v.currentValue.amount !== null && v.currentValue.unit === planRunLoggerAppWeightUnit());
-  var activeCtx = null, progressionCtx = null;
-  if (usable && rule) {
-    var holder = {}; holder[exerciseId] = { value: v.currentValue.amount };
-    activeCtx = v.valueKind === 'workingLoad' ? { workingLoads: holder } : { trainingMaxes: holder };
-    progressionCtx = { enabled: true, adjustmentType: rule.adjustmentType };
-  }
-  var frAdjusting = !!(usable && typeof planRunFailureResolveSetLoad === 'function' &&
-    ((v.temporaryAdjustments && v.temporaryAdjustments.length) || (v.loadAdjustments && v.loadAdjustments.length)));
-  var frCtx = frAdjusting ? { valueKind: v.valueKind, amount: v.currentValue.amount, unit: v.currentValue.unit, temps: v.temporaryAdjustments || [], persistent: v.loadAdjustments || [] } : null;
-  return (orderedSets || []).map(function (os) {
-    var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, exerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
-    if (frCtx) {
-      var frLoad = planRunFailureResolveSetLoad(os.prescribed, frCtx);
-      if (frLoad !== null && String(frLoad) !== loggerSet.weight) { loggerSet.weight = String(frLoad); loggerSet.autoFilled = true; loggerSet.failureAdjusted = true; }
-    }
-    return loggerSet;
-  });
-}
 // The series value (if any) this assignment's prescriptions resolve from.
 // Only a resolved value in the app's current weight unit is used; anything
 // else leaves the prescription exactly as the Session snapshot has it
@@ -571,10 +539,15 @@ function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
     // reductions adjust the loads filled in below. Both come from the same
     // verified series read; the Session snapshot itself is unchanged.
     var frOrderedSets = (sv && sv.value.scheduleOverride) ? sv.value.scheduleOverride.orderedSets : a.orderedSets;
-    // The same load resolution the decision previews use (one function, so
-    // what a preview says a set will get is what the logger fills).
-    var sets = planRunLoggerRunSets(frOrderedSets, rowExerciseId, sv ? sv.rule : null, sv ? sv.value : null).map(function (loggerSet, si) {
-      var os = frOrderedSets[si];
+    var frAdjusting = !!(sv && sv.usable && typeof planRunFailureResolveSetLoad === 'function' &&
+      ((sv.value.temporaryAdjustments && sv.value.temporaryAdjustments.length) || (sv.value.loadAdjustments && sv.value.loadAdjustments.length)));
+    var frCtx = frAdjusting ? { valueKind: sv.value.valueKind, amount: sv.value.currentValue.amount, unit: sv.value.currentValue.unit, temps: sv.value.temporaryAdjustments || [], persistent: sv.value.loadAdjustments || [] } : null;
+    var sets = (frOrderedSets || []).map(function (os) {
+      var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, rowExerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
+      if (frCtx) {
+        var frLoad = planRunFailureResolveSetLoad(os.prescribed, frCtx);
+        if (frLoad !== null && String(frLoad) !== loggerSet.weight) { loggerSet.weight = String(frLoad); loggerSet.autoFilled = true; loggerSet.failureAdjusted = true; }
+      }
       loggerSet.planSetId = os.planSetId;
       loggerSet.isPR = false;
       loggerSet.isNew1RM = false;

@@ -2410,8 +2410,6 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 #page-run-failure-decision .fr-load-row { display: flex; justify-content: space-between; gap: 12px; font-size: 15px; padding: 2px 0; }
 #page-run-failure-decision .fr-load-row s { color: var(--text2); }
 #page-run-failure-decision .fr-problem { color: #ffb3ab; font-weight: 600; }
-#page-run-failure-decision .fr-vloads, #page-run-session-preview .fr-vloads { margin: 6px 0 0; padding-left: 20px; font-size: 15px; line-height: 1.45; }
-#page-run-failure-decision .fr-vloads li, #page-run-session-preview .fr-vloads li { margin-bottom: 4px; }
 #page-run-failure-decision .fr-ok { color: #9fd8a0; font-weight: 600; }
 #page-run-failure-decision .fr-field { display: block; margin-top: 10px; }
 #page-run-failure-decision .fr-field span { display: block; font-size: 13px; color: var(--text2); margin-bottom: 4px; }
@@ -2424,8 +2422,6 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 .fr-card-btn { margin-top: 8px; width: 100%; min-height: 44px; justify-content: center; border-radius: 2px; background: #121212; color: var(--text2); border: 1px solid #FF6A00; }
 #page-run-session-preview .fr-preview-gate { margin: 0 16px 12px; padding: 10px 12px; border-left: 2px solid #FF6A00; background: var(--surface2); }
 #page-run-session-preview .fr-preview-gate p { margin: 0 0 8px; }
-#page-run-session-preview .fr-preview-gate .fr-label { margin-top: 8px; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--text2); }
-#page-run-session-preview .fr-preview-gate .fr-muted { color: var(--text2); font-size: 14px; }
 #page-run-session-preview .rsp-note { font-size: 14px; color: var(--accent); margin: 2px 0 4px; }
 /* Success approval + HISTORY program details (release-gated) */
 #page-run-failure-decision .fr-eval { margin-top: 4px; font-size: 14px; }
@@ -2442,10 +2438,3 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
 .hist-prog .fr-tag { display: inline-block; white-space: nowrap; font-size: 11px; color: var(--accent); border: 1px solid var(--accent); padding: 0 5px; border-radius: 2px; }
 .hist-prog .fr-muted { color: var(--text2); }
 .hist-omit { color: var(--text2); }
-
-/* APP UPDATES -- "a new version is ready" banner (app-update.js). */
-.app-update-banner { position: fixed; left: 8px; right: 8px; bottom: calc(env(safe-area-inset-bottom, 0px) + 76px); z-index: 10000; display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface2, #222); color: var(--text, #fff); border-left: 3px solid var(--accent, #FF6A00); border-radius: 4px; box-shadow: 0 4px 16px rgba(0,0,0,.45); font-size: 14px; line-height: 1.35; }
-.app-update-banner .app-update-msg { flex: 1; }
-.app-update-banner .app-update-btn { flex: none; min-height: 40px; padding: 0 14px; border: 1px solid var(--accent, #FF6A00); background: var(--accent, #FF6A00); color: #fff; font-weight: 600; border-radius: 3px; }
-.app-update-banner .app-update-btn:disabled { opacity: .45; }
-.app-update-banner .app-update-later { flex: none; min-height: 40px; padding: 0 10px; border: 1px solid var(--border, #444); background: transparent; color: var(--text2, #bbb); border-radius: 3px; }
