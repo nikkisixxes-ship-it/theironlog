@@ -1272,15 +1272,26 @@ function planRunUiRenderSessionPreviewContent(run, occurrence, seriesValuesByRul
   html += '</div>';
   if (frPendingSeries.length) {
     var frPd = (frPendingSeries[0].pendingDecisions || [])[0];
-    var frGateText;
+    var frGateHtml;
     if (frPd && frPd.kind === 'success') {
       var frNoun = frPd.valueAtEvaluation.kind === 'trainingMax' ? 'Training Max' : 'Working Load';
-      frGateText = 'You passed the last Session of “' + escapeHtml(frPendingSeries[0].seriesName) + '”. Approve or decline the proposed increase before starting this Session.</p>' +
-        '<p data-testid="planrun-decision-gate-values">If you approve, this Session uses a ' + frNoun + ' of ' + escapeHtml(planRunFailureFormatValue(frPd.proposedValue)) + '. If you decline, it uses ' + escapeHtml(planRunFailureFormatValue(frPd.valueAtEvaluation)) + '.';
+      // What this Session's sets would actually get either way -- resolved
+      // exactly as the logger fills them (planRunLoggerRunSets).
+      var frNext = null;
+      (occurrence.assignments || []).forEach(function (a) {
+        var sv0 = (!frNext && typeof planRunLoggerSeriesValueForAssignment === 'function') ? planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId) : null;
+        if (sv0 && sv0.value === frPendingSeries[0]) {
+          frNext = { name: occurrence.nameSnapshot, orderedSets: sv0.value.scheduleOverride ? sv0.value.scheduleOverride.orderedSets : a.orderedSets, retried: !!sv0.value.scheduleOverride,
+            exerciseId: (typeof sv0.value.activeExerciseId === 'string') ? sv0.value.activeExerciseId : a.exerciseId, rule: sv0.rule, v: sv0.value };
+        }
+      });
+      frGateHtml = '<p>You passed the last Session of “' + escapeHtml(frPendingSeries[0].seriesName) + '”. Approve or decline the proposed increase before starting this Session.</p>' +
+        '<p data-testid="planrun-decision-gate-values">' + frNoun + ': ' + escapeHtml(planRunFailureFormatValue(frPd.proposedValue)) + ' if you approve, ' + escapeHtml(planRunFailureFormatValue(frPd.valueAtEvaluation)) + ' if you decline.</p>' +
+        (typeof planRunFailureUiValueConsequencesHtml === 'function' ? planRunFailureUiValueConsequencesHtml(frNext, frPd.valueAtEvaluation.kind, frPd.proposedValue.amount, frPendingSeries[0].currentValue.amount) : '');
     } else {
-      frGateText = 'Decide what to do after your last miss in “' + escapeHtml(frPendingSeries[0].seriesName) + '” before starting this Session.';
+      frGateHtml = '<p>Decide what to do after your last miss in “' + escapeHtml(frPendingSeries[0].seriesName) + '” before starting this Session.</p>';
     }
-    html += '<div class="fr-preview-gate" data-testid="planrun-decision-gate"><p>' + frGateText + '</p>' +
+    html += '<div class="fr-preview-gate" data-testid="planrun-decision-gate">' + frGateHtml +
       '<button type="button" class="btn fr-card-btn" data-testid="planrun-review-decision-btn" data-planrun-action="failure-decisions">Review decision</button></div>';
   }
   if (blockedByEnd) {
