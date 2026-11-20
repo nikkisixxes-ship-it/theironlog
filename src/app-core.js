@@ -4498,6 +4498,17 @@ function toggleRecentCard(wid) {
   document.querySelectorAll('.recent-card-expanded').forEach(el => { el.style.display = 'none'; }); document.querySelectorAll('.recent-card-chevron').forEach(el => { el.style.transform = ''; });
   if (!isOpen) { expanded.innerHTML = buildRecentExpandedHtml(wid); expanded.style.display = 'block'; if (chevron) chevron.style.transform = 'rotate(180deg)'; if (typeof planRunFailureUiHistoryFill === 'function') planRunFailureUiHistoryFill(wid, expanded); }
 }
+// HISTORY "Program details": show/hide the whole section. Its own tap only
+// (the card around it also opens/closes on tap).
+function histProgToggle(btn, ev) {
+  if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+  const box = btn && btn.closest('[data-hist-prog]'); if (!box) return;
+  const body = box.querySelector('[data-hist-prog-body]'); if (!body) return;
+  const open = btn.getAttribute('aria-expanded') !== 'true';
+  btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+  body.hidden = !open;
+  box.classList.toggle('open', open);
+}
 function buildRecentExpandedHtml(wid) {
   const w = appDb.workouts.find(x => x.id === wid); if (!w) return '';
   const prSets = storedWorkoutPRSets(w); // duplicate weight-PR correction (read-only)
@@ -4556,10 +4567,16 @@ function buildRecentExpandedHtml(wid) {
     ? `<span style="flex:1;text-align:center;font-size:12px;color:var(--text3);align-self:center">Completed via Program Run — not editable here</span>`
     : `<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="editHistoricalWorkout('${wid}');event.stopPropagation()">Edit</button>`;
   // FAILURE RECOMMENDATIONS / SUCCESS APPROVAL (release-gated): a Program
-  // Run workout gets a "Program details" panel, filled from the persisted
-  // Run records after the card opens (planRunFailureUiHistoryFill).
+  // Run workout gets a "Program details" section, filled from the persisted
+  // Run records after the card opens (planRunFailureUiHistoryFill). It is ONE
+  // disclosure for the whole section, collapsed every time the card is
+  // (re)built -- i.e. whenever the card is opened. The fill only writes into
+  // the body, so it never changes whether the section is open.
   const progPanel = (isCanonical && w.planRunId && w.planOccurrenceId && typeof planRunFailureUiHistoryEnabled === 'function' && planRunFailureUiHistoryEnabled())
-    ? `<div class="hist-prog" data-testid="hist-prog" data-hist-prog="${wid}"><div class="hist-prog-h">Program details</div><div class="fr-muted">Loading…</div></div>` : '';
+    ? `<div class="hist-prog" data-testid="hist-prog" data-hist-prog="${wid}" onclick="event.stopPropagation()">`
+      + `<button type="button" class="hist-prog-toggle" data-testid="hist-prog-toggle" aria-expanded="false" aria-controls="hist-prog-body-${wid}" onclick="histProgToggle(this, event)">`
+      + `<span class="hist-prog-toggle-label">Program details</span><span class="hist-prog-chev" aria-hidden="true">&rsaquo;</span></button>`
+      + `<div class="hist-prog-body" id="hist-prog-body-${wid}" data-hist-prog-body data-testid="hist-prog-body" hidden><div class="fr-muted">Loading…</div></div></div>` : '';
   return `<div class="recent-expanded-inner"><div class="recent-ex-list">${exercisesHtml}</div>${progPanel}<div class="recent-expanded-actions">${editOrNotice}<button class="btn btn-secondary" style="flex:1;justify-content:center" onclick="openCopyModal('${wid}');event.stopPropagation()">Export</button></div></div>`;
 }
 function openExpandedVideosModal(wid, exIdx) {

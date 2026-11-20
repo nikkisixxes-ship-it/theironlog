@@ -1,0 +1,25 @@
+{
+  "build": "2026-11-20b",
+  "files": {
+    "styles.css": "d90f127647bfe3f23d97967458a0014930d0671fd5cc4cac65381b100dbef6c2",
+    "app-update.js": "c87e2e97eb0336837cdd5b894002a414e9c1303a695793818d18d7ec59ccfe52",
+    "firebase.js": "8092c59e0f779277e99eca7c40f7629cb944e78c95298992831c88dd4548faec",
+    "app-data.js": "ad92651383f890ff14224f6f0774d0cdcc93b2d2ca40f0758db759b905451daf",
+    "app-library.js": "0caa26eb0f05bca1d5d9147ae61f204d4a8318f61775ece1c7952ff6c917c0e3",
+    "app-collections.js": "6f5120caf1681659d0b921de63efd94b1465240325e9a81815ec6de27c0db237",
+    "app-plan.js": "efc8f62893af3a3a8bda1d6219389f24f291012f01b700a58d083586a15ad8c1",
+    "firebase-plan-progression.js": "a1addd895158b13ad9a725c6696f553a93553d39a2ec03ac3dd3fd42356f43f7",
+    "plan-run-model.js": "67480bb382237a95de789abe2744ef160093c3a0d3730d7acddde38a0f1fdaaa",
+    "plan-run-failure-model.js": "6566d53e4e5e8635f73b51641b1f0593f629b735c1b493c63595369b2a39f949",
+    "firebase-plan-run.js": "d8ca7ffb6e176cab875d1a94b22591f13f0bba2cf836c9d5a1152ed3d13db088",
+    "app-plan-run-ui.js": "e9805351a916216d1c3f154e06c6c2ab3790312aee501d1bc7105f7efaff426f",
+    "app-plan-run-start-ui.js": "1cdb0a834b36b38478663c1a857d1eeb528660e4541b29d78a850675904445b1",
+    "app-plan-run-training-max-ui.js": "546989202b22cc09cb578426d75ece4d83499a1e4c1bcdbd4835fc132734437e",
+    "app-plan-run-logger-ui.js": "b283c1c5b4c06cf6c82d2a12fb6ae1836c991360934f11cf9f16decae7c27cb6",
+    "app-plan-run-failure-ui.js": "cad5782bbef8041a7239ecb9f99a46b624a23844a43012c9c6fd31e4aa2ae53a",
+    "app-plan-run-end-ui.js": "4ffc23b2946f5efa83ef90b1eb02246934b8608401e409c7bfd12742c4b7148c",
+    "app-core.js": "34d7ca44be14532f54b35eae34534ff0532c73785d5af6098d25d90ecd5f4713",
+    "app-load-calc.js": "92a1f7e7c137a66ca0be0554799866b8afe11b010870ebacf5cf2aadee239272",
+    "app-rest-timer.js": "b11b3f89274a65a3166dae378d55fc4e1e215a568eb852fc155ac12bba429863"
+  }
+}

@@ -519,15 +519,18 @@ function planRunFailureUiHistoryFill(wid, containerEl) {
   var w = ((typeof appDb !== 'undefined' && appDb.workouts) || []).filter(function (x) { return x.id === wid; })[0];
   var box = containerEl && containerEl.querySelector('[data-hist-prog]');
   if (!w || !box || !w.planRunId || !w.planOccurrenceId) return;
+  // Fill only the section's body: the "Program details" toggle (and so
+  // whether the section is open) is left exactly as the person set it.
+  var target = box.querySelector('[data-hist-prog-body]') || box;
   var uid = planRunFailureUiUid();
   var ep = (planRunFailureUiHistoryEpoch[wid] || 0) + 1; planRunFailureUiHistoryEpoch[wid] = ep;
   Promise.resolve(fsPlanRunPersistence.fsPlanRunReadWorkoutProgressionHistory({ ownerUid: uid, planRunId: w.planRunId, occurrenceId: w.planOccurrenceId, workoutId: w.id })).then(function (r) {
     if (planRunFailureUiHistoryEpoch[wid] !== ep || !box.isConnected) return;
-    box.innerHTML = planRunFailureUiHistoryHtml(r);
+    target.innerHTML = planRunFailureUiHistoryHtml(r, target !== box);
     box.setAttribute('data-loaded', '1');
   }, function () {
     if (planRunFailureUiHistoryEpoch[wid] !== ep || !box.isConnected) return;
-    box.innerHTML = '<div class="hist-prog-h">Program details</div><div class="fr-muted" data-testid="hist-prog-error">Couldn’t load the program details right now.</div>';
+    target.innerHTML = (target !== box ? '' : '<div class="hist-prog-h">Program details</div>') + '<div class="fr-muted" data-testid="hist-prog-error">Couldn’t load the program details right now.</div>';
     box.setAttribute('data-loaded', '1');
   });
 }
@@ -554,8 +557,9 @@ function planRunFailureUiHistChangeText(d, it) {
   }
   return e.note || '';
 }
-function planRunFailureUiHistoryHtml(r) {
-  var h = '<div class="hist-prog-h">Program details</div>';
+// noHeading: the section already has its "Program details" toggle.
+function planRunFailureUiHistoryHtml(r, noHeading) {
+  var h = noHeading ? '' : '<div class="hist-prog-h">Program details</div>';
   if (!r || r.outcome !== 'verified') return h + '<div class="fr-muted" data-testid="hist-prog-error">Program details aren’t available for this workout.</div>';
   var shown = r.items.filter(function (it) { return it.evaluation || it.decisions.length || it.governing.retried || it.adjustmentsUsed.length; });
   if (!shown.length) return h + '<div class="fr-muted" data-testid="hist-prog-empty">No progression was evaluated in this workout.</div>';
