@@ -530,6 +530,8 @@ function openLibMenuDropdown(e) {
   if (libPurpose === 'browse') {
     items.push({ divider: true });
     items.push({ label: 'Add Custom Exercise', icon: '', action: `openCreateCustomExercise('browse')` });
+    // Stage 2: the Load Calculator's equipment editor (account equipment), usable without a workout.
+    if (typeof openEquipmentEditor === 'function') items.push({ label: 'Equipment', icon: '', action: `openEquipmentEditor()` });
   }
   showDropdown(e.currentTarget, items);
 }

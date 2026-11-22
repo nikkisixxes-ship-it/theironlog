@@ -1,12 +1,13 @@
 // ==================== LOAD CALCULATOR ====================
-// A standalone tool opened from the active Workout Logger's "•••" menu.
-// It never reads or writes the workout: no sets, prescriptions,
-// progression, HISTORY, the workout timer, the recovery draft, or Firestore.
+// A standalone, manual tool opened from the active Workout Logger's "•••"
+// menu; its equipment editor also opens from LIBRARY. It never reads or
+// writes the workout: no sets, prescriptions, progression, HISTORY, the
+// workout timer or the recovery draft.
 //
-// EQUIPMENT is kept on this device only, per signed-in user, in
-// localStorage under LC_STORE_KEY_PREFIX + uid. The pattern (prefix + uid,
-// every storage access guarded) matches the active-workout recovery draft
-// in app-core.js.
+// EQUIPMENT (Stage 2) belongs to the signed-in account and is kept in
+// Firestore by app-equipment.js (loaded before this file). Equipment saved
+// on a device before Stage 2 (localStorage, LC_STORE_KEY_PREFIX + uid) is a
+// read-only backup that can be copied to the account; it is never changed.
 //
 // NUMBERS: every weight is turned into a whole number of thousandths
 // ("milli" units: 2.5 -> 2500) before any comparison or sum, so valid
@@ -28,45 +29,7 @@ const LC_STORE_KEY_PREFIX = 'ironlog.loadCalculator:'; // + owner uid
 const LC_MAX_WEIGHT_M = 100000 * 1000;   // 100,000 (lb or kg)
 const LC_MAX_PAIRS = 50;
 const LC_MAX_PLATE_TYPES = 20;
-const LC_MAX_SETTINGS = 1000;
-const LC_DP_STATE_LIMIT = 200000;
 
-// ---- REP QuickDraw switch positions ----
-// Read from the user's "REP Quickdraw" chart (12 positions, top to bottom,
-// in the chart's own orientation). Both columns of the chart are identical
-// in every setting, so one string per weight describes the whole diagram.
-//   '-' off   'F' 5 lb position on   'H' 2.5 lb position on
-// Position labels (LC_QD_LABELS) are the chart's own side labels. Each
-// string was checked: 5 + 5 x (F count) + 2.5 x (H count) = its weight.
-// The "two ends" are positions 1-6 (top) and 7-12 (bottom); a setting is
-// UNEVEN when those two ends carry different weight.
-const LC_QD_LABELS = [5, 5, 5, 5, 5, 2.5, 2.5, 5, 5, 5, 5, 5];
-const LC_QD_POSITIONS = {
-  '5': '------------',
-  '7.5': '------H-----',
-  '10': '-----HH-----',
-  '12.5': '-----H-F----',
-  '15': '----F--F----',
-  '17.5': '----F-HF----',
-  '20': '----FHHF----',
-  '22.5': '----FH-FF---',
-  '25': '---FF--FF---',
-  '27.5': '---FF-HFF---',
-  '30': '---FFHHFF---',
-  '32.5': '---FFH-FFF--',
-  '35': '--FFF--FFF--',
-  '37.5': '--FFF-HFFF--',
-  '40': '--FFFHHFFF--',
-  '42.5': '--FFFH-FFFF-',
-  '45': '-FFFF--FFFF-',
-  '47.5': '-FFFF-HFFFF-',
-  '50': '-FFFFHHFFFF-',
-  '52.5': '-FFFFH-FFFFF',
-  '55': 'FFFFF--FFFFF',
-  '57.5': 'FFFFF-HFFFFF',
-  '60': 'FFFFFHHFFFFF',
-};
-const LC_QD_MIN_M = 5000, LC_QD_MAX_M = 60000, LC_QD_STEP_M = 2500;
 
 // ==================== NUMBERS ====================
 // Parses a typed weight. Returns milli units (integer) or null.
@@ -88,161 +51,27 @@ function lcParseCount(v, max) {
   const n = parseInt(s, 10);
   return n <= max ? n : null;
 }
-function lcToM(n) { return Math.round(Number(n) * 1000); }
-function lcFmt(m) {
-  let s = (m / 1000).toFixed(3);
-  s = s.replace(/0+$/, '').replace(/\.$/, '');
-  return s;
-}
-function lcGcd(a, b) { while (b) { const t = a % b; a = b; b = t; } return a; }
-
-// ==================== SOLVERS (pure) ====================
-// Plate-loaded. startM: unloaded weight; plates: [{sizeM, pairs}] (one pair
-// = one plate per side); targetM: the target. Returns
-//   { exact, below, above, capacityM } with each option
-//   { totalM, perSide:[{sizeM,count}], plateCount } (null when none).
-// Exact is the combination with the FEWEST plates per side; ties go to the
-// combination using more of the heavier plates (compared heaviest first).
-// The starting weight alone (no plates) is a valid result.
-function lcPlateBetter(a, b) {
-  const na = a.reduce((x, y) => x + y, 0), nb = b.reduce((x, y) => x + y, 0);
-  if (na !== nb) return na < nb;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] > b[i];
-  return false;
-}
-function lcSolvePlates(startM, plates, targetM) {
-  const types = plates.filter(p => p.pairs > 0 && p.sizeM > 0).slice().sort((a, b) => b.sizeM - a.sizeM);
-  // Heaviest possible load = every plate on. Needs no search.
-  const capacityM = startM + 2 * types.reduce((a, t) => a + t.sizeM * t.pairs, 0);
-  // SHORT-CIRCUIT: a target at or below the starting weight never needs the
-  // combination search (plates only add weight). At the starting weight the
-  // answer is exact with no plates; below it, the unloaded weight is the
-  // nearest achievable load above, and nothing lighter exists.
-  if (targetM <= startM) {
-    const bare = { totalM: startM, perSide: [], plateCount: 0 };
-    return targetM === startM
-      ? { exact: bare, below: null, above: null, capacityM }
-      : { exact: null, below: null, above: bare, capacityM };
-  }
-  let g = 0; types.forEach(t => { g = lcGcd(g, t.sizeM); });
-  const n = types.length;
-  let best = new Map([[0, new Array(n).fill(0)]]); // per-side sum in g-units -> counts
-  types.forEach((t, i) => {
-    const step = t.sizeM / g;
-    const next = new Map(best);
-    for (const [s, c] of best) {
-      for (let k = 1; k <= t.pairs; k++) {
-        const ns = s + k * step;
-        const cand = c.slice(); cand[i] += k;
-        const cur = next.get(ns);
-        if (!cur) {
-          // The limit is enforced as each NEW state is added, so one pass
-          // can never build an oversized map before the check.
-          if (next.size >= LC_DP_STATE_LIMIT) throw new Error('too many combinations');
-          next.set(ns, cand);
-        } else if (lcPlateBetter(cand, cur)) next.set(ns, cand);
-      }
-    }
-    best = next;
-  });
-  const opt = (s) => {
-    const c = best.get(s);
-    return {
-      totalM: startM + 2 * s * g,
-      perSide: c.map((count, i) => ({ sizeM: types[i].sizeM, count })).filter(x => x.count > 0),
-      plateCount: c.reduce((x, y) => x + y, 0)
-    };
-  };
-  let exact = null, belowS = null, aboveS = null;
-  for (const s of best.keys()) {
-    const tot = startM + 2 * s * g;
-    if (tot === targetM) exact = s;
-    else if (tot < targetM) { if (belowS === null || s > belowS) belowS = s; }
-    else if (aboveS === null || s < aboveS) aboveS = s;
-  }
-  return {
-    exact: exact === null ? null : opt(exact),
-    below: belowS === null ? null : opt(belowS),
-    above: aboveS === null ? null : opt(aboveS),
-    capacityM
-  };
-}
-// Preset settings (sorted milli list). Returns { exact, belowM, aboveM }.
-function lcNearestSetting(settingsM, targetM) {
-  let exact = false, belowM = null, aboveM = null;
-  settingsM.forEach(s => {
-    if (s === targetM) exact = true;
-    else if (s < targetM) { if (belowM === null || s > belowM) belowM = s; }
-    else if (aboveM === null || s < aboveM) aboveM = s;
-  });
-  return { exact, belowM, aboveM };
-}
-function lcQdSettingsM(maxSettingM) {
-  const out = [];
-  for (let m = LC_QD_MIN_M; m <= Math.min(maxSettingM, LC_QD_MAX_M); m += LC_QD_STEP_M) out.push(m);
-  return out;
-}
-function lcQdPattern(m) { return LC_QD_POSITIONS[lcFmt(m)] || null; }
-function lcQdEndWeights(m) {
-  const p = lcQdPattern(m); if (!p) return null;
-  let top = 0, bottom = 0;
-  for (let i = 0; i < 12; i++) {
-    const w = p[i] === '-' ? 0 : lcToM(LC_QD_LABELS[i]);
-    if (i < 6) top += w; else bottom += w;
-  }
-  return { top, bottom };
-}
-function lcQdIsUneven(m) { const e = lcQdEndWeights(m); return !!e && e.top !== e.bottom; }
-function lcProfileSettingsM(p) {
-  if (p.type === 'quickdraw') return lcQdSettingsM(lcToM(p.maxSetting));
-  if (p.type !== 'adjustable') return [];
-  if (p.mode === 'list') return (p.list || []).map(lcToM).sort((a, b) => a - b);
-  const out = []; const min = lcToM(p.min), max = lcToM(p.max), inc = lcToM(p.increment);
-  if (!(inc > 0)) return out;
-  for (let m = min; m <= max && out.length <= LC_MAX_SETTINGS; m += inc) out.push(m);
-  return out;
-}
-function lcIsPerDumbbell(p) {
-  return p.type === 'quickdraw' || (p.type === 'plate' && p.targetMode === 'perDumbbell') || (p.type === 'adjustable' && !!p.perDumbbell);
-}
+// ==================== SOLVERS ====================
+// The pure numbers and solvers (lcToM, lcFmt, lcSolvePlates, lcNearestSetting,
+// QuickDraw positions, lcProfileSettingsM, lcIsPerDumbbell...) live in
+// load-solver.js, which index.html loads before this file. They are shared,
+// unchanged, with the calculation module (calc-cv1.js).
 
 // ==================== STORAGE ====================
-function lcUid() { return (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || 'signed-out'; }
-function lcStore() { try { return (typeof localStorage !== 'undefined') ? localStorage : null; } catch (e) { return null; } }
-function lcEmptyData() { return { schema: LC_SCHEMA, version: LC_VERSION, inventories: [], profiles: [], lastProfileId: null }; }
-function lcLoad() {
-  const store = lcStore();
-  let raw = null;
-  try { raw = store ? store.getItem(LC_STORE_KEY_PREFIX + lcUid()) : null; } catch (e) { raw = null; }
-  if (!raw) return { data: lcEmptyData(), problem: null };
-  try {
-    const d = JSON.parse(raw);
-    if (!d || d.schema !== LC_SCHEMA || typeof d.version !== 'number' || d.version > LC_VERSION ||
-        !Array.isArray(d.inventories) || !Array.isArray(d.profiles)) throw new Error('shape');
-    return { data: d, problem: null };
-  } catch (e) {
-    // Never overwrite something we could not read until the user saves.
-    return { data: lcEmptyData(), problem: 'unreadable' };
-  }
+// Account equipment comes from app-equipment.js (eqState). lcState.data is a
+// read-only view of it, rebuilt before every render.
+function lcUid() { return (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null; }
+function lcRefreshData() {
+  const uid = lcUid();
+  const profiles = eqState.uid === uid ? eqState.profiles : [], inventories = eqState.uid === uid ? eqState.inventories : [];
+  const last = uid ? eqLastProfile(uid) : null;
+  lcState.data = { profiles, inventories, lastProfileId: profiles.some(p => p.id === last) ? last : (profiles[0] ? profiles[0].id : null) };
 }
-function lcSave() {
-  const store = lcStore();
-  try {
-    if (!store) throw new Error('no storage');
-    store.setItem(LC_STORE_KEY_PREFIX + lcUid(), JSON.stringify(lcState.data));
-    lcState.problem = null;
-    return true;
-  } catch (e) {
-    showToast('This browser couldn’t save your equipment. It will work until the app is closed.', 'error');
-    return false;
-  }
-}
-function lcNewId(prefix) { return prefix + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
 // ==================== UI STATE ====================
 // stack: navigation history inside the dialog. Each entry remembers its own
 // scroll position, so "Back" returns exactly where the user was.
-let lcState = { data: null, problem: null, stack: [], target: '', targetBasis: null, drafts: {} };
+let lcState = { data: { profiles: [], inventories: [], lastProfileId: null }, stack: [], target: '', targetBasis: null, drafts: {}, root: 'calc', busy: false, copy: null, unsub: null };
 
 // TARGET BASIS: a typed target only means something for one unit (lb/kg)
 // and one basis (per dumbbell / equipment total). Whenever the active
@@ -265,19 +94,48 @@ function lcCurrentProfile() {
 function lcScroller() { const ov = document.getElementById('modal-load-calc'); return ov ? ov.querySelector('.modal') : null; }
 function lcTop() { return lcState.stack[lcState.stack.length - 1]; }
 
-function openLoadCalculator() {
-  if (!(typeof currentWorkout !== 'undefined' && currentWorkout && !currentWorkout._isEdit)) return;
-  const r = lcLoad();
-  lcState.data = r.data; lcState.problem = r.problem;
-  lcState.stack = [{ view: 'calc', scroll: 0 }];
-  lcState.drafts = {};
+function lcOpen(root) {
+  if (!lcUid()) return;
+  if (eqState.uid !== lcUid()) eqResetForOwner(lcUid());
+  eqEnsureStarted();
+  lcState.root = root; lcState.stack = [{ view: root, scroll: 0 }];
+  lcState.drafts = {}; lcState.copy = null; lcState.busy = false;
+  if (!lcState.unsub) lcState.unsub = eqSubscribe(lcOnEquipmentChange);
   const ov = document.getElementById('modal-load-calc');
   ov.classList.add('lc-top');
   lcRender();
   openModal('modal-load-calc');
   const sc = lcScroller(); if (sc) sc.scrollTop = 0;
 }
-function closeLoadCalculator() { closeModal('modal-load-calc'); }
+function openLoadCalculator() {
+  if (!(typeof currentWorkout !== 'undefined' && currentWorkout && !currentWorkout._isEdit)) return;
+  lcOpen('calc');
+}
+// LIBRARY > Equipment: the same equipment editor, no workout needed.
+function openEquipmentEditor() { lcOpen('manage'); }
+function closeLoadCalculator() {
+  closeModal('modal-load-calc');
+  if (lcState.unsub) { lcState.unsub(); lcState.unsub = null; }
+  lcState.drafts = {}; lcState.copy = null; lcState.stack = [];
+}
+// Account changed (sign-out, sign-in, switch): close and forget everything shown.
+function lcResetForOwner() {
+  const ov = document.getElementById('modal-load-calc');
+  if (ov && ov.classList.contains('open')) closeLoadCalculator();
+  else { if (lcState.unsub) { lcState.unsub(); lcState.unsub = null; } lcState.drafts = {}; lcState.copy = null; lcState.stack = []; }
+  lcState.target = ''; lcState.targetBasis = null;
+  lcState.data = { profiles: [], inventories: [], lastProfileId: null };
+}
+// Live updates: redraw read-only views; editors keep the typed input (conflicts are caught on save).
+function lcOnEquipmentChange() {
+  const top = lcTop(); if (!top) return;
+  if (['calc', 'manage', 'invUsers', 'copy'].indexOf(top.view) === -1 || lcState.busy) return;
+  const sc = lcScroller(); const y = sc ? sc.scrollTop : 0;
+  const active = document.activeElement && document.activeElement.id;
+  const caret = active === 'lc-target' ? document.activeElement.selectionStart : null;
+  lcRender(); if (sc) sc.scrollTop = y;
+  if (active) { const el = document.getElementById(active); if (el) { el.focus(); if (caret !== null && el.setSelectionRange) el.setSelectionRange(caret, caret); } }
+}
 function lcNav(view, params) {
   const sc = lcScroller(); const top = lcTop();
   if (top && sc) top.scroll = sc.scrollTop;
@@ -293,8 +151,8 @@ function lcBack() {
 }
 // Replace the stack below the root (used after saving a profile).
 function lcResetTo(view, params) {
-  lcState.stack = [{ view: 'calc', scroll: 0 }];
-  if (view && view !== 'calc') lcState.stack.push({ view, params: params || {}, scroll: 0 });
+  lcState.stack = [{ view: lcState.root, scroll: 0 }];
+  if (view && view !== lcState.root) lcState.stack.push({ view, params: params || {}, scroll: 0 });
   lcRender();
   const sc = lcScroller(); if (sc) sc.scrollTop = 0;
 }
@@ -305,12 +163,15 @@ function lcRender() {
   const body = document.getElementById('lc-body');
   const backBtn = document.getElementById('lc-back-btn');
   if (!top || !body) return;
+  lcRefreshData();
   backBtn.style.display = lcState.stack.length > 1 ? '' : 'none';
   body.setAttribute('data-view', top.view);
   let title = 'Load Calculator', html = '';
   switch (top.view) {
     case 'calc': html = lcCalcHtml(); break;
-    case 'manage': title = 'Manage Equipment'; html = lcManageHtml(); break;
+    case 'manage': title = lcState.root === 'manage' && lcState.stack.length === 1 ? 'Equipment' : 'Manage Equipment'; html = lcManageHtml(); break;
+    case 'invUsers': title = 'Inventory In Use'; html = lcInvUsersHtml(); break;
+    case 'copy': title = 'Copy Device Equipment'; html = lcCopyHtml(); break;
     case 'editProfile': title = top.params.isNew ? 'New Equipment' : 'Edit Equipment'; html = lcEditProfileHtml(); break;
     case 'editInventory': title = top.params.isNew ? 'New Plate Inventory' : 'Edit Plate Inventory'; html = lcEditInventoryHtml(); break;
     case 'guide': title = 'Weight Guide'; html = lcGuideHtml(); break;
@@ -327,10 +188,47 @@ function lcTypeLabel(p) {
   if (p.type === 'adjustable') return p.perDumbbell ? 'Adjustable dumbbell' : 'Adjustable';
   return 'REP QuickDraw';
 }
+// What the account read looks like right now. Returns html for a blocking state, or null when the lists can be shown.
+function lcStatusHtml() {
+  const st = eqState.status;
+  if (st === 'idle' || st === 'loading') return '<div class="lc-state" data-testid="lc-state" data-state="loading"><div class="lc-empty-title">Loading your equipment…</div></div>';
+  if (st === 'failed') return `<div class="lc-state" data-testid="lc-state" data-state="failed"><div class="lc-empty-title">Couldn’t load your equipment</div>
+    <div class="lc-muted">${eqState.error === 'permission-denied' ? 'The server refused the request. Try signing out and in again.' : 'Something went wrong while reading your account' + (eqState.error ? ' (' + escapeHtml(eqState.error) + ')' : '') + '.'} Nothing has been changed.</div>
+    <button class="btn btn-primary lc-full-btn" onclick="eqRetry()">Try again</button></div>`;
+  if (st === 'cachedOnly' && !eqState.profiles.length && !eqState.inventories.length)
+    return `<div class="lc-state" data-testid="lc-state" data-state="offline"><div class="lc-empty-title">Can’t reach your account</div>
+    <div class="lc-muted">You seem to be offline, and this device has no saved copy of your account equipment yet. Your equipment isn’t gone; it will appear when you’re back online.</div>
+    <button class="btn btn-secondary lc-full-btn" onclick="eqRetry()">Try again</button></div>`;
+  return null;
+}
+function lcNoticesHtml() {
+  let h = '';
+  if (eqState.status === 'cachedOnly' || eqState.offline) h += '<div class="lc-notice" data-testid="lc-offline">Offline: showing the copy saved on this device. Changes can’t be saved until you’re back online.</div>';
+  if (eqState.unreadable.length) h += `<div class="lc-notice" data-testid="lc-unreadable">${eqState.unreadable.length} saved item${eqState.unreadable.length > 1 ? 's' : ''} in your account couldn’t be read and ${eqState.unreadable.length > 1 ? 'are' : 'is'} hidden: ${eqState.unreadable.map(u => escapeHtml(u.name)).join(', ')}.</div>`;
+  h += lcDeviceCopyBannerHtml();
+  h += lcCopyClashHtml();
+  return h;
+}
+// Copied equipment that now shares its name with different equipment (for
+// example, made on another device at the very moment of copying).
+function lcCopyClashHtml() {
+  const uid = lcUid(); if (!uid || eqState.status !== 'ready') return '';
+  const names = eqCopyNameClashes(uid); if (!names.length) return '';
+  return `<div class="lc-notice" data-testid="lc-copy-clash">Two items now share ${names.length === 1 ? 'the name' : 'these names'}: ${names.map(n => '“' + escapeHtml(n) + '”').join(', ')}. One was copied from this device while another device added the other. Rename one in Manage Equipment so you can tell them apart.</div>`;
+}
+function lcDeviceCopyBannerHtml() {
+  const uid = lcUid(); if (!uid || eqState.status !== 'ready') return '';
+  const b = eqDeviceBackup(uid), done = eqCopyStatus(uid);
+  if (b.status === 'unreadable') return '<div class="lc-notice" data-testid="lc-device-unreadable">Equipment saved on this device before account sync couldn’t be read. It has been left untouched.</div>';
+  if (b.status !== 'ok') return '';
+  if (done && done.completedAt) return `<div class="lc-notice lc-notice-quiet" data-testid="lc-device-done">This device’s earlier equipment was copied to your account. The device copy is kept as a backup. <button class="btn btn-ghost btn-sm" onclick="lcStartCopy()">Review again</button></div>`;
+  return `<div class="lc-notice" data-testid="lc-device-banner">This device has equipment saved before your account kept equipment (${b.data.profiles.length} profile${b.data.profiles.length === 1 ? '' : 's'}, ${b.data.inventories.length} inventor${b.data.inventories.length === 1 ? 'y' : 'ies'}). It stays on this device until you copy it.
+    <button class="btn btn-secondary btn-sm lc-full-btn" style="margin-top:8px" data-testid="lc-copy-start" onclick="lcStartCopy()">Copy this device’s equipment to your account</button></div>`;
+}
 function lcCalcHtml() {
   const d = lcState.data;
-  const notice = lcState.problem === 'unreadable'
-    ? '<div class="lc-notice">Saved equipment on this device couldn’t be read. It will be replaced when you save new equipment.</div>' : '';
+  const blocked = lcStatusHtml(); if (blocked) return blocked;
+  const notice = lcNoticesHtml();
   if (!d.profiles.length) {
     return notice + `<div class="lc-empty" data-testid="lc-empty">
       <div class="lc-empty-title">No equipment yet</div>
@@ -364,8 +262,7 @@ function lcCalcHtml() {
 }
 function lcSelectProfile(id) {
   if (!lcProfile(id)) return;
-  lcState.data.lastProfileId = id;
-  lcSave();
+  eqSetLastProfile(lcUid(), id);
   lcRender();
 }
 function lcWeightText(m, p) { return `${lcFmt(m)} ${p.unit}${lcIsPerDumbbell(p) ? ' per dumbbell' : ''}`; }
@@ -478,6 +375,8 @@ function lcDiagramViewHtml() {
 // ==================== MANAGE EQUIPMENT ====================
 function lcManageHtml() {
   const d = lcState.data;
+  const blocked = lcStatusHtml(); if (blocked) return blocked;
+  const notices = lcNoticesHtml();
   const profs = d.profiles.length ? d.profiles.map(p => `
     <div class="lc-list-row" data-testid="lc-profile-row">
       <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(p.name)}</div><div class="lc-muted lc-small">${escapeHtml(lcTypeLabel(p))} · ${escapeHtml(p.unit)}</div></div>
@@ -485,14 +384,16 @@ function lcManageHtml() {
       <button class="btn btn-danger btn-sm" onclick="lcDeleteProfile('${escapeHtml(p.id)}')">Delete</button>
     </div>`).join('') : '<div class="lc-muted lc-small">No equipment profiles yet.</div>';
   const invs = d.inventories.length ? d.inventories.map(i => {
-    const users = d.profiles.filter(p => p.type === 'plate' && p.inventoryId === i.id).length;
+    const users = eqDependents(i.id).length;
     return `<div class="lc-list-row" data-testid="lc-inventory-row">
       <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(i.name)}</div><div class="lc-muted lc-small">${escapeHtml(i.unit)} · ${i.plates.filter(x => x.pairs > 0).map(x => lcFmt(lcToM(x.size)) + '×' + x.pairs).join(', ') || 'no plates'} · used by ${users}</div></div>
       <button class="btn btn-ghost btn-sm" onclick="lcStartEditInventory('${escapeHtml(i.id)}')">Edit</button>
       <button class="btn btn-danger btn-sm" onclick="lcDeleteInventory('${escapeHtml(i.id)}')">Delete</button>
     </div>`;
   }).join('') : '<div class="lc-muted lc-small">No plate inventories yet. One is needed for plate-loaded equipment.</div>';
-  return `
+  const missing = d.profiles.filter(p => p.type === 'plate' && !lcInventory(p.inventoryId));
+  return notices + (missing.length ? `<div class="lc-notice" data-testid="lc-missing-ref">${missing.map(p => escapeHtml(p.name)).join(', ')}: plate inventory missing. Edit to choose another.</div>` : '') + `
+    ${lcState.root === 'manage' && lcState.stack.length === 1 ? '<div class="lc-muted lc-small" style="margin-bottom:10px">Equipment for the Load Calculator, kept in your account.</div>' : ''}
     <div class="lc-section-label">Equipment profiles</div>${profs}
     <div class="lc-add-grid">
       <button class="btn btn-secondary btn-sm" onclick="lcStartNewProfile('plate')">+ Plate-loaded</button>
@@ -502,22 +403,48 @@ function lcManageHtml() {
     <div class="lc-section-label">Plate inventories <span class="lc-muted lc-small">(sizes and pairs, shared by plate-loaded profiles)</span></div>${invs}
     <div class="lc-add-grid"><button class="btn btn-secondary btn-sm" onclick="lcStartNewInventory()">+ Plate inventory</button></div>`;
 }
+// Runs an account write; while it runs, live redraws wait. Errors are shown, never swallowed.
+async function lcWrite(fn, okMsg) {
+  if (lcState.busy) return false;
+  lcState.busy = true; lcSetBusyUi(true);
+  try { const r = await fn(); if (okMsg) showToast(okMsg, 'success'); return r === undefined ? true : r; }
+  catch (e) { const f = eqFriendly(e); lcFormError(f.message, f.eqCode); return false; }
+  finally { lcState.busy = false; lcSetBusyUi(false); }
+}
+function lcSetBusyUi(on) { document.querySelectorAll('#lc-body .lc-save-btn').forEach(b => { b.disabled = on; if (on) b.dataset.label = b.dataset.label || b.textContent; b.textContent = on ? 'Saving…' : (b.dataset.label || b.textContent); }); }
 function lcDeleteProfile(id) {
   const p = lcProfile(id); if (!p) return;
-  confirm2('Delete Equipment', `Delete "${p.name}"?`, () => {
-    lcState.data.profiles = lcState.data.profiles.filter(x => x.id !== id);
-    if (lcState.data.lastProfileId === id) lcState.data.lastProfileId = lcState.data.profiles[0] ? lcState.data.profiles[0].id : null;
-    lcSave(); lcRender();
+  confirm2('Delete Equipment', `Delete "${p.name}"?`, async () => {
+    if (await lcWrite(() => eqDeleteProfile(id, p), 'Equipment deleted')) lcRender();
   });
 }
 function lcDeleteInventory(id) {
   const inv = lcInventory(id); if (!inv) return;
-  const users = lcState.data.profiles.filter(p => p.type === 'plate' && p.inventoryId === id);
-  if (users.length) { showToast(`Used by ${users.map(u => u.name).join(', ')}. Change or delete those first.`, 'error'); return; }
-  confirm2('Delete Plate Inventory', `Delete "${inv.name}"?`, () => {
-    lcState.data.inventories = lcState.data.inventories.filter(x => x.id !== id);
-    lcSave(); lcRender();
+  if (eqDependents(id).length) { lcNav('invUsers', { inventoryId: id }); return; }
+  confirm2('Delete Plate Inventory', `Delete "${inv.name}"?`, async () => {
+    const r = await lcWrite(() => eqDeleteInventory(id, inv), null);
+    if (r === 'deleted' || r === 'gone') { showToast('Plate inventory deleted', 'success'); lcRender(); }
+    else if (eqDependents(id).length) lcNav('invUsers', { inventoryId: id });
   });
+}
+// An inventory can't be deleted while equipment uses it: move each user to another inventory, or delete it.
+function lcInvUsersHtml() {
+  const inv = lcInventory(lcTop().params.inventoryId);
+  if (!inv) return '<div class="lc-muted" data-testid="lc-inv-gone">This inventory no longer exists.</div>';
+  const users = eqDependents(inv.id);
+  const others = lcState.data.inventories.filter(i => i.id !== inv.id && i.unit === inv.unit);
+  const rows = users.map(p => `<div class="lc-list-row" data-testid="lc-dependent-row" data-id="${escapeHtml(p.id)}">
+      <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(p.name)}</div></div>
+      ${p.missing ? '<span class="lc-muted lc-small">Not visible here</span>' : `${others.length ? `<select aria-label="Move ${escapeHtml(p.name)} to" data-testid="lc-move-select" onchange="if(this.value)lcMoveProfile('${escapeHtml(p.id)}',this.value)"><option value="">Move to…</option>${others.map(o => `<option value="${escapeHtml(o.id)}">${escapeHtml(o.name)}</option>`).join('')}</select>` : ''}
+      <button class="btn btn-danger btn-sm" onclick="lcDeleteProfile('${escapeHtml(p.id)}')">Delete</button>`}</div>`).join('');
+  return `<div class="lc-notice" data-testid="lc-in-use">“${escapeHtml(inv.name)}” is used by ${users.length} piece${users.length === 1 ? '' : 's'} of equipment. Move each one to another ${escapeHtml(inv.unit)} inventory, or delete it, before deleting this inventory.</div>
+    ${rows || '<div class="lc-muted lc-small">Nothing uses it any more.</div>'}
+    ${!others.length && users.length ? `<div class="lc-muted lc-small" style="margin:8px 0">There’s no other ${escapeHtml(inv.unit)} inventory to move to. <button class="btn btn-ghost btn-sm" onclick="lcStartNewInventory()">+ Plate inventory</button></div>` : ''}
+    <div id="lc-form-error" class="lc-error" style="display:none"></div>
+    ${users.length ? '' : `<button class="btn btn-danger lc-full-btn" data-testid="lc-delete-now" onclick="lcDeleteInventory('${escapeHtml(inv.id)}')">Delete “${escapeHtml(inv.name)}”</button>`}`;
+}
+async function lcMoveProfile(profileId, invId) {
+  if (await lcWrite(() => eqReassignProfile(profileId, invId), 'Equipment moved')) lcRender(); else lcRender();
 }
 
 // ---- profile editor ----
@@ -525,7 +452,7 @@ function lcDefaultUnit() { return (typeof appDb !== 'undefined' && appDb.unit ==
 function lcStartNewProfile(type) {
   const unit = type === 'quickdraw' ? 'lb' : lcDefaultUnit();
   const firstInv = lcState.data.inventories.find(i => i.unit === unit);
-  const draft = { id: null, type, name: type === 'quickdraw' ? 'REP QuickDraw' : '', unit,
+  const draft = { id: null, base: null, type, name: type === 'quickdraw' ? 'REP QuickDraw' : '', unit,
     startWeight: '', inventoryId: firstInv ? firstInv.id : '', targetMode: 'total',
     perDumbbell: true, mode: 'range', min: '', max: '', increment: '', list: '', maxSetting: '60' };
   lcState.drafts.profile = draft;
@@ -534,11 +461,11 @@ function lcStartNewProfile(type) {
 function lcStartEditProfile(id) {
   const p = lcProfile(id); if (!p) return;
   lcState.drafts.profile = {
-    id: p.id, type: p.type, name: p.name, unit: p.unit,
+    id: p.id, base: p, type: p.type, name: p.name, unit: p.unit,
     startWeight: p.startWeight != null ? String(p.startWeight) : '', inventoryId: p.inventoryId || '', targetMode: p.targetMode || 'total',
     perDumbbell: p.perDumbbell !== false, mode: p.mode || 'range',
     min: p.min != null ? String(p.min) : '', max: p.max != null ? String(p.max) : '', increment: p.increment != null ? String(p.increment) : '',
-    list: (p.list || []).join(', '), maxSetting: p.maxSetting != null ? String(p.maxSetting) : '60'
+    list: (p.list || []).map(x => lcFmt(lcToM(x))).join(', '), maxSetting: p.maxSetting != null ? String(p.maxSetting) : '60'
   };
   lcNav('editProfile', { isNew: false });
 }
@@ -563,8 +490,10 @@ function lcEditProfileHtml() {
   const d = lcState.drafts.profile; if (!d) return '';
   let html = `<div class="lc-type-line lc-muted">${d.type === 'plate' ? 'Plate-loaded' : d.type === 'adjustable' ? 'Adjustable (preset weights)' : 'REP QuickDraw (lb, per dumbbell)'}</div>`;
   html += lcField('Name', 'lc-p-name', 'profile', 'name', d.name, { placeholder: d.type === 'plate' ? 'e.g. Straight bar' : 'e.g. Adjustable dumbbells' });
+  if (d.conflict) html += `<div class="lc-notice" data-testid="lc-conflict">${escapeHtml(d.conflict)} <button class="btn btn-ghost btn-sm" onclick="lcReloadDraft('profile')">Load the latest version</button> <span class="lc-muted lc-small">(replaces what you typed)</span></div>`;
   if (d.type === 'plate') {
     html += lcUnitSelect('profile', d.unit);
+    if (d.inventoryId && !lcInventory(d.inventoryId)) html += '<div class="lc-notice" data-testid="lc-inv-missing">Its plate inventory no longer exists. Choose another.</div>';
     html += lcField(`Starting weight, unloaded (${escapeHtml(d.unit)})`, 'lc-p-start', 'profile', 'startWeight', d.startWeight, { numeric: true, placeholder: 'e.g. 45' });
     html += `<div class="form-group"><label for="lc-p-mode">Target means</label><select id="lc-p-mode" onchange="lcDraftSet('profile','targetMode',this.value)">
       <option value="total" ${d.targetMode === 'total' ? 'selected' : ''}>Total on the bar or machine</option>
@@ -591,22 +520,29 @@ function lcEditProfileHtml() {
     if (d.id) html += `<button class="btn btn-ghost btn-sm" style="margin-bottom:14px" onclick="lcNav('guide',{profileId:'${escapeHtml(d.id)}'})">View weight guide</button>`;
   }
   html += `<div id="lc-form-error" class="lc-error" style="display:none"></div>
-    <button class="btn btn-primary lc-full-btn" onclick="lcSaveProfileDraft()">Save</button>`;
+    <button class="btn btn-primary lc-full-btn lc-save-btn" onclick="lcSaveProfileDraft()">Save</button>`;
   return html;
 }
-function lcFormError(msg) {
+function lcFormError(msg, code) {
   const el = document.getElementById('lc-form-error');
-  if (el) { el.textContent = msg; el.style.display = ''; }
+  if (el) { el.textContent = msg; el.style.display = ''; el.dataset.code = code || 'invalid'; }
   showToast(msg, 'error');
   return false;
 }
-function lcSaveProfileDraft() {
-  const d = lcState.drafts.profile; if (!d) return false;
+// After a conflict: replace the draft with the account's latest version (only when the lifter asks).
+function lcReloadDraft(kind) {
+  const d = lcState.drafts[kind]; if (!d || !d.id) return;
+  lcState.stack.pop();
+  if (kind === 'profile') { if (lcProfile(d.id)) lcStartEditProfile(d.id); else { lcState.drafts.profile = null; lcRender(); } }
+  else { if (lcInventory(d.id)) lcStartEditInventory(d.id); else { lcState.drafts.inventory = null; lcRender(); } }
+}
+async function lcSaveProfileDraft() {
+  const d = lcState.drafts.profile; if (!d || lcState.busy) return false;
   const name = String(d.name || '').trim();
   if (!name) return lcFormError('Give this equipment a name.');
   if (name.length > 40) return lcFormError('Keep the name to 40 characters or fewer.');
   if (d.unit !== 'lb' && d.unit !== 'kg') return lcFormError('Choose lb or kg.');
-  const p = { id: d.id || lcNewId('lcp'), name, type: d.type, unit: d.type === 'quickdraw' ? 'lb' : d.unit };
+  const p = { id: d.id || eqNewId('eqp'), name, type: d.type, unit: d.type === 'quickdraw' ? 'lb' : d.unit };
   if (d.type === 'plate') {
     const start = lcParseWeight(d.startWeight, { allowZero: true });
     if (start === null) return lcFormError('Enter the starting weight as a number (0 or more, up to 3 decimals).');
@@ -638,27 +574,35 @@ function lcSaveProfileDraft() {
     if (mx === null || mx < LC_QD_MIN_M || mx > LC_QD_MAX_M || (mx - LC_QD_MIN_M) % LC_QD_STEP_M !== 0) return lcFormError('Choose a maximum from 5 to 60 lb.');
     p.maxSetting = mx / 1000;
   } else return lcFormError('Unknown equipment type.');
-  const list = lcState.data.profiles;
-  const idx = list.findIndex(x => x.id === p.id);
-  if (idx === -1) list.push(p); else list[idx] = p;
-  lcState.data.lastProfileId = p.id;
-  lcSave();
+  const ok = await lcWrite(() => eqSaveProfile(p, d.base), null);
+  if (!ok) { lcNoteConflict('profile'); return false; }
+  if (lcState.drafts.profile !== d) return true;   // closed or account changed meanwhile
+  eqSetLastProfile(lcUid(), p.id);
   lcState.drafts.profile = null;
   showToast('Equipment saved', 'success');
-  lcResetTo('calc');
+  lcResetTo(lcState.root === 'manage' ? 'manage' : 'calc');
   return true;
 }
 
 // ---- inventory editor ----
+// When a save failed because the account changed, say so in the editor (the typed input stays).
+function lcNoteConflict(kind) {
+  const el = document.getElementById('lc-form-error'); const d = lcState.drafts[kind];
+  if (!d || !el || ['conflict', 'deleted'].indexOf(el.dataset.code) === -1) return;
+  d.conflict = el.textContent;
+  if (el.dataset.code === 'deleted') { d.id = null; d.base = null; d.conflict += ' Saving again will create it as new.'; }
+  const sc = lcScroller(); const y = sc ? sc.scrollTop : 0; const msg = el.textContent, code = el.dataset.code;
+  lcRender(); if (sc) sc.scrollTop = y; lcFormError(msg, code);
+}
 function lcPresetPlates(unit) { return (unit === 'kg' ? [25, 20, 15, 10, 5, 2.5, 1.25] : [45, 35, 25, 10, 5, 2.5]).map(s => ({ size: String(s), pairs: '0' })); }
 function lcStartNewInventory(fromProfile) {
   const unit = fromProfile && lcState.drafts.profile ? lcState.drafts.profile.unit : lcDefaultUnit();
-  lcState.drafts.inventory = { id: null, name: '', unit, plates: lcPresetPlates(unit), lockedUnit: !!fromProfile };
+  lcState.drafts.inventory = { id: null, base: null, name: '', unit, plates: lcPresetPlates(unit), lockedUnit: !!fromProfile };
   lcNav('editInventory', { isNew: true, fromProfile: !!fromProfile });
 }
 function lcStartEditInventory(id) {
   const inv = lcInventory(id); if (!inv) return;
-  lcState.drafts.inventory = { id: inv.id, name: inv.name, unit: inv.unit, plates: inv.plates.map(x => ({ size: String(x.size), pairs: String(x.pairs) })) };
+  lcState.drafts.inventory = { id: inv.id, base: inv, name: inv.name, unit: inv.unit, plates: inv.plates.map(x => ({ size: lcFmt(lcToM(x.size)), pairs: String(x.pairs) })) };
   lcNav('editInventory', { isNew: false });
 }
 function lcInvPlateSet(i, field, value) { const d = lcState.drafts.inventory; if (d && d.plates[i]) d.plates[i][field] = value; }
@@ -672,16 +616,19 @@ function lcEditInventoryHtml() {
       <input type="text" inputmode="numeric" autocomplete="off" aria-label="Pairs" placeholder="Pairs" value="${escapeHtml(x.pairs)}" oninput="lcInvPlateSet(${i},'pairs',this.value)">
       <span class="lc-muted lc-small">pairs</span>
       <button class="btn-icon" aria-label="Remove plate size" onclick="lcInvRemoveRow(${i})">✕</button></div>`).join('');
-  return `${lcField('Name', 'lc-i-name', 'inventory', 'name', d.name, { placeholder: 'e.g. Garage plates' })}
-    ${lcUnitSelect('inventory', d.unit, d.lockedUnit)}
+  const used = d.id ? eqDependents(d.id) : [];
+  return `${d.conflict ? `<div class="lc-notice" data-testid="lc-conflict">${escapeHtml(d.conflict)} <button class="btn btn-ghost btn-sm" onclick="lcReloadDraft('inventory')">Load the latest version</button> <span class="lc-muted lc-small">(replaces what you typed)</span></div>` : ''}
+    ${used.length ? `<div class="lc-muted lc-small" data-testid="lc-shared-note" style="margin-bottom:10px">Shared by ${used.map(u => escapeHtml(u.name)).join(', ')}. Changes apply to all of them.</div>` : ''}
+    ${lcField('Name', 'lc-i-name', 'inventory', 'name', d.name, { placeholder: 'e.g. Garage plates' })}
+    ${lcUnitSelect('inventory', d.unit, d.lockedUnit || used.length > 0)}
     <div class="lc-section-label">Plates <span class="lc-muted lc-small">(1 pair = one plate for each side; 0 if you have none)</span></div>
     ${rows}
     <button class="btn btn-ghost btn-sm" style="margin:4px 0 14px" onclick="lcInvAddRow()">+ Plate size</button>
     <div id="lc-form-error" class="lc-error" style="display:none"></div>
-    <button class="btn btn-primary lc-full-btn" onclick="lcSaveInventoryDraft()">Save</button>`;
+    <button class="btn btn-primary lc-full-btn lc-save-btn" onclick="lcSaveInventoryDraft()">Save</button>`;
 }
-function lcSaveInventoryDraft() {
-  const d = lcState.drafts.inventory; if (!d) return false;
+async function lcSaveInventoryDraft() {
+  const d = lcState.drafts.inventory; if (!d || lcState.busy) return false;
   const name = String(d.name || '').trim();
   if (!name) return lcFormError('Give this inventory a name.');
   if (name.length > 40) return lcFormError('Keep the name to 40 characters or fewer.');
@@ -702,15 +649,80 @@ function lcSaveInventoryDraft() {
     const clash = lcState.data.profiles.filter(p => p.type === 'plate' && p.inventoryId === d.id && p.unit !== d.unit);
     if (clash.length) return lcFormError(`This inventory is used by ${clash.map(c => c.name).join(', ')} (${clash[0].unit}). Change those profiles first, so pounds and kilograms don’t mix.`);
   }
-  const inv = { id: d.id || lcNewId('lci'), name, unit: d.unit, plates };
-  const list = lcState.data.inventories;
-  const idx = list.findIndex(x => x.id === inv.id);
-  if (idx === -1) list.push(inv); else list[idx] = inv;
-  lcSave();
+  const inv = { id: d.id || eqNewId('eqi'), name, unit: d.unit, plates };
+  const ok = await lcWrite(() => eqSaveInventory(inv, d.base), null);
+  if (!ok) { lcNoteConflict('inventory'); return false; }
+  if (lcState.drafts.inventory !== d) return true;
   lcState.drafts.inventory = null;
   showToast('Plate inventory saved', 'success');
   const fromProfile = lcTop().params.fromProfile;
   if (fromProfile && lcState.drafts.profile) lcState.drafts.profile.inventoryId = inv.id;
   lcBack();
   return true;
+}
+
+// ==================== COPY THIS DEVICE'S EQUIPMENT ====================
+// Preview first (copy / already in your account / conflicts / can't copy);
+// nothing is written until "Copy". Back cancels with nothing written. The
+// device's own data is never changed or deleted. Retrying after an
+// interruption resumes safely: items already copied are recognised.
+function lcStartCopy() {
+  const uid = lcUid(); const b = eqDeviceBackup(uid);
+  if (b.status !== 'ok') { showToast('There’s no readable equipment on this device to copy.', 'error'); return; }
+  lcState.copy = { choices: {}, running: false, progress: null, error: null, result: null };
+  lcNav('copy');
+}
+function lcCopyPlan() {
+  const uid = lcUid(); const b = eqDeviceBackup(uid); if (b.status !== 'ok') return null;
+  const st = eqCopyStatus(uid);
+  // Before the first copy the id isn't stored yet: plan with a provisional id; it is fixed when copying starts.
+  const dcid = st && st.deviceCopyId && !st.completedAt ? st.deviceCopyId : (lcState.copy.provisionalId || (lcState.copy.provisionalId = 'dc' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)));
+  return { plan: eqPlanCopy(b.data, { profiles: eqState.profiles, inventories: eqState.inventories }, dcid, lcState.copy.choices), local: b.data };
+}
+function lcCopyChoose(key, value) { lcState.copy.choices[key] = value; const sc = lcScroller(); const y = sc ? sc.scrollTop : 0; lcRender(); if (sc) sc.scrollTop = y; }
+function lcCopyHtml() {
+  const c = lcState.copy; if (!c) return '';
+  const blocked = lcStatusHtml(); if (blocked) return blocked;
+  if (eqState.status !== 'ready') return '<div class="lc-notice">Your account must be online to copy equipment.</div>';
+  if (c.result) return lcCopyClashHtml() + `<div class="lc-state" data-testid="lc-copy-done"><div class="lc-empty-title">Copied</div>
+    <div class="lc-muted">${c.result.copied} item${c.result.copied === 1 ? '' : 's'} copied${c.result.reused ? ', ' + c.result.reused + ' already in your account' : ''}${c.result.alreadyCopied ? ', ' + c.result.alreadyCopied + ' copied earlier' : ''}${c.result.skipped ? ', ' + c.result.skipped + ' skipped' : ''}${c.result.blocked ? ', ' + c.result.blocked + ' couldn’t be copied' : ''}. The calculator now uses your account equipment. This device’s earlier copy is kept as a backup.</div>
+    <button class="btn btn-primary lc-full-btn" onclick="lcState.copy=null;lcResetTo(lcState.root)">Done</button></div>`;
+  const r = lcCopyPlan(); if (!r) return '<div class="lc-muted">There’s nothing readable on this device to copy.</div>';
+  const { plan } = r;
+  const lbl = { copy: 'Will be copied', alreadyCopied: 'Already copied from this device', reuse: 'Already in your account', conflict: 'Name already used — choose', skip: 'Skipped', blocked: 'Can’t be copied' };
+  const row = it => {
+    const key = it.kind + ':' + it.localId; const ch = c.choices[key];
+    let extra = '';
+    if (it.status === 'copy' && it.newName && it.newName !== it.name) extra = `<div class="lc-muted lc-small">Will be named “${escapeHtml(it.newName)}”</div>`;
+    if (it.status === 'reuse') extra = `<div class="lc-muted lc-small">Same as “${escapeHtml(it.accountName)}”, so it won’t be copied again.</div>`;
+    if (it.status === 'blocked' || it.status === 'conflict') extra = `<div class="lc-muted lc-small">${escapeHtml(it.reason || '')}</div>`;
+    const btns = it.status === 'conflict' || (ch && ch !== 'copyAnyway')
+      ? `<div class="lc-copy-choices"><button class="btn btn-sm ${ch === 'keepBoth' ? 'btn-primary' : 'btn-secondary'}" data-testid="lc-keep-both" onclick="lcCopyChoose('${escapeHtml(key)}','keepBoth')">Keep both</button><button class="btn btn-sm ${ch === 'skip' ? 'btn-primary' : 'btn-secondary'}" data-testid="lc-skip" onclick="lcCopyChoose('${escapeHtml(key)}','skip')">Skip</button></div>` : '';
+    return `<div class="lc-list-row lc-copy-row" data-testid="lc-copy-row" data-kind="${it.kind}" data-status="${it.status}" data-name="${escapeHtml(it.name || '')}">
+      <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(it.name || '(unnamed)')} <span class="lc-muted lc-small">· ${it.kind === 'inventory' ? 'plate inventory' : 'equipment'}</span></div>
+      <div class="lc-small lc-copy-status">${lbl[it.status]}</div>${extra}${btns}</div></div>`;
+  };
+  const anything = plan.counts.copy > 0;
+  return `<div class="lc-muted lc-small" style="margin-bottom:10px">Review what will happen. Nothing is copied until you press Copy, and nothing on this device is changed or deleted. Other settings and unfinished workouts aren’t copied.</div>
+    ${plan.items.map(row).join('')}
+    <div id="lc-form-error" class="lc-error" style="display:${c.error ? '' : 'none'}">${escapeHtml(c.error || '')}</div>
+    ${c.progress ? `<div class="lc-muted lc-small" data-testid="lc-copy-progress">Copying… ${c.progress.done} of ${c.progress.total}</div>` : ''}
+    <button class="btn btn-primary lc-full-btn lc-save-btn" data-testid="lc-copy-go" ${!plan.ready || c.running ? 'disabled' : ''} onclick="lcRunCopy()">${!plan.ready ? 'Choose for each name conflict' : anything ? 'Copy ' + plan.counts.copy + ' item' + (plan.counts.copy === 1 ? '' : 's') : 'Finish (nothing new to copy)'}</button>
+    <button class="btn btn-ghost lc-full-btn" data-testid="lc-copy-cancel" ${c.running ? 'disabled' : ''} onclick="lcState.copy=null;lcBack()">Cancel</button>`;
+}
+async function lcRunCopy() {
+  const c = lcState.copy; if (!c || c.running) return;
+  const uid = lcUid();
+  // Fix this device's copy id before writing anything, so an interrupted copy resumes with the same ids.
+  const st = eqCopyStatus(uid);
+  if (!(st && st.deviceCopyId && !st.completedAt)) {
+    if (!eqSetCopyStatus(uid, { deviceCopyId: c.provisionalId, completedAt: null, previous: st && st.completedAt ? st : null, created: (st && st.created) || [] })) { c.error = 'This browser couldn’t remember the copy, so nothing was copied.'; lcRender(); return; }
+  }
+  const r = lcCopyPlan(); if (!r || !r.plan.ready) return;
+  c.running = true; c.error = null; c.progress = { done: 0, total: r.plan.counts.copy + 1 }; lcState.busy = true; lcRender();
+  try {
+    c.result = await eqRunCopy(r.plan, r.local, pr => { c.progress = pr; const el = document.querySelector('[data-testid="lc-copy-progress"]'); if (el) el.textContent = `Copying… ${pr.done} of ${pr.total}`; });
+  } catch (e) { const f = eqFriendly(e); c.error = f.eqCode === 'stale' ? f.message : f.message + ' Anything already copied is safe; pressing Copy again continues without duplicating.'; c.errorCode = f.eqCode; }
+  finally { c.running = false; c.progress = null; lcState.busy = false; }
+  if (lcState.copy === c && lcUid() === uid) lcRender();
 }

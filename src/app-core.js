@@ -299,6 +299,10 @@ auth.onAuthStateChanged(async user => {
   // kept under that owner's own draft before anything below discards it,
   // and nothing of it stays visible to a different account.
   awDraftHandleAuthChange(user);
+  // STAGE 2 ACCOUNT EQUIPMENT: forget the previous owner's equipment, close
+  // the Load Calculator and its drafts, before anything of the new session runs.
+  if (typeof eqResetForOwner === 'function') eqResetForOwner(user ? user.uid : null);
+  if (typeof lcResetForOwner === 'function') lcResetForOwner();
   // Every auth transition (sign-in, sign-out, user switch) unsubscribes all
   // previously-attached listeners immediately -- not only via the manual Sign Out
   // control -- so a stale listener can never write a previous user's data into a
@@ -2230,12 +2234,28 @@ function showDropdown(anchor, items) {
     return `<div class="dropdown-item ${item.danger?'danger':''}" onclick="closeDropdown();${item.action}"><span style="width:18px;text-align:center;flex-shrink:0">${item.icon||''}</span><span>${item.toggle||''}${item.label}</span></div>`;
   }).join('');
   const rect = anchor.getBoundingClientRect();
+  menu.style.maxHeight = ''; menu.style.overflowY = '';
   menu.style.display = 'block';
   const menuW = 220;
   let left = rect.right - menuW;
   if (left < 8) left = 8;
+  // Keep the whole menu inside the visible screen (Safari's toolbars and the
+  // phone's home bar shrink it; landscape leaves little height). Open below
+  // the button, or above it when there is clearly more room there; if the menu
+  // is still taller than the room, it scrolls, so every item stays reachable.
+  const vv = window.visualViewport;
+  const viewTop = vv ? vv.offsetTop : 0, viewBottom = vv ? vv.offsetTop + vv.height : window.innerHeight;
+  const margin = 8, natural = menu.scrollHeight;
+  const below = viewBottom - (rect.bottom + 6) - margin, above = (rect.top - 6) - viewTop - margin;
+  // Menus that already fit keep their usual position (unchanged behaviour).
   let top = rect.bottom + 6;
   if (top + 200 > window.innerHeight) top = rect.top - 210;
+  if (top < viewTop + margin || top + natural > viewBottom - margin) {
+    let room;
+    if (natural <= below || below >= above) { top = rect.bottom + 6; room = below; }
+    else { room = above; top = rect.top - 6 - Math.min(natural, room); }
+    if (natural > room) { menu.style.maxHeight = Math.max(room, 120) + 'px'; menu.style.overflowY = 'auto'; }
+  }
   menu.style.left = left + 'px'; menu.style.top = top + 'px'; menu.style.minWidth = menuW + 'px';
   document.getElementById('dropdown-backdrop').classList.add('open');
 }
