@@ -288,6 +288,89 @@ function roundToIncrement(val) {
   return Math.ceil(val / inc) * inc;
 }
 
+// ==================== STAGE 4a: RECORDED UNITS AND STATISTICS CLASSES ====================
+// Draft 7 §3.4 / §11.2. Stage 4a writes no unit, but it must read workouts a
+// later version (4b) wrote with one -- e.g. after a rollback -- without
+// misreading them.
+//
+// A workout's unit state, from the workout ITSELF (never the preference):
+//   'none'     -- no unit recorded (every workout today): unchanged behaviour,
+//                 its numbers are read in the account's unit, as always;
+//   'recorded' -- 'lb' or 'kg': its numbers are in THAT unit, whatever the
+//                 account's display preference is now;
+//   'invalid'  -- a unit field that is neither: its numbers' unit is unknown.
+function workoutUnitState(w) {
+  if (!w || w.unit === undefined || w.unit === null) return 'none';
+  return (w.unit === 'lb' || w.unit === 'kg') ? 'recorded' : 'invalid';
+}
+function recordedWorkoutUnit(w) { return workoutUnitState(w) === 'recorded' ? w.unit : null; }
+// The app spells the account unit 'lbs' / 'kg'; records spell it 'lb' / 'kg'.
+function appUnitToRecorded(u) { return u === 'kg' ? 'kg' : (u === 'lbs' || u === 'lb') ? 'lb' : null; }
+function recordedUnitToApp(u) { return u === 'kg' ? 'kg' : 'lbs'; }
+// The label for one workout's numbers, in the app's own spelling ("lbs"/"kg").
+// No unit recorded -> the account unit, exactly as today.
+function workoutUnitLabel(w) {
+  const st = workoutUnitState(w);
+  if (st === 'recorded') return recordedUnitToApp(w.unit);
+  if (st === 'invalid') return 'unit?';
+  return appDb.unit;
+}
+// May a value whose unit is `valueUnit` ('lb'/'kg'/'lbs', or missing) be put
+// into workout `w` as a number? A workout with no recorded unit: yes, exactly
+// as today. A workout with a recorded unit: only when the value carries that
+// same unit -- never converted, never guessed.
+function workoutAcceptsValueUnit(w, valueUnit) {
+  const st = workoutUnitState(w);
+  if (st === 'none') return true;
+  if (st === 'invalid') return false;
+  return appUnitToRecorded(valueUnit) === w.unit;
+}
+// The statistics class of one exercise row of a stored workout (§11.2.2):
+//   L legacy  -- the workout has no unit: compared only with other L, raw, as today;
+//   V verified -- unit, implement count and (if 2) basis all recorded;
+//   C convention unknown -- anything else with a unit field: never compared.
+// From the record's own fields only. A missing implement count is never 1.
+function statsRowClass(w, e) {
+  const st = workoutUnitState(w);
+  if (st === 'none') return 'L';
+  if (st === 'invalid') return 'C';
+  return IronStatsCompat.classify({ unit: w.unit, implements: e ? e.implements : undefined, basis: e ? e.basis : undefined });
+}
+function statsLegacyRow(w, e) { return statsRowClass(w, e) === 'L'; }
+// V only: the set's per-implement load in whole grams (exact lb/kg conversion).
+function statsVerifiedGrams(w, e, weight) {
+  return IronStatsCompat.perImplementGrams(weight, { unit: w.unit, implements: e.implements, basis: e.basis });
+}
+// How many performed sets of this exercise the legacy statistics leave out
+// because they were recorded with a unit (V or C). 0 for every account today.
+function statsUncomparedSetCount(exId) {
+  let n = 0;
+  appDb.workouts.forEach(w => (w.exercises || []).forEach(e => {
+    if (e.exerciseId !== exId || statsLegacyRow(w, e)) return;
+    (e.sets || []).forEach(s => { if (planRunSetHasRecordedPerformance(s)) n++; });
+  }));
+  return n;
+}
+// V only (PR flags): the best per-implement grams / best E1RM on grams among
+// OTHER workouts' verified rows of this exercise. Mirrors getBestWeight /
+// getBest1RM, class V instead of L.
+function statsBestVerified(exId, excludeId) {
+  let bestW = 0, best1 = 0;
+  appDb.workouts.forEach(w => {
+    if (excludeId && w.id === excludeId) return;
+    (w.exercises || []).forEach(e => {
+      if (e.exerciseId !== exId || statsRowClass(w, e) !== 'V') return;
+      (e.sets || []).forEach(s => {
+        if (!planRunSetHasRecordedPerformance(s)) return;
+        const wt = +s.weight; if (!(wt > 0) || !Number.isFinite(wt)) return;
+        const g = statsVerifiedGrams(w, e, wt); if (g > bestW) bestW = g;
+        const r = +s.reps; if (r > 0 && Number.isFinite(r)) { const v = calc1RM(g, r); if (v > best1) best1 = v; }
+      });
+    });
+  });
+  return { weight: bestW, e1rm: best1 };
+}
+
 // ==================== PERFORMANCE STATS HELPERS ====================
 function getPreviousPerf(exId) {
   const prev = appDb.workouts.filter(w => w.exercises.some(e => e.exerciseId === exId)).sort((a,b) => b.date-a.date)[0];
@@ -302,7 +385,19 @@ function getPreviousPerf(exId) {
   // ahead of a real supplemental set no longer hides the real last
   // performance.
   const s = (ex?.sets || []).find(x => planRunSetHasRecordedPerformance(x));
-  return s?.weight ? `${s.weight}${appDb.unit} × ${s.reps||s.time}` : null;
+  // STAGE 4a: shown in the previous workout's OWN unit when it recorded one
+  // (a display, not a comparison). No unit recorded: exactly as today.
+  return s?.weight ? `${s.weight}${workoutUnitLabel(prev)} × ${s.reps||s.time}` : null;
+}
+// STAGE 4a: the same previous workout, for the logger's "Last:" badge, which
+// must know whose unit the number is in.
+function getPreviousPerfInfo(exId) {
+  const prev = appDb.workouts.filter(w => w.exercises.some(e => e.exerciseId === exId)).sort((a,b) => b.date-a.date)[0];
+  if (!prev) return null;
+  const ex = prev.exercises.find(e => e.exerciseId === exId);
+  const s = (ex?.sets || []).find(x => planRunSetHasRecordedPerformance(x));
+  if (!s?.weight) return null;
+  return { text: `${s.weight} × ${s.reps||s.time}`, unitState: workoutUnitState(prev), unit: recordedWorkoutUnit(prev) };
 }
 
 // BEST-PERFORMANCE FILTERING CORRECTION (ROUND 6) -- these seven functions
@@ -361,10 +456,16 @@ function getPreviousPerf(exId) {
 // this round (not permitted); this conclusion rests entirely on tracing
 // every real save/import code path, not on direct inspection.
 
+// STAGE 4a (Draft 7 §11.2): every helper below that compares LOADS reads only
+// class L rows -- workouts with no recorded unit -- so their numbers are
+// compared raw, exactly as today. Rows recorded with a unit (V or C) are left
+// out rather than compared as raw numbers: 100 kg is never "less than" 150 lb.
+// For an account with only older workouts (all L) nothing changes.
+// getBestTime / getBestReps compare seconds and reps, not loads: unchanged.
 function getBest1RM(exId, excludeId) {
   let best = 0;
   appDb.workouts.filter(w => excludeId ? w.id !== excludeId : true)
-    .forEach(w => w.exercises.filter(e => e.exerciseId===exId)
+    .forEach(w => w.exercises.filter(e => e.exerciseId===exId && statsLegacyRow(w, e))
       .forEach(e => e.sets.forEach(s => { if(planRunSetHasRecordedPerformance(s)&&s.weight&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>best)best=v;} })));
   return best;
 }
@@ -372,7 +473,7 @@ function getBest1RM(exId, excludeId) {
 function getBestWeight(exId, excludeId) {
   let best = 0;
   appDb.workouts.filter(w => excludeId ? w.id !== excludeId : true)
-    .forEach(w => w.exercises.filter(e => e.exerciseId===exId)
+    .forEach(w => w.exercises.filter(e => e.exerciseId===exId && statsLegacyRow(w, e))
       .forEach(e => e.sets.forEach(s => { if(planRunSetHasRecordedPerformance(s)&&+s.weight>best)best=+s.weight; })));
   return best;
 }
@@ -393,7 +494,7 @@ function getBestReps(exId) {
 
 function getBestE1RMForExercise(exId, bw) {
   let best = 0;
-  appDb.workouts.forEach(w => w.exercises.filter(e=>e.exerciseId===exId).forEach(e => e.sets.forEach(s=>{
+  appDb.workouts.forEach(w => w.exercises.filter(e=>e.exerciseId===exId && statsLegacyRow(w, e)).forEach(e => e.sets.forEach(s=>{
     if(!planRunSetHasRecordedPerformance(s)) return;
     if(s.weight&&+s.weight>0&&s.reps){const v=calc1RM(+s.weight,+s.reps);if(v>best)best=v;}
     if((!s.weight||+s.weight===0)&&s.reps&&bw){const v=calc1RM(bw,+s.reps);if(v>best)best=v;}
@@ -404,7 +505,7 @@ function getBestE1RMForExercise(exId, bw) {
 // Get best N-rep performance (used for PRs on profile)
 function getBestNRM(exId, targetReps) {
   let best = 0;
-  appDb.workouts.forEach(w => w.exercises.filter(e => e.exerciseId === exId).forEach(e => e.sets.forEach(s => {
+  appDb.workouts.forEach(w => w.exercises.filter(e => e.exerciseId === exId && statsLegacyRow(w, e)).forEach(e => e.sets.forEach(s => {
     if (planRunSetHasRecordedPerformance(s) && s.weight && s.reps && +s.reps === targetReps && +s.weight > best) best = +s.weight;
   })));
   return best || null;
@@ -415,7 +516,7 @@ function getE1RMHistory(exId) {
   const points = [];
   const sorted = [...appDb.workouts].sort((a,b) => a.date - b.date);
   sorted.forEach(w => {
-    const ex = w.exercises.find(e => e.exerciseId === exId);
+    const ex = w.exercises.find(e => e.exerciseId === exId && statsLegacyRow(w, e));
     if (!ex) return;
     let best = 0;
     ex.sets.forEach(s => {
@@ -439,7 +540,7 @@ function getE1RMHistory(exId) {
 function getExerciseStats(exId) {
   const all = [];
   appDb.workouts.forEach(w => {
-    const ex = w.exercises.find(e => e.exerciseId === exId);
+    const ex = w.exercises.find(e => e.exerciseId === exId && statsLegacyRow(w, e));
     if (ex) ex.sets.forEach(s => { if (planRunSetHasRecordedPerformance(s)) all.push(s); });
   });
   appDb.importedSets.filter(s => s.exerciseId === exId).forEach(s => all.push(s));
@@ -463,8 +564,10 @@ function getExerciseStats(exId) {
 // which now calls this too): weight > 0 -> "135lbs × 5" (or "70lbs × 40"
 // for weight + time); otherwise reps -> "BW × 12"; otherwise time -> "60s".
 // Callers pass only sets that already passed planRunSetHasRecordedPerformance.
-function formatPerformedSetLine(s) {
-  if (s.weight && +s.weight > 0) return `${s.weight}${appDb.unit} × ${s.reps||s.time||'—'}`;
+// STAGE 4a: pass the set's workout `w` and a workout that recorded its unit
+// shows its own unit; without `w`, or with no unit recorded, as today.
+function formatPerformedSetLine(s, w) {
+  if (s.weight && +s.weight > 0) return `${s.weight}${w ? workoutUnitLabel(w) : appDb.unit} × ${s.reps||s.time||'—'}`;
   if (s.reps) return `BW × ${s.reps}`;
   if (s.time) return `${s.time}s`;
   return '—';

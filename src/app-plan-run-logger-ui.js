@@ -324,7 +324,10 @@ function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
       // Set missing its planSetId stamp is still rejected exactly as before.
       var supplemental = loggerSet.isSupplemental === true;
       if (!supplemental && typeof loggerSet.planSetId !== 'string') return { ok: false, reason: 'missingSetIdentity' };
-      sets.push(planRunLoggerBuildPersistedSet(loggerSet));
+      var persisted = planRunLoggerBuildPersistedSet(loggerSet);
+      // STAGE 4a: keep a set's recorded identity (setId) if it has one.
+      if (!planRunCopyRecordedFields(loggerSet, persisted, PLAN_RUN_RECORDED_SET_KEYS)) return { ok: false, reason: 'malformedRecordedField' };
+      sets.push(persisted);
     }
     var perfVideos = Array.isArray(ex.perfVideos) ? ex.perfVideos.filter(function (v) { return typeof v === 'string' && v.length > 0; }) : [];
     // WORKOUT-FLEXIBILITY CORRECTION: `origin` is always stamped by this
@@ -332,7 +335,10 @@ function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
     // app-core.js's addExToWorkout for an added row, confirmChangeExercise
     // for a substituted row) -- defaulted to 'prescribed' here only as a
     // belt-and-suspenders fallback, never relied upon as the normal path.
-    exercises.push({ exerciseId: ex.exerciseId, planAssignmentId: ex.origin === 'added' ? null : ex.planAssignmentId, planPrescriptionId: ex.origin === 'added' ? null : ex.planPrescriptionId, origin: ex.origin || 'prescribed', sets: sets, perfVideos: perfVideos });
+    var row = { exerciseId: ex.exerciseId, planAssignmentId: ex.origin === 'added' ? null : ex.planAssignmentId, planPrescriptionId: ex.origin === 'added' ? null : ex.planPrescriptionId, origin: ex.origin || 'prescribed', sets: sets, perfVideos: perfVideos };
+    // STAGE 4a: keep a row's recorded fields (rowId, implements, basis) if present.
+    if (!planRunCopyRecordedFields(ex, row, PLAN_RUN_RECORDED_ROW_KEYS)) return { ok: false, reason: 'malformedRecordedField' };
+    exercises.push(row);
   }
   var workout = {
     id: currentWorkout.id, ownerUid: ownerUid,
@@ -343,6 +349,8 @@ function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
     duration: planRunLoggerCoerceNumOrNull(currentWorkout.duration), bodyweight: planRunLoggerCoerceNumOrNull(currentWorkout.bodyweight),
     exercises: exercises, createdAt: nowTimestamp
   };
+  // STAGE 4a: keep the workout's recorded unit if it has one (never invented here).
+  if (!planRunCopyRecordedFields(currentWorkout, workout, PLAN_RUN_RECORDED_WORKOUT_KEYS)) return { ok: false, reason: 'malformedRecordedField' };
   return { ok: true, workout: workout };
 }
 

@@ -695,6 +695,9 @@ function renderProfilePage(ex) {
   const pr10 = getBestNRM(ex.id, 10) || null;
   const e1rmHistory = getE1RMHistory(ex.id);
   const hasGraph = e1rmHistory.length >= 3;
+  // STAGE 4a: the figures above read older (no-unit) records only; say so when
+  // any set was recorded with a unit. Never shown for older data alone.
+  const uncomparedSets = statsUncomparedSetCount(ex.id);
 
   const badgesHtml = cats
     .filter(c => CATEGORY_ABBREV[c])
@@ -748,6 +751,7 @@ function renderProfilePage(ex) {
           <div class="prof-pr-row"><span class="prof-pr-key">10RM</span><span class="prof-pr-val">${pr10 ? pr10 + ' ' + appDb.unit : '—'}</span></div>
         </div>
       </div>
+      ${uncomparedSets ? `<div class="prof-empty-state" data-testid="prof-uncompared-note" style="text-align:left;margin-top:8px">These figures and the chart use older records (unit not recorded), compared as written. ${uncomparedSets} set${uncomparedSets === 1 ? '' : 's'} recorded with a unit ${uncomparedSets === 1 ? 'is' : 'are'} not included: this version doesn’t compare them. They’re listed under Set History with their own unit.</div>` : ''}
 
       ${hasGraph ? `
       <div class="prof-graph-section">
@@ -816,7 +820,7 @@ function buildProfileSetHistoryHtml(exId) {
   const groupsHtml = visible.map(g => {
     const d = new Date(g.date).toLocaleDateString('en-US', { weekday:'short', month:'short', day:'numeric', year:'numeric' });
     const setsHtml = g.sets.map((s, i) => `
-        <div class="prof-sethist-set"><span class="prof-sethist-num">${i + 1}</span><span class="prof-sethist-val">${escapeHtml(formatPerformedSetLine(s) + formatSetRpeSuffix(s))}</span></div>`).join('');
+        <div class="prof-sethist-set"><span class="prof-sethist-num">${i + 1}</span><span class="prof-sethist-val">${escapeHtml(formatPerformedSetLine(s, appDb.workouts.find(x => x.id === g.workoutId)) + formatSetRpeSuffix(s))}</span></div>`).join('');
     return `
       <div class="prof-sethist-group" data-testid="prof-set-history-group" data-workout-id="${escapeHtml(String(g.workoutId))}">
         <div class="prof-sethist-head"><span class="prof-sethist-name">${escapeHtml(String(g.name || 'Workout'))}</span><span class="prof-sethist-date">${d}</span></div>

@@ -30,6 +30,10 @@
   var st = { latest: null, checking: false, lastCheck: 0, failedAuto: false, hiddenFor: null, waitingFor: null, navigating: false, writesInFlight: 0 };
   window.__ironlogBuild = RUNNING;
   window.__ironlogUpdate = st;
+  // STAGE 4a: show the running version in Settings, so each copy of the app
+  // (Safari, Home Screen, other devices) can be checked before Stage 4b.
+  function showVersion() { var el = document.getElementById('settings-app-version'); if (el) el.textContent = 'App version ' + (RUNNING || 'unknown'); }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', showVersion); else showVersion();
 
   // ---- Database writes still in progress ------------------------------------
   // Every write promise the app starts is counted until it settles. A reload

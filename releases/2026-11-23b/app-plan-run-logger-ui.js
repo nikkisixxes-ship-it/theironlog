@@ -1,0 +1,1212 @@
+// =============================================================================
+// app-plan-run-logger-ui.js -- Run-aware logger LAUNCH and FINISH slice (this
+// round). Resolves the deferral app-plan-run-ui.js's own header comment
+// named ("deliberately NOT the live, interactive page-log screen... a
+// dependency this slice stops and reports rather than quietly resolving
+// with a write") per the owner's explicit decisions recorded in
+// program-run-logger-finish-slice-addendum.md:
+//   1. Persisted Set shape is the already-implemented flat 8-field shape
+//      (plan-run-model.js) -- `time`, not `seconds`. Not reopened here.
+//   2. This slice EXTENDS the existing Session-preview path
+//      (app-plan-run-ui.js) into the real, interactive `#page-log` screen --
+//      no parallel "TRAIN" flow, and Run Finish never falls through to
+//      legacy finishWorkout()'s own two branches (`currentWorkout.programId`/
+//      `currentWorkout.activeProgramId`) or its fire-and-forget
+//      `fsSaveWorkout()` tail. `app-core.js`'s `finishWorkout()` gains
+//      exactly one new, additive, EARLY-return branch:
+//        if (currentWorkout.canonicalRun) { finishCanonicalRunWorkout(); return; }
+//      inserted after the existing shared preamble (name defaulting, empty-
+//      set/exercise filtering, the `_isEdit` branch, `duration` capture) and
+//      before the legacy `programId`/`activeProgramId` branches -- see that
+//      file's own diff for the exact insertion point.
+//   3. A genuine `integrityConflict` from Mark-In-Progress (already handled
+//      by app-plan-run-ui.js's own planRunUiStartSession) is shown and
+//      blocks launch, with wording distinct from an ordinary transient
+//      failure. This file does not change that gate -- launch (below) is
+//      reached only through the SAME already-confirmed 'committed'/
+//      'alreadyInProgress' path planRunUiStartSession already requires.
+//
+// STATUS / NON-AUTHORIZATION NOTICE: submitted for INDEPENDENT REVIEW ONLY.
+// ROUND 5 CORRECTION: this comment previously said CANONICAL_PLAN_RUN_
+// CAPABILITY_ENABLED (firebase-plan-run.js) "remains hardcoded false" and
+// that fsPlanRunFinish/fsPlanRunCheckFinishStatus therefore "issue zero
+// Firestore I/O in production today." That was stale/wrong. The real,
+// current value is hardcoded `true` -- deliberately reactivated during
+// Stage 6 and still enabled through the supplemental-set deployment, an
+// independently confirmed baseline fact for this round, not a new finding.
+// With the flag true, disabledGate() (firebase-plan-run.js) does NOT throw,
+// so fsPlanRunFinish/fsPlanRunCheckFinishStatus DO issue real Firestore I/O
+// in production today. This file calls exactly two persistence functions --
+// fsPlanRunPersistence.fsPlanRunFinish and
+// fsPlanRunPersistence.fsPlanRunCheckFinishStatus -- never Start, End, or
+// any progression-evaluation function directly (progression evaluation is
+// entirely internal to fsPlanRunFinish's own transaction; this file only
+// ever reads its returned resultRefs, never invokes it separately). The
+// user-facing End Run path is explicitly deferred to a separate slice --
+// no code here reaches fsPlanRunEnd/fsPlanRunPreflightEnd/
+// fsPlanRunCheckEndStatus.
+//
+// SCOPE THIS ROUND:
+//   A. LAUNCH: extends app-plan-run-ui.js's read-only Session-preview
+//      content with a real "Open Logger" control (wired from that file --
+//      see its own diff), which calls planRunLoggerLaunch(run, occurrence)
+//      below. Builds a real `currentWorkout` from the occurrence's own
+//      already-verified `assignments[].orderedSets[]` (the SAME data the
+//      read-only preview already renders, via the SAME existing
+//      `planSetToLoggerSet` converter app-plan.js already exports -- no new
+//      numeric auto-fill logic; the already-accepted, already-disclosed
+//      "no %TM/%1RM/working-load resolution outside an Active Program
+//      instance" gap applies identically here), stamps `currentWorkout.
+//      canonicalRun` with exactly the identity fields Finish will need, and
+//      opens the real `#page-log` screen via the SAME
+//      finalizeStartActiveWorkout/startNewWorkout convention every other
+//      logger launch already uses (renderWorkoutExercises/showPage/
+//      startWorkoutTimer).
+//   B. IDENTITY PRESERVATION AT LAUNCH: every Set the logger renders for a
+//      canonical Run session is stamped with its own real, already-verified
+//      `planSetId` (occurrence.assignments[].orderedSets[].planSetId) and
+//      every exercise with its own real `planAssignmentId`/
+//      `planPrescriptionId` -- the SAME identity fields
+//      planRunWorkoutContextMatchesOccurrence (plan-run-model.js, not
+//      reopened) requires every persisted Set to resolve against. Because
+//      that already-accepted model requires EVERY persisted Set to resolve
+//      to a real prescribed Set, and the generic logger's own `addSet`/
+//      `addPRSet`/`removeSet` (app-core.js) have no concept of that
+//      identity, this slice adds one small, additive guard to each of
+//      those three existing functions (see app-core.js's own diff): for a
+//      canonical Run session only, they decline with an honest message
+//      instead of silently either fabricating an unidentifiable Set or
+//      silently dropping one at Finish time -- a Run-linked Session logs
+//      exactly its prescribed Sets, matching what the read-only preview
+//      already showed. This is a direct, non-guessed consequence of
+//      decision 1 above ("preserve every required... Set identity"), not a
+//      new design decision -- disclosed here and in the delivery report,
+//      not silently applied.
+//   C. FINISH: `finishCanonicalRunWorkout()` builds the amended 16-field
+//      top-level / 8-field-flat-Set / `perfVideos`-array workout doc from
+//      `currentWorkout` (coercing each Set's weight/reps/time/rpe to a
+//      real finite number or null, and completed/isPR/isNew1RM to a real
+//      boolean -- see planRunLoggerCoerceNumOrNull/planRunLoggerCoerceBool
+//      below; the in-memory logger set's own fields are plain strings from
+//      `<input>.value`, confirmed by reading app-core.js's own `updateSet`),
+//      then calls the real, awaited `fsPlanRunFinish` transaction. Shows
+//      honest pending/committed/notEligible/conflict/budgetExceeded/
+//      invalidInput/uncertain states on `#page-log` itself (never navigates
+//      away until success is CONFIRMED by the transaction's own return
+//      value), offers Retry (resubmits the EXACT SAME prepared `pkg`/
+//      `operationId`, never rebuilt) and Check Status
+//      (fsPlanRunCheckFinishStatus, read-only, identity-only input) on an
+//      uncertain outcome, and disables the Finish button for the duration
+//      of any in-flight or uncertain attempt so a second click can never
+//      submit a second, competing operationId for the same workoutId.
+//
+// EXCLUDED, DELIBERATELY, THIS SLICE: the user-facing End Run path (its own
+// subsequent slice, per the owner's explicit instruction); any interactive
+// per-Rule progression Apply/Edit/Skip review UI (no such capability exists
+// anywhere in this codebase for the canonical model -- progression
+// evaluation is fully automatic inside fsPlanRunFinish's own transaction;
+// this file only surfaces its resultRefs.needsManualReviewRuleIds count as
+// an honest informational note, never an interactive review flow); Save-
+// without-finishing (fsPlanRunSaveHistoryOnly) from this screen; History-
+// only workout creation.
+//
+// LIFECYCLE-SAFETY CORRECTION (this round, still logger-launch/Finish only
+// -- End Run not begun). Four narrowly scoped fixes, all still inside this
+// file plus the two small app-core.js call sites this file already relies
+// on (finishWorkout's branch, the auth-change/showPage boundaries):
+//   1. planRunLoggerFinishResetForAuthChange now also discards a Run-linked
+//      currentWorkout (never a legacy one -- see that function's own
+//      comment).
+//   2. Result staleness is now two INDEPENDENT checks, not one buggy epoch
+//      counter that was declared but never actually consulted:
+//      planRunLoggerFinishResultStillCurrent(pkg) (is this response still
+//      about the CURRENT workout/owner/attempt -- gates every data/state
+//      effect) and planRunLoggerFinishIsPageVisible() (is #page-log the
+//      active page RIGHT NOW -- gates only the interruptive toast/
+//      navigation on a real commit). The old planRunLoggerFinishEpoch/
+//      planRunLoggerFinishInvalidateForNav/planRunLoggerFinishIsCurrentForRender
+//      (the last of which was written but never actually called anywhere)
+//      are removed as superseded, not left as dead, misleading weight.
+//   3. planRunLoggerLaunch now declines (zero state change, honest toast)
+//      when a currentWorkout already exists -- legacy or canonicalRun --
+//      rather than silently overwriting it.
+//   4. finishCanonicalRunWorkout now also blocks re-entry while the
+//      tracked attempt is 'uncertain', not only 'pending' -- Retry remains
+//      the sole path that may resubmit during that phase. The existing
+//      Abandon contract (fresh operationId, same workoutId, "fsPlanRunFinish's
+//      own already-accepted collision handling resolves that safely
+//      regardless of whether the abandoned attempt secretly did commit")
+//      was traced against the real planRunClassifyFinishOccurrence branches
+//      (b)/(h) before this correction, confirmed still safe, and therefore
+//      left unchanged -- see the delivery report for the full trace.
+//
+// LIFECYCLE-SAFETY CORRECTION, ROUND 2 (independent review) -- one narrowly
+// scoped fix, still inside this file only, no plan-run-model.js/
+// firebase-plan-run.js change:
+//   5. Abandon -> edit -> fresh Finish (new operationId, same workoutId) ->
+//      the ORIGINAL, abandoned attempt turns out to have actually committed:
+//      fsPlanRunFinish's own real, already-accepted branch (b) ("no-receipt
+//      self-commit", plan-run-model.js) correctly returns alreadyCommitted
+//      in this case (the occurrence really IS completed under this
+//      workoutId) -- but branch (b) only confirms the STORED workout's own
+//      structural identity against the occurrence, never its byte content
+//      against THIS fresh attempt's own (possibly-edited) pkg.workout. This
+//      file previously treated every 'alreadyCommitted' outcome as proof
+//      that pkg.workout was what got saved -- true for a genuine first
+//      commit and for an exact-pkg Retry, but NOT true here: the real,
+//      persisted content is the ORIGINAL attempt's, which this fresh
+//      attempt's local pkg never saw.
+//      The already-accepted, already-shipped fsPlanRunFinish contract
+//      already discloses exactly this uncertainty via its own
+//      `packageHashVerified` field (plan-run-model.js branch (a)'s own
+//      comment: "a status-check-only call... must never claim to have
+//      verified byte-identical package content it never had" -- the same
+//      honesty requirement applies here). This correction does not add,
+//      redefine, or reinterpret that field -- it simply makes THIS file
+//      finally read it: `planRunLoggerFinishApplyOutcome` (reached only
+//      from a real fsPlanRunFinish call -- a fresh Finish or an exact-pkg
+//      Retry) now trusts pkg.workout for History/"saved" ONLY when
+//      outcome==='committed' (this attempt's own write just happened, so
+//      pkg.workout trivially IS the content) or outcome==='alreadyCommitted'
+//      && packageHashVerified===true (an exact-pkg Retry always reaches
+//      this, byte-verified, since it resubmits the SAME operationId+content
+//      fsPlanRunFinish just hashed). Any other 'alreadyCommitted' --
+//      reachable only after an Abandon, per the trace above and in the
+//      delivery report -- routes to a new, honest, non-"saved" state
+//      (planRunLoggerFinishEnterAlreadyCommittedUnverified) instead: local
+//      History is never written with unverified content, and no "saved"
+//      toast is ever shown for content that was never actually confirmed.
+//      fsPlanRunCheckFinishStatus's own outcome handling (planRunLogger
+//      FinishCheckStatus) is DELIBERATELY left unchanged -- see that
+//      function's own comment for why it is safe as-is without this same
+//      gate (it can only ever confirm the SAME already-tracked pkg, which
+//      cannot collide with a different attempt without an intervening
+//      Abandon that already ends its own tracking first).
+//
+// END RUN SLICE (this round) -- adds exactly one new, pure, read-only
+// function, `planRunLoggerBlocksEndForRun(planRunId)` (below), consumed by
+// the new `app-plan-run-end-ui.js`'s own End Run control so it can refuse to
+// offer ending a Run while this file's own logger state still has an open
+// Run-linked workout or an unresolved Finish attempt belonging to that same
+// Run. This file itself still calls exactly the same two persistence
+// functions named above -- fsPlanRunFinish/fsPlanRunCheckFinishStatus --
+// and never fsPlanRunEnd/fsPlanRunPreflightEnd/fsPlanRunCheckEndStatus,
+// which live entirely in the new file.
+//
+// SAFETY CORRECTION (this round -- independent-review finding, same-device
+// race; see app-plan-run-end-ui.js's own header for the full trace):
+// `planRunLoggerLaunch` below is the ONLY place in this codebase that stamps
+// a NEW `currentWorkout.canonicalRun` -- it now also refuses to do so while
+// a DIFFERENT file's End attempt for the SAME Run is 'pending' or
+// 'uncertain', checked via app-plan-run-end-ui.js's own read-only
+// `planRunEndBlocksNewWorkoutForRun` (the exact reverse-direction mirror of
+// this file's own `planRunLoggerBlocksEndForRun`, immediately above). This
+// file still never itself calls fsPlanRunEnd/fsPlanRunPreflightEnd/
+// fsPlanRunCheckEndStatus, and still never reads app-plan-run-end-ui.js's
+// own `planRunEndStateByRunId` directly -- only through that file's one
+// exported read-only check, the same cross-file hand-off convention this
+// file's own `planRunLoggerBlocksEndForRun` already established in the
+// opposite direction.
+// =============================================================================
+
+// ---- Pure coercion helpers (zero I/O) -- exported below for direct testing
+// without a DOM. Mirror the in-memory logger set's own real representation:
+// app-core.js's `updateSet(exIdx, setIdx, field, val)` stores `val` (an
+// `<input type="number">`'s raw `.value`, i.e. a STRING, or '' when blank --
+// confirmed by reading that function directly, never something this file
+// assumes) verbatim into `currentWorkout.exercises[exIdx].sets[setIdx]
+// [field]`, with no numeric coercion anywhere in the legacy logger itself
+// (the legacy History write path persists those same raw strings
+// unchanged). The already-accepted, already-reviewed canonical Set
+// validator (plan-run-model.js's planRunWorkoutSetValid) requires a REAL
+// finite number or `null` for weight/reps/time/rpe -- never a string, never
+// NaN -- so this coercion is required new logic for this slice, applied
+// only at the canonical Finish boundary, never touching the legacy write
+// path or the in-memory logger representation itself.
+// -----------------------------------------------------------------------------
+function planRunLoggerCoerceNumOrNull(v) {
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  if (typeof v === 'string') {
+    if (v.trim() === '') return null;
+    var n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+  return null;
+}
+function planRunLoggerCoerceBool(v) { return v === true; }
+
+// Builds one canonical flat Set (PLAN_RUN_WORKOUT_SET_KEYS order/shape) from
+// one in-memory logger set. `planSetId` is never derived or guessed here for
+// a prescribed Set -- it must already have been stamped onto the in-memory
+// set at launch (planRunLoggerBuildCurrentWorkout below); a prescribed set
+// missing one is dropped by the caller (planRunLoggerBuildWorkoutDoc), never
+// persisted with a fabricated id.
+//
+// SUPPLEMENTAL-SET CORRECTION: a Set the person added beyond the
+// prescription (app-core.js's addSet, stamped isSupplemental:true there) is
+// persisted with planSetId:null -- never a fabricated id, never a reused
+// prescribed id -- and isSupplemental:true, exactly matching the amended
+// PLAN_RUN_WORKOUT_SET_KEYS shape (plan-run-model.js). Every other field is
+// built identically regardless of supplemental/prescribed.
+// PERSISTENCE-BOUNDARY DEFENSE (this round): isPR/isNew1RM are DERIVED
+// display/history flags, never independent facts -- this boundary must
+// never persist either one true for a Set that is not completed and does
+// not genuinely carry the values its own calculation requires (isPR
+// needs a real positive weight; isNew1RM additionally needs real reps,
+// mirroring exactly which inputs app-core.js's own checkSetPR/
+// onSetChecked require before computing either flag at all). This holds
+// regardless of whatever value happened to be sitting in the in-memory
+// logger Set when Finish was pressed -- an independent second backstop
+// behind the source-level correction in app-core.js, not a replacement
+// for it. See app-core.js's own sanitizeSetPRFlags for the equivalent
+// backstop on the ordinary (non-Program-Run) Finish path.
+function planRunLoggerBuildPersistedSet(s) {
+  var supplemental = s.isSupplemental === true;
+  var completed = planRunLoggerCoerceBool(s.completed);
+  var weight = planRunLoggerCoerceNumOrNull(s.weight);
+  var reps = planRunLoggerCoerceNumOrNull(s.reps);
+  var qualifiesForPRFlags = completed === true && weight !== null && weight > 0 && reps !== null;
+  return {
+    planSetId: supplemental ? null : s.planSetId,
+    weight: weight,
+    reps: reps,
+    time: planRunLoggerCoerceNumOrNull(s.time),
+    rpe: planRunLoggerCoerceNumOrNull(s.rpe),
+    completed: completed,
+    isPR: qualifiesForPRFlags ? planRunLoggerCoerceBool(s.isPR) : false,
+    isNew1RM: qualifiesForPRFlags ? planRunLoggerCoerceBool(s.isNew1RM) : false,
+    isSupplemental: supplemental
+  };
+}
+
+// Builds the full amended 16-field canonical workout document from a
+// `currentWorkout` already carrying a `canonicalRun` stamp (see
+// planRunLoggerBuildCurrentWorkout). Pure except for its `nowFn`/`ownerUid`
+// inputs (both supplied by the caller, never read from ambient globals
+// here) -- safe to unit-test without a DOM or `auth`. Returns
+// `{ok:true, workout}` or `{ok:false, reason}` -- a `reason` of
+// 'missingSetIdentity' means at least one rendered Set lost its
+// `planSetId` stamp somehow (should be unreachable given the launch-time
+// stamping and the add/remove guards in app-core.js, but this function
+// never assumes that and never silently drops a Set to "fix" the shape --
+// an honest, zero-write rejection is always preferred to guessing).
+function planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTimestamp) {
+  if (!currentWorkout || !currentWorkout.canonicalRun) return { ok: false, reason: 'notCanonicalRun' };
+  var cr = currentWorkout.canonicalRun;
+  var exercises = [];
+  for (var i = 0; i < currentWorkout.exercises.length; i++) {
+    var ex = currentWorkout.exercises[i];
+    // WORKOUT-FLEXIBILITY CORRECTION: an 'added' row (app-core.js's
+    // addExToWorkout, canonical-run branch) legitimately carries NO
+    // Assignment binding at all -- planAssignmentId/planPrescriptionId are
+    // both null, by design, never fabricated. Only a 'prescribed' or
+    // 'substituted' row (or a row with no `origin` stamped at all, which
+    // this slice never produces but is tolerated defensively) is required
+    // to carry real, non-null identity here. Root-cause note: before this
+    // correction, ANY added row -- reachable today via the always-visible
+    // Add Exercise button, with zero prior guard -- reached this exact
+    // check and failed the WHOLE Finish with 'missingExerciseIdentity',
+    // discarding every genuinely completed exercise in the same workout
+    // along with it. Confirmed directly against this file's own prior
+    // text before this correction.
+    if (ex.origin === 'added') {
+      if (typeof ex.exerciseId !== 'string') return { ok: false, reason: 'missingExerciseIdentity' };
+    } else if (typeof ex.planAssignmentId !== 'string' || typeof ex.planPrescriptionId !== 'string') {
+      return { ok: false, reason: 'missingExerciseIdentity' };
+    }
+    var sets = [];
+    for (var s = 0; s < ex.sets.length; s++) {
+      var loggerSet = ex.sets[s];
+      // SUPPLEMENTAL-SET CORRECTION: a Set the person added beyond the
+      // prescription (isSupplemental:true, stamped by app-core.js's addSet)
+      // never carries a planSetId -- that is correct, not an error, so it
+      // is exempted from this identity check. A non-supplemental (prescribed)
+      // Set missing its planSetId stamp is still rejected exactly as before.
+      var supplemental = loggerSet.isSupplemental === true;
+      if (!supplemental && typeof loggerSet.planSetId !== 'string') return { ok: false, reason: 'missingSetIdentity' };
+      var persisted = planRunLoggerBuildPersistedSet(loggerSet);
+      // STAGE 4a: keep a set's recorded identity (setId) if it has one.
+      if (!planRunCopyRecordedFields(loggerSet, persisted, PLAN_RUN_RECORDED_SET_KEYS)) return { ok: false, reason: 'malformedRecordedField' };
+      sets.push(persisted);
+    }
+    var perfVideos = Array.isArray(ex.perfVideos) ? ex.perfVideos.filter(function (v) { return typeof v === 'string' && v.length > 0; }) : [];
+    // WORKOUT-FLEXIBILITY CORRECTION: `origin` is always stamped by this
+    // point (planRunLoggerLaunch for every row present at launch,
+    // app-core.js's addExToWorkout for an added row, confirmChangeExercise
+    // for a substituted row) -- defaulted to 'prescribed' here only as a
+    // belt-and-suspenders fallback, never relied upon as the normal path.
+    var row = { exerciseId: ex.exerciseId, planAssignmentId: ex.origin === 'added' ? null : ex.planAssignmentId, planPrescriptionId: ex.origin === 'added' ? null : ex.planPrescriptionId, origin: ex.origin || 'prescribed', sets: sets, perfVideos: perfVideos };
+    // STAGE 4a: keep a row's recorded fields (rowId, implements, basis) if present.
+    if (!planRunCopyRecordedFields(ex, row, PLAN_RUN_RECORDED_ROW_KEYS)) return { ok: false, reason: 'malformedRecordedField' };
+    exercises.push(row);
+  }
+  var workout = {
+    id: currentWorkout.id, ownerUid: ownerUid,
+    planRunId: cr.planRunId, planOccurrenceId: cr.occurrenceId, planTemplateId: cr.planTemplateId,
+    headRevisionId: cr.headRevisionId, planMicrocycleId: cr.planMicrocycleId, planSessionId: cr.planSessionId,
+    recordKind: 'canonicalWorkout', completionState: 'sessionCompleted',
+    name: currentWorkout.name, date: planRunLoggerCoerceNumOrNull(currentWorkout.date),
+    duration: planRunLoggerCoerceNumOrNull(currentWorkout.duration), bodyweight: planRunLoggerCoerceNumOrNull(currentWorkout.bodyweight),
+    exercises: exercises, createdAt: nowTimestamp
+  };
+  // STAGE 4a: keep the workout's recorded unit if it has one (never invented here).
+  if (!planRunCopyRecordedFields(currentWorkout, workout, PLAN_RUN_RECORDED_WORKOUT_KEYS)) return { ok: false, reason: 'malformedRecordedField' };
+  return { ok: true, workout: workout };
+}
+
+// -----------------------------------------------------------------------------
+// DOM / UI layer -- everything below needs a real browser (or jsdom) realm.
+// -----------------------------------------------------------------------------
+
+function planRunLoggerCapabilityEnabled() {
+  if (typeof window !== 'undefined' && window.__PLAN_RUN_TEST_OVERRIDE_ENABLED__ === true) return true;
+  return typeof window !== 'undefined' && window.CANONICAL_PLAN_RUN_CAPABILITY_ENABLED === true;
+}
+function planRunLoggerCurrentUid() {
+  return (typeof auth !== 'undefined' && auth.currentUser && auth.currentUser.uid) || null;
+}
+
+// END RUN SLICE ADDITION -- a pure, read-only check used by
+// app-plan-run-end-ui.js's own End Run control before it will even offer to
+// end a Run: true when THIS SAME Run (planRunId) currently has an open
+// Run-linked workout in the logger, or an unresolved Finish attempt tracked
+// for it. Reads this file's own existing module state only (`currentWorkout`,
+// `planRunLoggerFinishState`) -- introduces no new state, and never mutates
+// anything. Checked as two independent conditions, matching the requirement
+// literally ("an open Run-linked workout OR an unresolved Finish attempt"):
+//   - an open workout: `currentWorkout.canonicalRun.planRunId === planRunId`
+//     -- covers every phase where a Session for this Run is still sitting
+//     open/editable in the logger, including 'pending'/'uncertain'/the
+//     Round-2 'alreadyCommittedUnverified' phase (all three leave
+//     currentWorkout populated by design -- see that phase's own header) and
+//     even the ordinary case where nothing has been submitted yet at all.
+//   - an unresolved Finish attempt: derived independently from
+//     `planRunLoggerFinishState.pkg.planRunId` (never from currentWorkout),
+//     so this stays correct even if a future change ever decouples the two.
+//     Only 'pending'/'uncertain'/'alreadyCommittedUnverified' count as
+//     unresolved -- every other phase (disabled/error/a terminal rejection
+//     already Dismissable, or no state at all) is already fully resolved
+//     and never blocks End.
+function planRunLoggerBlocksEndForRun(planRunId) {
+  var hasOpenWorkout = !!(typeof currentWorkout !== 'undefined' && currentWorkout && currentWorkout.canonicalRun && currentWorkout.canonicalRun.planRunId === planRunId);
+  var hasUnresolvedFinish = !!(typeof planRunLoggerFinishState !== 'undefined' && planRunLoggerFinishState && planRunLoggerFinishState.pkg && planRunLoggerFinishState.pkg.planRunId === planRunId &&
+    (planRunLoggerFinishState.phase === 'pending' || planRunLoggerFinishState.phase === 'uncertain' || planRunLoggerFinishState.phase === 'alreadyCommittedUnverified'));
+  return hasOpenWorkout || hasUnresolvedFinish;
+}
+
+// ---- A. LAUNCH --------------------------------------------------------------
+// Called from app-plan-run-ui.js's read-only preview screen's new "Open
+// Logger" control. `run`/`occurrence` are the SAME already-verified objects
+// (fsPlanRunReadForDisplay, mode:'display') that screen already has in hand
+// -- no additional read is issued here. Building `currentWorkout` and
+// opening `#page-log` is entirely synchronous, local state -- no write of
+// any kind happens at launch; the first real write this whole path can
+// possibly cause is the person's own later, explicit Finish.
+function planRunLoggerLaunch(run, occurrence) {
+  if (!planRunLoggerCapabilityEnabled()) return false;
+  if (!run || !occurrence || !Array.isArray(occurrence.assignments) || occurrence.assignments.length === 0) return false;
+  // LIFECYCLE-SAFETY CORRECTION, issue 3 -- opening a Run Session must never
+  // silently discard logged work already in progress, whether that work is
+  // an ordinary legacy workout or an earlier Run-linked one. Declines
+  // honestly (zero state change) instead; the person must explicitly Finish
+  // or Cancel whatever is already open first.
+  // ACTIVE-WORKOUT RECOVERY: never open a Session while the recovery
+  // question is unanswered (it would replace the recovered draft).
+  if (typeof awDraftBlocksOpeningWorkout === 'function' && awDraftBlocksOpeningWorkout()) return false;
+  if (currentWorkout) {
+    showToast('Finish or cancel your current workout before starting a new Session.', 'error');
+    return false;
+  }
+  // SAFETY CORRECTION (this round) -- see this file's own header and
+  // app-plan-run-end-ui.js's for the full trace: never open a NEW workout
+  // for a Run whose End attempt has not yet resolved one way or the other,
+  // however this function was reached (Resume's read-only preview, or
+  // Start Session's own preview afterward).
+  if (typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId)) {
+    showToast('This Program Run is being ended. Wait for that to finish before opening the logger.', 'error');
+    return false;
+  }
+  // PROGRESSION SERIES FOUNDATION: a Session with no series-linked Rule opens
+  // exactly as before (synchronously, nothing extra read). A Session WITH one
+  // first reads the current, committed series value(s) -- every time it is
+  // opened -- and resolves Working Load / Training Max prescriptions from them.
+  var seriesLinked = planRunLoggerOccurrenceSeriesLinks(occurrence);
+  if (seriesLinked.length === 0) return planRunLoggerOpenOccurrence(run, occurrence, null);
+  if (typeof planProgressionSeriesFeatureEnabled !== 'function' || !planProgressionSeriesFeatureEnabled()) {
+    showToast('This Session uses a Progression series, which needs the newer version of the app. Nothing was changed.', 'error');
+    return false;
+  }
+  if (planRunLoggerSeriesLaunchPending) return false; // one open at a time
+  var ownerAtStart = planRunLoggerCurrentUid();
+  var token = {};
+  planRunLoggerSeriesLaunchPending = token;
+  var readPromise;
+  try {
+    readPromise = Promise.resolve(fsPlanRunPersistence.fsPlanRunReadSeriesForOccurrence({ ownerUid: ownerAtStart, planRunId: occurrence.planRunId, occurrence: occurrence }));
+  } catch (err) {
+    readPromise = Promise.reject(err);
+  }
+  return readPromise.then(function (result) {
+    if (planRunLoggerSeriesLaunchPending !== token) return false;
+    planRunLoggerSeriesLaunchPending = null;
+    // Re-check what the synchronous guards above checked: the world may have
+    // changed while the read was in flight.
+    if (planRunLoggerCurrentUid() !== ownerAtStart || currentWorkout) return false;
+    if (typeof planRunEndBlocksNewWorkoutForRun === 'function' && planRunEndBlocksNewWorkoutForRun(run.planRunId)) return false;
+    if (!result || result.outcome !== 'verified') {
+      showToast('This Session\u2019s Progression series values can\u2019t be confirmed right now, so it wasn\u2019t opened. Nothing was changed.', 'error');
+      return false;
+    }
+    // FAILURE RECOMMENDATIONS: a series with an undecided miss waits for the
+    // lifter's decision before its next Session opens.
+    var pendingSeries = Object.keys(result.valuesByRuleId).map(function (k) { return result.valuesByRuleId[k]; }).filter(function (v) { return v.pendingDecisionIds && v.pendingDecisionIds.length; });
+    if (pendingSeries.length) {
+      var frKinds = (pendingSeries[0].pendingDecisions || []).map(function (d) { return d.kind; });
+      showToast(frKinds.indexOf('failure') === -1
+        ? 'Approve or decline the proposed increase for “' + pendingSeries[0].seriesName + '” before starting this Session.'
+        : 'Decide what to do after your last miss in “' + pendingSeries[0].seriesName + '” before starting this Session.', 'error');
+      if (typeof planRunFailureUiOpenForRun === 'function') planRunFailureUiOpenForRun(run.planRunId);
+      return false;
+    }
+    return planRunLoggerOpenOccurrence(run, occurrence, result.valuesByRuleId);
+  }, function () {
+    if (planRunLoggerSeriesLaunchPending !== token) return false;
+    planRunLoggerSeriesLaunchPending = null;
+    showToast('Couldn\u2019t load this Session\u2019s Progression series values. Check your connection and try again.', 'error');
+    return false;
+  });
+}
+
+// PROGRESSION SERIES FOUNDATION -- module state + helpers for series-linked
+// Session launch. Never persisted.
+var planRunLoggerSeriesLaunchPending = null;
+function planRunLoggerOccurrenceSeriesLinks(occurrence) {
+  var out = [];
+  (occurrence.assignments || []).forEach(function (a) {
+    (a.rules || []).forEach(function (rl) {
+      var sid = (typeof planRunRuleEntrySeriesId === 'function') ? planRunRuleEntrySeriesId(rl) : null;
+      if (sid !== null && rl.enabled) out.push({ planAssignmentId: a.planAssignmentId, planRuleId: rl.planRuleId, seriesId: sid });
+    });
+  });
+  return out;
+}
+function planRunLoggerAppWeightUnit() {
+  return (typeof appDb !== 'undefined' && appDb && appDb.unit === 'kg') ? 'kg' : 'lb';
+}
+// The sets a Run Session opens with, as the logger fills them: the app's own
+// planSetToLoggerSet (a written weight stays; a blank fixed load takes the
+// Working Load; a %TM load comes from the Training Max), then any accepted
+// reductions from a decision after a miss. Shared by the logger and the
+// decision previews so both always agree.
+//   orderedSets: the prescription's ordered sets
+//   exerciseId:  the exercise the row opens with
+//   rule:        the series' rule entry ({ adjustmentType }), or null
+//   v:           the series value ({ valueKind, currentValue, temporaryAdjustments,
+//                loadAdjustments }), or null
+// Returns planSetToLoggerSet results (weight is '' when nothing fills it);
+// a set changed by a reduction carries failureAdjusted: true.
+function planRunLoggerRunSets(orderedSets, exerciseId, rule, v) {
+  var usable = !!(v && v.currentValue && v.currentValue.amount !== null && v.currentValue.unit === planRunLoggerAppWeightUnit());
+  var activeCtx = null, progressionCtx = null;
+  if (usable && rule) {
+    var holder = {}; holder[exerciseId] = { value: v.currentValue.amount };
+    activeCtx = v.valueKind === 'workingLoad' ? { workingLoads: holder } : { trainingMaxes: holder };
+    progressionCtx = { enabled: true, adjustmentType: rule.adjustmentType };
+  }
+  var frAdjusting = !!(usable && typeof planRunFailureResolveSetLoad === 'function' &&
+    ((v.temporaryAdjustments && v.temporaryAdjustments.length) || (v.loadAdjustments && v.loadAdjustments.length)));
+  var frCtx = frAdjusting ? { valueKind: v.valueKind, amount: v.currentValue.amount, unit: v.currentValue.unit, temps: v.temporaryAdjustments || [], persistent: v.loadAdjustments || [] } : null;
+  return (orderedSets || []).map(function (os) {
+    var loggerSet = (typeof planSetToLoggerSet === 'function') ? planSetToLoggerSet(os.prescribed, exerciseId, activeCtx, progressionCtx) : { weight: '', reps: '', time: '', rpe: '', autoFilled: false, autoType: null, completed: false };
+    if (frCtx) {
+      var frLoad = planRunFailureResolveSetLoad(os.prescribed, frCtx);
+      if (frLoad !== null && String(frLoad) !== loggerSet.weight) { loggerSet.weight = String(frLoad); loggerSet.autoFilled = true; loggerSet.failureAdjusted = true; }
+    }
+    return loggerSet;
+  });
+}
+// The series value (if any) this assignment's prescriptions resolve from.
+// Only a resolved value in the app's current weight unit is used; anything
+// else leaves the prescription exactly as the Session snapshot has it
+// (never converted, never guessed).
+function planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId) {
+  if (!seriesValuesByRuleId) return null;
+  for (var i = 0; i < (a.rules || []).length; i++) {
+    var rl = a.rules[i];
+    if (!rl.enabled || !Object.prototype.hasOwnProperty.call(seriesValuesByRuleId, rl.planRuleId)) continue;
+    var v = seriesValuesByRuleId[rl.planRuleId];
+    return { rule: rl, value: v, usable: v.currentValue.amount !== null && v.currentValue.unit === planRunLoggerAppWeightUnit() };
+  }
+  return null;
+}
+
+function planRunLoggerOpenOccurrence(run, occurrence, seriesValuesByRuleId) {
+  var seriesResolution = {};
+  var unitMismatch = false;
+  // RECOMMENDED REPLACEMENTS (in-memory, per open Session; saved only in the
+  // local recovery draft, never in the workout document):
+  //   effectiveExerciseByAssignmentId -- the exercise each Assignment opens
+  //     with (the Run's durable series replacement, if any);
+  //   seriesByAssignmentId -- the series facts Change Exercise needs;
+  //   recommendedByAssignmentId -- the Run's frozen recommendation snapshot;
+  //   pendingRunReplacements -- the person's not-yet-durable "Replace for
+  //     this active Run" choices, applied only by a committed Finish.
+  var effectiveExerciseByAssignmentId = {}, seriesByAssignmentId = {}, recommendedByAssignmentId = {};
+  var exercises = occurrence.assignments.map(function (a) {
+    var sv = planRunLoggerSeriesValueForAssignment(a, seriesValuesByRuleId);
+    var activeCtx = null, progressionCtx = null;
+    var rowExerciseId = a.exerciseId;
+    (a.rules || []).forEach(function (rl) {
+      var rec = (typeof planRunRuleEntryRecommendedIds === 'function') ? planRunRuleEntryRecommendedIds(rl) : null;
+      if (rl.enabled && rec) recommendedByAssignmentId[a.planAssignmentId] = rec.slice();
+    });
+    if (sv) {
+      if (typeof sv.value.activeExerciseId === 'string') rowExerciseId = sv.value.activeExerciseId;
+      seriesByAssignmentId[a.planAssignmentId] = { planRuleId: sv.rule.planRuleId, seriesId: sv.value.seriesId, seriesName: sv.value.seriesName, valueKind: sv.value.valueKind, activeExerciseId: rowExerciseId, hasFutureMember: sv.value.hasFutureMember === true };
+    }
+    effectiveExerciseByAssignmentId[a.planAssignmentId] = rowExerciseId;
+    if (sv) {
+      seriesResolution[a.planAssignmentId] = { planRuleId: sv.rule.planRuleId, seriesId: sv.value.seriesId, seriesName: sv.value.seriesName, valueKind: sv.value.valueKind, amount: sv.value.currentValue.amount, unit: sv.value.currentValue.unit, used: sv.usable };
+      if (sv.value.currentValue.amount !== null && !sv.usable) unitMismatch = true;
+      if (sv.usable) {
+        var holder = {}; holder[rowExerciseId] = { value: sv.value.currentValue.amount };
+        activeCtx = sv.value.valueKind === 'workingLoad' ? { workingLoads: holder } : { trainingMaxes: holder };
+        progressionCtx = { enabled: true, adjustmentType: sv.rule.adjustmentType };
+      }
+    }
+    // FAILURE RECOMMENDATIONS: an accepted Repeat Prescription may have moved
+    // a different prescription into this Session for this series; accepted
+    // reductions adjust the loads filled in below. Both come from the same
+    // verified series read; the Session snapshot itself is unchanged.
+    var frOrderedSets = (sv && sv.value.scheduleOverride) ? sv.value.scheduleOverride.orderedSets : a.orderedSets;
+    // The same load resolution the decision previews use (one function, so
+    // what a preview says a set will get is what the logger fills).
+    var sets = planRunLoggerRunSets(frOrderedSets, rowExerciseId, sv ? sv.rule : null, sv ? sv.value : null).map(function (loggerSet, si) {
+      var os = frOrderedSets[si];
+      loggerSet.planSetId = os.planSetId;
+      loggerSet.isPR = false;
+      loggerSet.isNew1RM = false;
+      // SUPPLEMENTAL-SET CORRECTION: every prescribed Set is explicitly
+      // stamped isSupplemental:false at launch (never left undefined), per
+      // this codebase's exact-keys/no-implicit-fields convention. Sets
+      // added later via app-core.js's addSet are stamped isSupplemental:true
+      // there, at creation -- never guessed or inferred here.
+      loggerSet.isSupplemental = false;
+      return loggerSet;
+    });
+    // WORKOUT-FLEXIBILITY CORRECTION: every row the Session launches with is
+    // honestly, explicitly 'prescribed' -- it is exactly what app-plan.js's
+    // own occurrence snapshot assigned. A later Change Exercise
+    // (app-core.js's confirmChangeExercise) may relabel it 'substituted';
+    // Add Exercise (app-core.js's addExToWorkout) stamps a brand-new row
+    // 'added' -- neither is ever decided here, at launch.
+    // RECOMMENDED REPLACEMENTS: a series durably replaced for this Run opens
+    // with its replacement exercise, labeled 'runReplacement' (Finish checks
+    // it against the series state, never trusts the label).
+    return { exerciseId: rowExerciseId, planAssignmentId: a.planAssignmentId, planPrescriptionId: a.planPrescriptionId, origin: rowExerciseId === a.exerciseId ? 'prescribed' : 'runReplacement', sets: sets, perfVideos: [] };
+  });
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): this function
+  // already refuses above (`if (currentWorkout) { ... return false; }`)
+  // when a workout is already open, so currentWorkout is always null by
+  // this point and no live timer from a DIFFERENT workout can be pending
+  // against it right now -- cleared here anyway, defensively, so this
+  // launch never depends on that guard remaining the only thing standing
+  // between it and a stale timer, consistent with every other real
+  // ownership-transition site (app-core.js) clearing unconditionally.
+  if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
+  // WORKOUT-FLEXIBILITY CORRECTION ROUND 2 (Finding 1 remediation): record
+  // the occurrence's own TRUE prescribed exerciseId for every Assignment,
+  // once, right here at launch, while the full occurrence snapshot is
+  // still in hand. Nothing else in this application retains that mapping
+  // after launch -- app-core.js's confirmChangeExercise previously had no
+  // way to tell "changed back to the real original exercise" apart from
+  // "changed to some other, genuinely different exercise" once a row had
+  // already been swapped once, because it could only compare against the
+  // row's CURRENT exerciseId, which may itself already reflect a prior
+  // substitution. This map is purely additive, in-memory-only, client-side
+  // state: it is never read by planRunLoggerBuildWorkoutDoc, never
+  // serialized into the persisted workout document, and has no effect on
+  // plan-run-model.js's validators or Firestore Rules/indexes -- it only
+  // helps app-core.js choose the honest `origin` label at the moment of a
+  // Change Exercise.
+  var prescribedExerciseByAssignmentId = {};
+  occurrence.assignments.forEach(function (a) { prescribedExerciseByAssignmentId[a.planAssignmentId] = a.exerciseId; });
+  currentWorkout = {
+    id: uid(), name: (occurrence.nameSnapshot && occurrence.nameSnapshot.sessionName) || (occurrence.nameSnapshot && occurrence.nameSnapshot.microcycleName) || 'Program Run Session',
+    date: Date.now(), exercises: exercises, rpeEnabled: false, duration: 0, bodyweight: null,
+    canonicalRun: {
+      planRunId: occurrence.planRunId, occurrenceId: occurrence.occurrenceId, planTemplateId: occurrence.planTemplateId,
+      headRevisionId: occurrence.headRevisionId, planMicrocycleId: occurrence.planMicrocycleId, planSessionId: occurrence.planSessionId,
+      prescribedExerciseByAssignmentId: prescribedExerciseByAssignmentId,
+      effectiveExerciseByAssignmentId: effectiveExerciseByAssignmentId,
+      seriesByAssignmentId: seriesByAssignmentId,
+      recommendedByAssignmentId: recommendedByAssignmentId,
+      pendingRunReplacements: {}
+    }
+  };
+  // In-memory only (never part of the persisted workout document): which
+  // series value each assignment was opened with.
+  if (seriesValuesByRuleId) currentWorkout.canonicalRun.seriesResolution = seriesResolution;
+  planRunLoggerFinishState = null;
+  planRunLoggerFinishCurrentOperationId = null;
+  document.getElementById('workout-exercises').innerHTML = '';
+  var nameDisplay = document.getElementById('log-session-name-display');
+  if (nameDisplay) nameDisplay.textContent = (currentWorkout.name || 'WORKOUT').toUpperCase();
+  renderWorkoutExercises();
+  showPage('page-log');
+  startWorkoutTimer();
+  if (typeof awDraftBeginForCurrentWorkout === 'function') awDraftBeginForCurrentWorkout(); // ACTIVE-WORKOUT RECOVERY
+  if (unitMismatch) showToast('A Progression series value is recorded in a different weight unit than your current setting, so it was not filled in.', 'error');
+  return true;
+}
+
+// ---- C. FINISH ---------------------------------------------------------------
+// Held in memory. After a page reload it starts empty EXCEPT for one case:
+// the active-workout recovery draft (app-core.js) keeps a still-unresolved
+// 'pending'/'uncertain' Finish attempt, and planRunLoggerRestoreFromDraft
+// restores it as 'uncertain' with the SAME prepared package and operationId
+// when the person resumes, so the existing Check Status / Retry finish it
+// (never a new operation). All other phases start fresh after a reload, as
+// on every other Program Run surface -- see this file's own header on why
+// this state survives ordinary navigation away from #page-log (unlike
+// app-plan-run-start-ui.js's own planRunStartClose, which fully discards
+// its state on navigation) but is fully discarded on a real auth change.
+var planRunLoggerFinishState = null; // null | {phase, pkg?, reason?, resultRefs?}
+
+// LIFECYCLE-SAFETY CORRECTION, issue 2 -- replaces the prior
+// planRunLoggerFinishEpoch/planRunLoggerFinishInvalidateForNav/
+// planRunLoggerFinishIsCurrentForRender mechanism (the epoch was bumped on
+// navigation/new launch/auth change but was never actually consulted by
+// planRunLoggerFinishApplyOutcome or the uncertain path -- a real defect;
+// planRunLoggerFinishIsCurrentForRender was written but never called
+// anywhere). "Still current" and "currently visible" are two independent
+// questions and are now two independent, always-consulted checks:
+//   - planRunLoggerFinishResultStillCurrent(pkg): is this response still
+//     about the workout/owner/attempt this screen is actually tracking right
+//     now? Gates every data/state effect (currentWorkout mutation, appDb
+//     writes, Finish-attempt state). A stale result (superseded by a newer
+//     launch, an Abandon, or a real auth change) is dropped untouched --
+//     never partially applied.
+//   - planRunLoggerFinishIsPageVisible(): is #page-log the active page RIGHT
+//     NOW? Gates ONLY the interruptive toast + redirect-to-Home inside
+//     planRunLoggerFinishCommit -- never the underlying save, which already
+//     genuinely happened and must be reflected (History, currentWorkout,
+//     the Finish button) regardless of what screen the person currently has
+//     open.
+// planRunLoggerFinishCurrentOperationId tracks the operationId of the one
+// attempt (if any) this screen still considers live for the CURRENT
+// currentWorkout -- set when a fresh attempt is built (finishCanonicalRun
+// Workout), cleared on a fresh launch, an Abandon, or an auth change. A
+// result whose own pkg.operationId no longer matches this is stale by
+// definition, independent of currentWorkout identity.
+var planRunLoggerFinishCurrentOperationId = null;
+
+function planRunLoggerFinishResultStillCurrent(pkg) {
+  return !!pkg && !!currentWorkout && !!currentWorkout.canonicalRun &&
+    currentWorkout.id === pkg.workoutId &&
+    planRunLoggerCurrentUid() === pkg.ownerUid &&
+    planRunLoggerFinishCurrentOperationId === pkg.operationId;
+}
+
+function planRunLoggerFinishIsPageVisible() {
+  var pageLog = (typeof document !== 'undefined') ? document.getElementById('page-log') : null;
+  return !!pageLog && pageLog.classList.contains('active');
+}
+
+function planRunLoggerFinishContainer() {
+  return (typeof document !== 'undefined') ? document.getElementById('plan-run-finish-status') : null;
+}
+
+function planRunLoggerFinishHandleClick(event) {
+  var btn = event.target.closest ? event.target.closest('[data-planrun-finish-action]') : null;
+  if (!btn) return;
+  var action = btn.getAttribute('data-planrun-finish-action');
+  if (action === 'retry') planRunLoggerFinishRetry();
+  else if (action === 'check-status') planRunLoggerFinishCheckStatus();
+  else if (action === 'abandon') planRunLoggerFinishAbandon();
+}
+function planRunLoggerFinishWireEvents(el) {
+  if (!el || el.__planRunLoggerFinishWired) return;
+  el.addEventListener('click', planRunLoggerFinishHandleClick);
+  el.__planRunLoggerFinishWired = true;
+}
+
+// Entry point -- called from app-core.js's finishWorkout() when
+// currentWorkout.canonicalRun is set (see that file's own diff). Never
+// falls through to any legacy branch; always returns without touching
+// appDb.workouts/fsSaveWorkout unless/until a real 'committed'/
+// 'alreadyCommitted' outcome is confirmed.
+function finishCanonicalRunWorkout() {
+  if (!currentWorkout || !currentWorkout.canonicalRun) return;
+  if (!planRunLoggerCapabilityEnabled()) { planRunLoggerFinishSetState({ phase: 'disabled' }); return; }
+  // Duplicate-submission / re-entry guard (extended this round -- issue 4):
+  // a second Finish click while one is already pending, OR while the
+  // previous attempt is 'uncertain' (its real outcome not yet known), is a
+  // no-op -- never a second, competing operationId for the same workoutId.
+  // Retry remains the sole path that may resubmit during 'uncertain'; it
+  // resubmits the EXACT SAME already-prepared pkg (see
+  // planRunLoggerFinishRetry), never a fresh one built here. Traced against
+  // the real planRunClassifyFinishOccurrence branches (b)/(h)
+  // (plan-run-model.js) before this correction: a fresh Finish here, while
+  // the prior attempt's real-world outcome is still unknown, is exactly the
+  // race the addendum and this correction both treat as unsafe -- see this
+  // file's own header and the delivery report for the full trace. A
+  // definitively resolved state (committed, or a rejected/dismissable
+  // outcome the person has Abandoned) does not block this -- once
+  // planRunLoggerFinishState is null again, a fresh Finish is an ordinary,
+  // new, honest attempt.
+  if (planRunLoggerFinishState && (planRunLoggerFinishState.phase === 'pending' || planRunLoggerFinishState.phase === 'uncertain')) return;
+  var ownerUid = planRunLoggerCurrentUid();
+  if (!ownerUid) { planRunLoggerFinishSetState({ phase: 'error', reason: 'noAuthenticatedUser' }); return; }
+  // SYNCHRONOUS PRE-SAVE RECOMPUTATION (Round 8, Finding 1 -- the
+  // save-before-debounce race): app-core.js's own updateSet schedules a
+  // 400ms debounced recompute of isPR/isNew1RM after every weight/reps
+  // edit. If Finish is pressed before that timer fires, the Set's stored
+  // flags could still reflect an earlier edit, not the current one --
+  // genuinely recalculated here, synchronously, for every Set of this
+  // exact currentWorkout, using the exact same computeSetPRFlags
+  // app-core.js's live checkSetPR/onSetChecked use, before
+  // planRunLoggerBuildWorkoutDoc below ever reads them. This runs on every
+  // Finish attempt (including a Retry, which resubmits the same already-
+  // prepared pkg and therefore does NOT re-reach this line -- its workout
+  // was already recomputed on the original attempt that built it).
+  // clearAllPRDebounceTimers() also cancels any timer still pending for
+  // this workout outright, consistent with the same ownership-transition
+  // defense applied at every other real transition site (app-core.js).
+  if (typeof recomputeAllSetPRFlags === 'function') recomputeAllSetPRFlags(currentWorkout);
+  if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
+  var nowTs = (typeof firebase !== 'undefined' && firebase.firestore && firebase.firestore.Timestamp) ? firebase.firestore.Timestamp.now() : { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 };
+  var built = planRunLoggerBuildWorkoutDoc(currentWorkout, ownerUid, nowTs);
+  if (!built.ok) { planRunLoggerFinishSetState({ phase: 'error', reason: built.reason }); return; }
+  var operationId = uid();
+  var pkg = {
+    operationId: operationId, ownerUid: ownerUid, planRunId: currentWorkout.canonicalRun.planRunId,
+    occurrenceId: currentWorkout.canonicalRun.occurrenceId, workoutId: currentWorkout.id, workout: built.workout
+  };
+  // RECOMMENDED REPLACEMENTS: carry the person's still-pending Run-level
+  // replacements (re-checked against the rows first) inside this one
+  // prepared package, so Retry / Check Status / recovery reuse exactly it.
+  var runReplacements = (typeof planRunPendingReplacementsForFinish === 'function') ? planRunPendingReplacementsForFinish() : [];
+  if (runReplacements.length) pkg.runReplacements = runReplacements;
+  planRunLoggerFinishCurrentOperationId = operationId;
+  planRunLoggerFinishAttempt(pkg, ownerUid);
+}
+
+function planRunLoggerFinishAttempt(pkg, ownerUid) {
+  planRunLoggerFinishSetState({ phase: 'pending', pkg: pkg });
+  var p;
+  try {
+    p = fsPlanRunPersistence.fsPlanRunFinish(pkg);
+  } catch (err) {
+    planRunLoggerFinishEnterUncertain(pkg, ownerUid);
+    return;
+  }
+  Promise.resolve(p).then(function (result) {
+    planRunLoggerFinishApplyOutcome(pkg, ownerUid, result);
+  }, function () {
+    planRunLoggerFinishEnterUncertain(pkg, ownerUid);
+  });
+}
+
+function planRunLoggerFinishApplyOutcome(pkg, expectedUid, result) {
+  // LIFECYCLE-SAFETY CORRECTION, issue 2 -- staleness is now checked here,
+  // for every outcome branch, not left unconsulted. A result that is no
+  // longer "still current" (a newer launch, an Abandon, or a real auth
+  // change already superseded this exact attempt) is dropped untouched: no
+  // currentWorkout mutation, no state change, no toast, no redirect. This
+  // covers the auth-change case the old `planRunLoggerCurrentUid() !==
+  // expectedUid` check handled, plus the cases it missed (a newer
+  // currentWorkout under the SAME owner).
+  if (!planRunLoggerFinishResultStillCurrent(pkg)) return;
+  if (result && (result.outcome === 'committed' || result.outcome === 'alreadyCommitted')) {
+    // LIFECYCLE-SAFETY CORRECTION, ROUND 2, issue 5 -- 'committed' always
+    // means THIS attempt's own write just happened (pkg.workout trivially
+    // IS the persisted content). 'alreadyCommitted' means something else --
+    // possibly a DIFFERENT, earlier attempt (only reachable after an
+    // Abandon) -- and is trustworthy here ONLY when packageHashVerified is
+    // explicitly true (an exact-pkg Retry always gets this, since it
+    // resubmits the identical operationId+content fsPlanRunFinish itself
+    // hashes and compares). See this file's own header for the full trace.
+    if (planRunLoggerFinishResultConfirmsLocalContent(result)) {
+      planRunLoggerFinishCommit(pkg, result);
+    } else {
+      planRunLoggerFinishEnterAlreadyCommittedUnverified(pkg, result);
+    }
+    return;
+  }
+  if (result && result.outcome === 'notEligibleForCompletion') {
+    planRunLoggerFinishSetState({ phase: 'notEligible' });
+    return;
+  }
+  if (result && result.outcome === 'budgetExceeded') {
+    planRunLoggerFinishSetState({ phase: 'budgetExceeded', reasons: result.reasons || [] });
+    return;
+  }
+  if (result && result.outcome === 'integrityConflict') {
+    planRunLoggerFinishSetState({ phase: 'conflict', reason: result.reason || null });
+    return;
+  }
+  if (result && result.outcome === 'invalidInput') {
+    // A shape/identity rejection BEFORE any write -- this slice's own
+    // builder is designed to never produce one, but a genuine occurrence is
+    // shown honestly, never silently retried as if it might succeed
+    // unchanged.
+    planRunLoggerFinishSetState({ phase: 'error', reason: result.reason || null });
+    return;
+  }
+  if (result && (result.outcome === 'occurrenceSkipped' || result.outcome === 'competingOperationCorroborated')) {
+    // A competing operation already resolved this occurrence (e.g. a
+    // duplicate attempt from another tab/device) -- not this attempt's own
+    // success, but not this attempt's own failure either. Shown as its own
+    // distinct, honest state, never claimed as "saved" by THIS attempt.
+    planRunLoggerFinishSetState({ phase: 'competing' });
+    return;
+  }
+  // Any other/malformed shape is treated exactly like a thrown failure --
+  // uncertain, never a false success.
+  planRunLoggerFinishEnterUncertain(pkg, expectedUid);
+}
+
+// LIFECYCLE-SAFETY CORRECTION, ROUND 2, issue 5 -- the one place this file
+// decides whether pkg.workout (this screen's own local copy) may honestly
+// be treated as "what is actually persisted." 'committed' is always true by
+// construction (this exact call just wrote it). 'alreadyCommitted' is true
+// only when the persistence layer itself reports packageHashVerified:true
+// -- never inferred, never assumed from the outcome string alone.
+function planRunLoggerFinishResultConfirmsLocalContent(result) {
+  if (!result) return false;
+  if (result.outcome === 'committed') return true;
+  if (result.outcome === 'alreadyCommitted') return result.packageHashVerified === true;
+  return false;
+}
+
+// Reached only from planRunLoggerFinishApplyOutcome (a real fsPlanRunFinish
+// call -- a fresh Finish or an exact-pkg Retry) when the outcome is
+// 'alreadyCommitted' without packageHashVerified:true. This means: the
+// occurrence is genuinely, permanently completed under this workoutId, but
+// NOT provably by pkg.workout's own content -- an EARLIER, different
+// attempt for this same workoutId (only reachable after an Abandon; see
+// this file's own header for the full trace) may be what actually
+// committed, and its real content could differ from what currentWorkout
+// holds right now. Never writes appDb.workouts, never shows a "saved"
+// toast, never navigates away -- this screen cannot honestly claim its own
+// current content is what got persisted. currentWorkout itself is left
+// untouched (matching every other rejected/terminal phase's own
+// convention) so the person's edits are never silently discarded; the real,
+// actually-persisted content will still reach appDb.workouts on its own,
+// via this app's ordinary COL_WORKOUTS live listener (app-core.js), exactly
+// as it would for any write this session did not itself make.
+function planRunLoggerFinishEnterAlreadyCommittedUnverified(pkg, result) {
+  planRunLoggerFinishSetState({ phase: 'alreadyCommittedUnverified', pkg: pkg, resultRefs: (result && result.resultRefs) || null });
+}
+
+function planRunLoggerFinishCommit(pkg, result) {
+  // Success is rendered/acted on ONLY here, reached ONLY from a real
+  // 'committed'/'alreadyCommitted' outcome, and ONLY for a result
+  // planRunLoggerFinishApplyOutcome/planRunLoggerFinishCheckStatus has
+  // already confirmed is still current (see planRunLoggerFinishResultStill
+  // Current) -- so the data effects below always apply. Pushes the EXACT
+  // persisted document (never raw currentWorkout, which still carries
+  // in-memory-only fields like autoFilled/targetData) into appDb.workouts so
+  // History reflects it immediately, mirroring legacy finishWorkout()'s own
+  // appDb.workouts.unshift(...) tail -- the one piece of that tail this
+  // slice deliberately preserves, since it is pure local display state, not
+  // a write.
+  //
+  // LIFECYCLE-SAFETY CORRECTION, issue 2 -- whether the write itself really
+  // happened does NOT depend on what screen the person currently has open,
+  // so every data/state effect below (History, clearing currentWorkout,
+  // stopping the timer, clearing the tracked attempt) always runs. Only the
+  // INTERRUPTIVE parts -- the success toast and the redirect to Home -- are
+  // gated on #page-log actually being visible right now; a late commit that
+  // resolves after the person has already navigated elsewhere must not
+  // yank them back to Home or pop a toast about a screen they're not on.
+  var wasVisible = planRunLoggerFinishIsPageVisible();
+  // POST-FINISH STALE-TRAIN CORRECTION (supporting work): the committed
+  // workout document may already have reached appDb.workouts through this
+  // app's ordinary COL_WORKOUTS live listener before this callback runs
+  // (the listener and the transaction promise have no guaranteed order).
+  // Insert it only if that workout id is not already present, so local
+  // History holds it exactly once either way.
+  var alreadyLocal = appDb.workouts.some(function (w) { return w && w.id === pkg.workout.id; });
+  if (!alreadyLocal) appDb.workouts.unshift(pkg.workout);
+  // POST-FINISH AUTHORITATIVE-STATE GUARD: record the committed fact (this
+  // Session of this Run is no longer remaining work) BEFORE any TRAIN
+  // refresh below, so TRAIN never presents a read that predates it. See
+  // planRunUiNoteFinishCommitted (app-plan-run-ui.js).
+  if (typeof planRunUiNoteFinishCommitted === 'function') planRunUiNoteFinishCommitted(pkg.planRunId, pkg.occurrenceId);
+  var resultRefs = result.resultRefs || null;
+  planRunLoggerFinishState = null;
+  planRunLoggerFinishCurrentOperationId = null;
+  // ACTIVE-WORKOUT RECOVERY: the Finish is confirmed committed -- the only
+  // canonical point at which the local draft is removed.
+  if (typeof awDraftClear === 'function') awDraftClear(pkg.ownerUid);
+  stopWorkoutTimer();
+  // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): currentWorkout
+  // is about to be cleared -- any pending debounce timer was already
+  // cancelled synchronously back in finishCanonicalRunWorkout, before this
+  // (necessarily later, asynchronous) commit even started; cleared again
+  // here too, defensively, in case a later edit somehow scheduled a new
+  // one in the interim.
+  if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
+  currentWorkout = null;
+  if (wasVisible) {
+    var needsReview = resultRefs && Array.isArray(resultRefs.needsManualReviewRuleIds) ? resultRefs.needsManualReviewRuleIds.length : 0;
+    if (needsReview > 0) {
+      showToast('Workout saved! ' + needsReview + ' progression rule' + (needsReview === 1 ? ' needs' : 's need') + ' manual review.', 'success');
+    } else {
+      showToast('Workout saved!', 'success');
+    }
+    showPage('page-home');
+    // FAILURE RECOMMENDATIONS: an evaluated miss with a program
+    // recommendation goes straight to the decision (it can also be reached
+    // later from the Program's card on TRAIN).
+    if (result && Array.isArray(result.progressionDecisions) && result.progressionDecisions.length && typeof planRunFailureUiOpenForRun === 'function') {
+      planRunFailureUiOpenForRun(pkg.planRunId);
+    }
+  } else {
+    // Not on #page-log right now -- no toast, no redirect (issue 2's
+    // explicit requirement). #plan-run-finish-status and the Finish button
+    // are still brought current so a later return to #page-log shows
+    // nothing pending, honestly reflecting that this attempt already
+    // resolved; showPage('page-home') above would have done this via its
+    // own id==='page-log' branch, so it's done directly here instead.
+    planRunLoggerFinishRender();
+    // POST-FINISH STALE-TRAIN CORRECTION: if the person is already looking
+    // at TRAIN when this late commit lands, refresh it in place (no
+    // redirect, no toast) through the same renderHome() path showPage uses,
+    // so the finished Session never stays displayed as In Progress.
+    if (typeof activePage === 'function' && activePage() === 'page-home' && typeof renderHome === 'function') renderHome();
+  }
+}
+
+function planRunLoggerFinishEnterUncertain(pkg, expectedUid) {
+  // Mirrors planRunLoggerFinishApplyOutcome's own currency check -- a
+  // throw/reject/malformed-result path reaches here too, and must be
+  // dropped just as silently when superseded.
+  if (!planRunLoggerFinishResultStillCurrent(pkg)) return;
+  planRunLoggerFinishSetState({ phase: 'uncertain', pkg: pkg });
+}
+
+function planRunLoggerFinishRetry() {
+  var st = planRunLoggerFinishState;
+  if (!st || st.phase !== 'uncertain' || !st.pkg) return;
+  var ownerUid = planRunLoggerCurrentUid();
+  if (!ownerUid || ownerUid !== st.pkg.ownerUid) return;
+  // Reuses the EXACT SAME pkg object (same operationId, same workout byte
+  // content) -- never rebuilt from currentWorkout, which may since have
+  // been mutated by further edits on this screen (the person is free to
+  // keep typing while an attempt is uncertain; Retry still resubmits
+  // exactly what was originally prepared, per the task's own "preserve the
+  // exact prepared attempt" requirement -- a person who wants their further
+  // edits included must Abandon and Finish again, a fresh, honest attempt).
+  planRunLoggerFinishAttempt(st.pkg, ownerUid);
+}
+
+function planRunLoggerFinishCheckStatus() {
+  var st = planRunLoggerFinishState;
+  if (!st || st.phase !== 'uncertain' || !st.pkg || st.checking) return;
+  var ownerUid = planRunLoggerCurrentUid();
+  if (!ownerUid || ownerUid !== st.pkg.ownerUid) return;
+  var pkg = st.pkg;
+  planRunLoggerFinishSetState(Object.assign({}, st, { checking: true }));
+  var p;
+  try {
+    p = fsPlanRunPersistence.fsPlanRunCheckFinishStatus({
+      operationId: pkg.operationId, ownerUid: pkg.ownerUid, planRunId: pkg.planRunId,
+      occurrenceId: pkg.occurrenceId, workoutId: pkg.workoutId
+    });
+  } catch (err) {
+    if (!planRunLoggerFinishResultStillCurrent(pkg)) return;
+    planRunLoggerFinishSetState(Object.assign({}, planRunLoggerFinishState, { checking: false }));
+    return;
+  }
+  Promise.resolve(p).then(function (result) {
+    if (!planRunLoggerFinishResultStillCurrent(pkg)) return;
+    // LIFECYCLE-SAFETY CORRECTION, ROUND 2, issue 5 -- deliberately NOT
+    // gated on packageHashVerified the way planRunLoggerFinishApplyOutcome
+    // now is (see that function and this file's own header). Check Status
+    // is read-only, identity-only input (never carries pkg.workout, so
+    // fsPlanRunCheckFinishStatus can never honestly set that flag true for
+    // ANY outcome -- gating on it here would treat every legitimate
+    // "confirm my own uncertain attempt" recovery as unverified, breaking
+    // the existing, accepted Check Status contract). This is safe as-is:
+    // `pkg` here is always `st.pkg`, the SAME package this exact uncertain
+    // attempt already submitted via a real fsPlanRunFinish call -- and the
+    // re-entry guard in finishCanonicalRunWorkout blocks any OTHER attempt
+    // for this workoutId for as long as this one stays 'uncertain', so
+    // nothing else can have raced it. The ambiguity this round's fix
+    // addresses is only ever introduced by Abandon (which ends this exact
+    // tracking first, before a DIFFERENT, possibly-edited attempt can ever
+    // be built) -- Check Status can therefore never observe it.
+    if (result && (result.outcome === 'committed' || result.outcome === 'alreadyCommitted')) {
+      planRunLoggerFinishCommit(pkg, result);
+      return;
+    }
+    if (result && result.outcome === 'confirmedAbsent') {
+      // The Finish never actually happened -- the SAME pending pkg is still
+      // safe to Retry (nothing was committed under it).
+      planRunLoggerFinishSetState({ phase: 'uncertain', pkg: pkg, checking: false, lastCheck: 'confirmedAbsent' });
+      return;
+    }
+    // occurrenceSkipped/competingOperationCorroborated/integrityConflict/
+    // anything else -- stay uncertain, report the check's own result
+    // honestly, still offering Retry/Check Status/Abandon.
+    planRunLoggerFinishSetState({ phase: 'uncertain', pkg: pkg, checking: false, lastCheck: (result && result.outcome) || 'unknown' });
+  }, function () {
+    if (!planRunLoggerFinishResultStillCurrent(pkg)) return;
+    planRunLoggerFinishSetState(Object.assign({}, planRunLoggerFinishState, { checking: false }));
+  });
+}
+
+// Stops THIS session tracking an uncertain (or definitively rejected)
+// attempt. Never deletes, edits, or checks anything already persisted, and
+// never discards currentWorkout itself -- the person's logged data stays on
+// screen; they may edit further and Finish again (a fresh attempt, fresh
+// operationId, same workoutId -- fsPlanRunFinish's own already-accepted
+// collision handling resolves that safely regardless of whether the
+// abandoned attempt secretly did commit).
+function planRunLoggerFinishAbandon() {
+  var st = planRunLoggerFinishState;
+  if (!st || (st.phase !== 'uncertain' && st.phase !== 'conflict' && st.phase !== 'notEligible' && st.phase !== 'budgetExceeded' && st.phase !== 'error' && st.phase !== 'competing' && st.phase !== 'alreadyCommittedUnverified')) return;
+  planRunLoggerFinishState = null;
+  planRunLoggerFinishCurrentOperationId = null;
+  planRunLoggerFinishRender();
+  if (typeof awDraftSaveNow === 'function') awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: attempt no longer kept
+}
+
+// ACTIVE-WORKOUT RECOVERY: puts a recovered workout's still-unresolved
+// Finish attempt (if any) back exactly as the existing protocol holds it --
+// the SAME prepared package and operationId, in the existing 'uncertain'
+// state, so only the existing Retry / Check Status / Abandon apply (a
+// 'pending' attempt's real outcome is unknown after a reload, which is what
+// 'uncertain' means). Called by app-core.js's awDraftRestore after
+// currentWorkout has been set to the recovered workout.
+function planRunLoggerRestoreFromDraft(finishAttempt) {
+  if (finishAttempt && finishAttempt.pkg && currentWorkout && finishAttempt.pkg.workoutId === currentWorkout.id) {
+    planRunLoggerFinishState = { phase: 'uncertain', pkg: finishAttempt.pkg };
+    planRunLoggerFinishCurrentOperationId = finishAttempt.pkg.operationId;
+  } else {
+    planRunLoggerFinishState = null;
+    planRunLoggerFinishCurrentOperationId = null;
+  }
+}
+
+// Real auth-change boundary (app-core.js's onAuthStateChanged calls this
+// synchronously, alongside planRunUiResetForOwner/planRunStartClose, before
+// any new owner's content can display).
+//
+// LIFECYCLE-SAFETY CORRECTION, issue 1 -- previously this only discarded
+// THIS file's own pending Finish-attempt tracking, leaving a Run-linked
+// currentWorkout (and whatever the previous owner had already logged into
+// it) sitting in memory afterward. Sign-out, a direct A->B switch, and
+// A->B->A could all leave that PREVIOUS owner's in-progress canonical
+// Session -- including a workout with a still-pending or uncertain Finish
+// attempt -- displayed and finishable by a NEWLY signed-in owner (B, or A
+// again on the A->B->A path). A Run-linked currentWorkout (canonicalRun
+// truthy) is now discarded here too, exactly like planRunUiResetForOwner/
+// planRunStartClose already discard their own owner-scoped state on this
+// same boundary; a pending/uncertain attempt's own late response is
+// independently guarded by planRunLoggerFinishResultStillCurrent (its
+// currentWorkout.id check alone already fails once currentWorkout is
+// nulled here). An ordinary LEGACY currentWorkout (no canonicalRun) is
+// left completely untouched -- this correction does not silently change
+// that already-existing, out-of-scope behavior, which this slice has no
+// more license to alter than it did before.
+function planRunLoggerFinishResetForAuthChange() {
+  var discardingRun = !!(currentWorkout && currentWorkout.canonicalRun);
+  planRunLoggerFinishState = null;
+  planRunLoggerFinishCurrentOperationId = null;
+  if (discardingRun) {
+    stopWorkoutTimer();
+    // STALE-TIMER / OWNERSHIP-TRANSITION DEFENSE (Round 8): a sign-out
+    // discards this Run-linked currentWorkout entirely (nothing is saved)
+    // -- any pending debounce timer scheduled against it must be
+    // cancelled here too, never left to fire later.
+    if (typeof clearAllPRDebounceTimers === 'function') clearAllPRDebounceTimers();
+    currentWorkout = null;
+    var exContainer = (typeof document !== 'undefined') ? document.getElementById('workout-exercises') : null;
+    if (exContainer) exContainer.innerHTML = '';
+  }
+  planRunLoggerFinishRender();
+}
+
+function planRunLoggerFinishSetState(next) {
+  planRunLoggerFinishState = next;
+  planRunLoggerFinishRender();
+  // ACTIVE-WORKOUT RECOVERY: every Finish state change is stored at once --
+  // a 'pending' attempt's package is in the draft BEFORE it is submitted.
+  if (typeof awDraftSaveNow === 'function') awDraftSaveNow();
+}
+
+// ---- Rendering ----------------------------------------------------------
+function planRunLoggerFinishOutcomeMessage(phase, st) {
+  if (phase === 'notEligible') return 'This Session doesn’t yet have enough recorded evidence to complete. Check that your prescribed sets are marked complete with the required reps/time.';
+  if (phase === 'budgetExceeded') return 'This Session is too large to finish in one operation.';
+  if (phase === 'conflict') return 'We found a conflict with this Run’s saved data and blocked this Finish. Nothing was saved.';
+  if (phase === 'competing') return 'This Session was already resolved by another attempt (e.g. another open tab). Nothing further was saved by this one.';
+  if (phase === 'error' && st && st.reason === 'progressionDecisionsRequireFeatureBuild') return 'This Session was started by a newer version of the app that asks you to approve progression changes. This version can’t record those decisions, so nothing was saved. Your workout is still open.';
+  if (phase === 'error') return 'This Session couldn’t be prepared to finish right now.';
+  return 'Nothing was saved.';
+}
+
+function planRunLoggerFinishRender() {
+  var container = planRunLoggerFinishContainer();
+  var finishBtn = document.getElementById('log-finish-btn');
+  if (!container) return;
+  planRunLoggerFinishWireEvents(container);
+  var st = planRunLoggerFinishState;
+  if (!currentWorkout || !currentWorkout.canonicalRun || !st) {
+    container.innerHTML = '';
+    if (finishBtn) finishBtn.disabled = false;
+    return;
+  }
+  var html = '';
+  if (st.phase === 'pending') {
+    html = '<div data-testid="finish-pending" style="padding:8px;border-radius:6px;background:#eef;color:#046;margin-top:8px">Saving…</div>';
+    if (finishBtn) finishBtn.disabled = true;
+  } else if (st.phase === 'uncertain') {
+    html = '<div data-testid="finish-uncertain" style="padding:8px;border-radius:6px;background:#ffe;color:#740;margin-top:8px">We couldn’t confirm whether this Session was saved. Nothing is shown as saved until we know for sure.'
+      + (st.lastCheck && st.lastCheck !== 'confirmedAbsent' ? ' (Last check: ' + escapeHtml(st.lastCheck) + '.)' : '') + '</div>';
+    html += '<div style="margin-top:6px">'
+      + '<button type="button" class="btn-primary" data-testid="finish-retry-btn" data-planrun-finish-action="retry" ' + (st.checking ? 'disabled' : '') + '>Retry</button> '
+      + '<button type="button" class="btn-secondary" data-testid="finish-check-status-btn" data-planrun-finish-action="check-status" ' + (st.checking ? 'disabled' : '') + '>Check Status</button> '
+      + '<button type="button" class="btn-secondary" data-testid="finish-abandon-btn" data-planrun-finish-action="abandon" ' + (st.checking ? 'disabled' : '') + '>Abandon</button>'
+      + '</div>';
+    if (finishBtn) finishBtn.disabled = true;
+  } else if (st.phase === 'notEligible' || st.phase === 'budgetExceeded' || st.phase === 'conflict' || st.phase === 'competing' || st.phase === 'error') {
+    html = '<div data-testid="finish-rejected" style="padding:8px;border-radius:6px;background:#fee;color:#900;margin-top:8px">' + escapeHtml(planRunLoggerFinishOutcomeMessage(st.phase, st)) + '</div>';
+    html += '<div style="margin-top:6px"><button type="button" class="btn-secondary" data-testid="finish-abandon-btn" data-planrun-finish-action="abandon">Dismiss</button></div>';
+    if (finishBtn) finishBtn.disabled = false;
+  } else if (st.phase === 'alreadyCommittedUnverified') {
+    // LIFECYCLE-SAFETY CORRECTION, ROUND 2, issue 5 -- distinct from the
+    // generic 'finish-rejected' phases above on purpose: nothing was
+    // rejected here (the occurrence really is completed), and this is NOT
+    // shown as success either. A separate testid so this exact honest state
+    // is independently verifiable.
+    html = '<div data-testid="finish-already-committed-unverified" style="padding:8px;border-radius:6px;background:#fee;color:#900;margin-top:8px">This Session was already marked complete by an earlier attempt. We can’t confirm your current edits on this screen match what was actually saved, so nothing further was saved just now.</div>';
+    html += '<div style="margin-top:6px"><button type="button" class="btn-secondary" data-testid="finish-abandon-btn" data-planrun-finish-action="abandon">Dismiss</button></div>';
+    if (finishBtn) finishBtn.disabled = false;
+  } else if (st.phase === 'disabled') {
+    html = '<div data-testid="finish-disabled" style="padding:8px;border-radius:6px;background:#eee;margin-top:8px">Finishing this Session is currently disabled.</div>';
+    if (finishBtn) finishBtn.disabled = true;
+  } else {
+    container.innerHTML = '';
+    if (finishBtn) finishBtn.disabled = false;
+    return;
+  }
+  container.innerHTML = html;
+}
+
+// -----------------------------------------------------------------------------
+// Guarded Node-only export seam (mirrors app-plan-run-start-ui.js's own
+// convention) -- exposes ONLY the pure, zero-I/O functions above.
+// -----------------------------------------------------------------------------
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    planRunLoggerCoerceNumOrNull: planRunLoggerCoerceNumOrNull,
+    planRunLoggerCoerceBool: planRunLoggerCoerceBool,
+    planRunLoggerBuildPersistedSet: planRunLoggerBuildPersistedSet,
+    planRunLoggerBuildWorkoutDoc: planRunLoggerBuildWorkoutDoc
+  };
+}

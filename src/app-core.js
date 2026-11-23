@@ -1085,6 +1085,15 @@ function getActiveTrainingMax(active, exerciseId) {
   return !isNaN(val) ? val : null;
 }
 
+// STAGE 4a: may a stored program value ({value, unit}) fill this workout's sets?
+// No unit recorded on the workout: yes, as today. Otherwise only the same unit;
+// if not, the lifter is told once and the sets are left alone.
+function loggerAcceptsProgramValue(stored, label) {
+  if (!currentWorkout || workoutUnitState(currentWorkout) === 'none') return true;
+  if (workoutAcceptsValueUnit(currentWorkout, stored && stored.unit)) return true;
+  showToast(`Saved. This workout was recorded in ${workoutUnitLabel(currentWorkout)}, so its weights weren’t refilled from the ${label}. Enter them by hand.`, 'error');
+  return false;
+}
 function setActiveTrainingMax(active, exerciseId, value) {
   if (!active) return;
   if (!active.trainingMaxes) active.trainingMaxes = {};
@@ -1094,8 +1103,10 @@ function setActiveTrainingMax(active, exerciseId, value) {
 }
 
 // Shared by %TM and %1RM resolution — nearest 5 lb / 2.5 kg.
+// STAGE 4a: inside a workout that recorded its unit, that unit's step.
 function roundPercentageLoad(val) {
-  const inc = appDb.unit === 'kg' ? 2.5 : 5;
+  const u = currentWorkout && recordedWorkoutUnit(currentWorkout) ? recordedUnitToApp(currentWorkout.unit) : appDb.unit;
+  const inc = u === 'kg' ? 2.5 : 5;
   return Math.round(val / inc) * inc;
 }
 function roundToTMIncrement(val) {
@@ -1204,6 +1215,9 @@ function saveActiveTMEdit() {
 // manual weight over them; updateSet() already clears autoFilled on manual edit).
 function updateCurrentWorkoutForTM(exerciseId, active) {
   if (!currentWorkout) return;
+  // STAGE 4a: a workout that recorded its unit only takes a value saved in that
+  // same unit; otherwise its sets are left as they are (nothing converted).
+  if (!loggerAcceptsProgramValue(active && active.trainingMaxes && active.trainingMaxes[exerciseId], 'Training Max')) return;
   let touched = false;
   currentWorkout.exercises.forEach(ex => {
     if (ex.exerciseId !== exerciseId) return;
@@ -1373,6 +1387,9 @@ function saveActive1RMEdit() {
 // autoFilled via updateSet(), same behavior relied on by the %TM edit flow).
 function updateCurrentWorkoutFor1RM(exerciseId, active) {
   if (!currentWorkout) return;
+  // STAGE 4a: a workout that recorded its unit only takes a value saved in that
+  // same unit; otherwise its sets are left as they are (nothing converted).
+  if (!loggerAcceptsProgramValue(active && active.oneRepMaxes && active.oneRepMaxes[exerciseId], '1RM')) return;
   let touched = false;
   currentWorkout.exercises.forEach(ex => {
     if (ex.exerciseId !== exerciseId) return;
@@ -1580,6 +1597,9 @@ function saveActiveWorkingLoadEdit() {
 // execution and must never be recalculated).
 function updateCurrentWorkoutForWorkingLoad(exerciseId, active) {
   if (!currentWorkout) return;
+  // STAGE 4a: a workout that recorded its unit only takes a value saved in that
+  // same unit; otherwise its sets are left as they are (nothing converted).
+  if (!loggerAcceptsProgramValue(active && active.workingLoads && active.workingLoads[exerciseId], 'Working Load')) return;
   let touched = false;
   currentWorkout.exercises.forEach(ex => {
     if (ex.exerciseId !== exerciseId) return;
@@ -1624,7 +1644,11 @@ function renderHistoryStats() {
   // UNPERFORMED-EXERCISE HISTORY CORRECTION: Total Volume now uses the same
   // shared predicate as Total Sets on the line above -- an unchecked,
   // prefilled target weight x reps was previously counted as lifted volume.
-  appDb.workouts.forEach(w => w.exercises.forEach(e => e.sets.forEach(s => { if (planRunSetHasRecordedPerformance(s) && s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); })));
+  // STAGE 4a: only rows with no recorded unit (class L) are summed, raw, as
+  // today -- a kg number is never added to a lb number. Rows recorded with a
+  // unit are counted separately and the box says so (never for older data).
+  let uncomparedVolSets = 0;
+  appDb.workouts.forEach(w => w.exercises.forEach(e => { const legacy = statsLegacyRow(w, e); e.sets.forEach(s => { if (!(planRunSetHasRecordedPerformance(s) && s.weight && s.reps)) return; if (legacy) totalVol += (+s.weight) * (+s.reps); else uncomparedVolSets++; }); }));
   appDb.importedSets.forEach(s => { if (s.weight && s.reps) totalVol += (+s.weight) * (+s.reps); });
   const totalSecs = appDb.workouts.reduce((a,w) => a + (w.duration||0), 0);
   const totalHours = totalSecs / 3600;
@@ -1640,7 +1664,7 @@ function renderHistoryStats() {
   document.getElementById('history-stats').innerHTML = `
     <div class="stat-box"><div class="stat-label">Total Workouts</div><div class="stat-value">${total}</div></div>
     <div class="stat-box"><div class="stat-label">Total Sets</div><div class="stat-value">${totalSetsFormatted}</div></div>
-    <div class="stat-box"><div class="stat-label">${unitLabel} Lifted</div><div class="stat-value" style="font-size:${totalVol>=10000?'22px':'28px'}">${volDisplay}</div></div>
+    <div class="stat-box"><div class="stat-label">${unitLabel} Lifted</div><div class="stat-value" style="font-size:${totalVol>=10000?'22px':'28px'}">${volDisplay}</div>${uncomparedVolSets ? `<div data-testid="history-volume-note" style="font-size:10px;color:var(--text3);margin-top:2px">Older records only · ${uncomparedVolSets} set${uncomparedVolSets === 1 ? '' : 's'} with a recorded unit not included</div>` : ''}</div>
     <div class="stat-box"><div class="stat-label">Training Time</div><div class="stat-value">${timeDisplay}<span style="font-size:16px;font-weight:600;color:var(--accent);margin-left:3px">${timeLabel}</span></div></div>`;
 }
 
@@ -2283,9 +2307,11 @@ function renderReorderList() {
 function reorderMove(idx, dir) { const arr = currentWorkout.exercises, n = idx + dir; if (n < 0 || n >= arr.length) return; [arr[idx], arr[n]] = [arr[n], arr[idx]]; renderReorderList(); renderWorkoutExercises(); }
 
 // ==================== LOG BODYWEIGHT ====================
-function openLogBWModal() { document.getElementById('bw-modal-unit').textContent = appDb.unit; document.getElementById('bw-modal-input').value = currentWorkout?.bodyweight || ''; openModal('modal-log-bw'); }
+function openLogBWModal() { document.getElementById('bw-modal-unit').textContent = workoutUnitLabel(currentWorkout); document.getElementById('bw-modal-input').value = currentWorkout?.bodyweight || ''; openModal('modal-log-bw'); }
 function saveBWFromModal() { const val = parseFloat(document.getElementById('bw-modal-input').value); if (currentWorkout) currentWorkout.bodyweight = val || null; awDraftSaveNow(); closeModal('modal-log-bw'); showToast('Bodyweight saved', 'success'); }
-function getWorkoutBW() { if (currentWorkout && currentWorkout.bodyweight) return currentWorkout.bodyweight; for (const w of appDb.workouts) { if (w.bodyweight) return w.bodyweight; } return null; }
+// STAGE 4a: a bodyweight is only borrowed from another workout when both are
+// in the same unit situation: no unit recorded (today), or the same recorded unit.
+function getWorkoutBW() { if (currentWorkout && currentWorkout.bodyweight) return currentWorkout.bodyweight; const cur = currentWorkout ? workoutUnitState(currentWorkout) : 'none'; for (const w of appDb.workouts) { if (!w.bodyweight) continue; const st = workoutUnitState(w); if (cur === 'none' ? st === 'none' : (cur === 'recorded' && st === 'recorded' && w.unit === currentWorkout.unit)) return w.bodyweight; } return null; }
 
 // ==================== NOTES MODAL ====================
 let notesEditExIdx = null;
@@ -2739,6 +2765,9 @@ function openSingleTMPrompt(exIdx) {
 }
 function autoFillProgramWeights() {
   if (!currentWorkout?.programId) return;
+  // STAGE 4a: these Training Maxes have no unit, so they never fill a workout
+  // that recorded one (nothing is guessed). Without a recorded unit: as today.
+  if (workoutUnitState(currentWorkout) !== 'none') { showToast(`This workout was recorded in ${workoutUnitLabel(currentWorkout)}; the program’s Training Max has no unit, so weights weren’t filled. Enter them by hand.`, 'error'); return; }
   const prog = appDb.programs.find(p => p.id === currentWorkout.programId); if (!prog) return;
   const session = prog.microcycles[currentWorkout.microcycleIdx]?.sessions[currentWorkout.sessionIdx]; if (!session) return;
   currentWorkout.exercises.forEach(ex => {
@@ -3097,17 +3126,31 @@ function renderWorkoutExercises() {
   currentWorkout.exercises.forEach((ex, i) => ex.sets.forEach((s, si) => attachSwipeToSet(i, si)));
   if (typeof awDraftSaveNow === 'function') awDraftSaveNow(); // ACTIVE-WORKOUT RECOVERY: structural changes re-render through here
 }
+// STAGE 4a: "Last:" without a unit when the previous number is in the same
+// unit as this workout's column (today's look); otherwise with its own unit,
+// or "unit not recorded", so a number is never read in the wrong unit.
+function loggerLastBadgeText(prev, info) {
+  const cur = workoutUnitState(currentWorkout);
+  if (!info) return prev.replace(appDb.unit,'').replace(appDb.unit.toLowerCase(),'').trim();
+  if (info.unitState === 'none' && cur === 'none') return prev.replace(appDb.unit,'').replace(appDb.unit.toLowerCase(),'').trim();
+  if (info.unitState === 'recorded' && cur === 'recorded' && info.unit === currentWorkout.unit) return info.text;
+  if (info.unitState === 'recorded') return info.text.replace(' × ', ' ' + recordedUnitToApp(info.unit) + ' × ');
+  if (info.unitState === 'none') return info.text + ' (unit not recorded)';
+  return info.text + ' (unit unknown)';
+}
 function buildExerciseBlock(ex, idx) {
   const exData = getExercise(ex.exerciseId); const name = exData ? exData.name : ex.exerciseId;
-  const note = getExNote(ex.exerciseId); const prev = getPreviousPerf(ex.exerciseId);
+  const note = getExNote(ex.exerciseId); const prev = getPreviousPerf(ex.exerciseId); const prevInfo = getPreviousPerfInfo(ex.exerciseId);
   const rpe = currentWorkout.rpeEnabled;
   const isTime = exData && (exData.tracking === 'time' || exData.tracking === 'weight_time');
   const isBW   = exData && exData.tracking === 'bodyweight_reps';
-  const col2Label = isBW ? 'Added Wt' : appDb.unit.toUpperCase(); const col3Label = isTime ? 'Time(s)' : 'Reps';
+  // STAGE 4a: a workout that recorded its unit is logged in THAT unit, whatever
+  // the account preference is now (no unit recorded: the preference, as today).
+  const col2Label = isBW ? (workoutUnitState(currentWorkout) === 'none' ? 'Added Wt' : 'Added ' + workoutUnitLabel(currentWorkout).toUpperCase()) : workoutUnitLabel(currentWorkout).toUpperCase(); const col3Label = isTime ? 'Time(s)' : 'Reps';
   const exrxUrl = EXRX_LINKS[ex.exerciseId];
   const exrxHtml = exrxUrl ? `<a href="${exrxUrl}" target="_blank" class="exrx-link" title="View on ExRx.net"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></a>` : '';
   let metaBadgesHtml = '';
-  if (prev) metaBadgesHtml += `<span class="ex-meta-badge" style="cursor:pointer" onclick="openExHistoryModal('${ex.exerciseId}')">Last: ${prev.replace(appDb.unit,'').replace(appDb.unit.toLowerCase(),'').trim()}</span>`;
+  if (prev) metaBadgesHtml += `<span class="ex-meta-badge" style="cursor:pointer" onclick="openExHistoryModal('${ex.exerciseId}')">Last: ${loggerLastBadgeText(prev, prevInfo)}</span>`;
   if (currentWorkout.programId) {
     const prog = appDb.programs.find(p => p.id === currentWorkout.programId);
     if (prog) {
@@ -3339,6 +3382,34 @@ function workoutExerciseSetSequences(workout) {
   });
   return seqs;
 }
+// STAGE 4a (Draft 7 §11.2): the same sequences, split by statistics class.
+// Rows of a workout with no recorded unit are all class L, so a workout today
+// gives exactly the sequences above (same exercises, same order). A workout
+// recorded with a unit may hold V rows (compared on per-implement grams) and
+// C rows (never compared, never flagged). Each class walks on its own.
+function workoutExerciseClassSequences(workout) {
+  const seqs = new Map();
+  ((workout && workout.exercises) || []).forEach(e => {
+    if (!e || !Array.isArray(e.sets)) return;
+    const cls = statsRowClass(workout, e), key = e.exerciseId + '|' + cls;
+    if (!seqs.has(key)) seqs.set(key, { exerciseId: e.exerciseId, cls, sets: [], rowOf: new Map() });
+    const q = seqs.get(key);
+    e.sets.forEach(s => { q.sets.push(s); q.rowOf.set(s, e); });
+  });
+  return [...seqs.values()];
+}
+// What a set measures inside its class: L the raw number (as today), V
+// per-implement grams. C has none.
+function classSeqWeightOf(workout, seq) {
+  if (seq.cls === 'L') return prSetWeight;
+  if (seq.cls === 'V') return s => { const w = prSetWeight(s); return w === null ? null : statsVerifiedGrams(workout, seq.rowOf.get(s), w); };
+  return () => null;
+}
+function classSeqE1RMOf(workout, seq) {
+  if (seq.cls === 'L') return prSetE1RM;
+  const wOf = classSeqWeightOf(workout, seq);
+  return s => { const v = wOf(s); return v === null ? null : calc1RM(v, coercePositiveFiniteNumber(s.reps)); };
+}
 // THE RULE. Walk the sequence keeping a running maximum that starts at
 // `startingMax`. A participating set strictly above the running maximum
 // is a PR and raises it; an equal or lower set is not. With
@@ -3383,9 +3454,18 @@ function applyWorkoutPRFlags(workout) {
   if (!workout || !Array.isArray(workout.exercises)) return;
   const prs = new Set();
   const e1rms = new Set();
-  workoutExerciseSetSequences(workout).forEach((sets, exerciseId) => {
-    firstNewMaximumPRSets(sets, getBestWeight(exerciseId, workout.id), false).forEach(s => prs.add(s));
-    firstNewMaximumE1RMSets(sets, getBest1RM(exerciseId, workout.id), false).forEach(s => e1rms.add(s));
+  // STAGE 4a: per class. L: exactly as before (getBestWeight/getBest1RM now
+  // read L rows only, which is every row today). V: against other workouts'
+  // V rows on per-implement grams. C: no flags.
+  workoutExerciseClassSequences(workout).forEach(seq => {
+    if (seq.cls === 'L') {
+      firstNewMaximumPRSets(seq.sets, getBestWeight(seq.exerciseId, workout.id), false).forEach(s => prs.add(s));
+      firstNewMaximumE1RMSets(seq.sets, getBest1RM(seq.exerciseId, workout.id), false).forEach(s => e1rms.add(s));
+    } else if (seq.cls === 'V') {
+      const best = statsBestVerified(seq.exerciseId, workout.id);
+      firstNewMaximumSets(seq.sets, classSeqWeightOf(workout, seq), best.weight, null).forEach(s => prs.add(s));
+      firstNewMaximumSets(seq.sets, classSeqE1RMOf(workout, seq), best.e1rm, null).forEach(s => e1rms.add(s));
+    }
   });
   workout.exercises.forEach(e => (e.sets || []).forEach(s => { s.isPR = prs.has(s); s.isNew1RM = e1rms.has(s); }));
 }
@@ -3399,8 +3479,10 @@ function applyWorkoutPRFlags(workout) {
 // and never writes.
 function storedWorkoutPRSets(workout) {
   const prs = new Set();
-  workoutExerciseSetSequences(workout).forEach(sets => {
-    firstNewMaximumPRSets(sets, 0, true).forEach(s => prs.add(s));
+  // STAGE 4a: within each class (L raw as before; V grams; C never shown).
+  workoutExerciseClassSequences(workout).forEach(seq => {
+    if (seq.cls === 'C') return;
+    firstNewMaximumSets(seq.sets, classSeqWeightOf(workout, seq), 0, 'isPR').forEach(s => prs.add(s));
   });
   return prs;
 }
@@ -3412,8 +3494,9 @@ function storedWorkoutPRSets(workout) {
 // stored flag, never adds one, never writes.
 function storedWorkoutNew1RMSets(workout) {
   const hits = new Set();
-  workoutExerciseSetSequences(workout).forEach(sets => {
-    firstNewMaximumE1RMSets(sets, 0, true).forEach(s => hits.add(s));
+  workoutExerciseClassSequences(workout).forEach(seq => {
+    if (seq.cls === 'C') return;
+    firstNewMaximumSets(seq.sets, classSeqE1RMOf(workout, seq), 0, 'isNew1RM').forEach(s => hits.add(s));
   });
   return hits;
 }
@@ -3656,6 +3739,9 @@ function addPRSet(idx) {
   if (planRunLoggerIsCanonicalRunSession()) { showToast('Program Run Sessions don\'t support + PR Set. Use + Set to add an extra set instead.', 'error'); return; }
   const ex = currentWorkout.exercises[idx]; const exData = getExercise(ex.exerciseId); if (!exData) return;
   const isTime = exData.tracking === 'time' || exData.tracking === 'weight_time'; const isBW = exData.tracking === 'bodyweight_reps';
+  // STAGE 4a: + PR Set suggests a weight from older (no-unit) records only; it
+  // can't safely do that for a workout that recorded its unit, so it says so.
+  if (!isTime && workoutUnitState(currentWorkout) !== 'none') { showToast('+ PR Set can’t suggest a weight for this workout: it was recorded in ' + workoutUnitLabel(currentWorkout) + ' and older records have no unit. Add a set with + Set instead.', 'error'); return; }
   const inc = appDb.unit === 'kg' ? 1.25 : 2.5;
   let newSet = { weight: '', reps: '', time: '', rpe: '', completed: false }; let targetInfo = '';
   if (isTime) {
@@ -4294,7 +4380,7 @@ function openExHistoryModal(exId) {
   body.innerHTML = workoutsWithEx.map(w => {
     const ex = w.exercises.find(e => e.exerciseId === exId); const d = new Date(w.date).toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',year:'numeric'});
     const performedSets = ex.sets.filter(planRunSetHasRecordedPerformance);
-    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${performedSets.map((s,i)=>{ const line=`Set ${i+1}: ${formatPerformedSetLine(s)}`; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
+    return `<div style="margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--border)"><div style="font-family:var(--font-display);font-size:16px;font-weight:800;color:var(--accent);margin-bottom:6px">${w.name}</div><div style="font-size:13px;color:var(--text3);margin-bottom:8px">${d}</div>${performedSets.map((s,i)=>{ const line=`Set ${i+1}: ${formatPerformedSetLine(s, w)}`; return `<div class="history-set-line">${line}</div>`; }).join('')}</div>`;
   }).join('');
   openModal('modal-ex-history');
 }
@@ -4567,7 +4653,8 @@ function buildRecentExpandedHtml(wid) {
     // logged (unchanged), an untouched one no longer renders at all.
     const setsHtml = e.sets.filter(planRunSetHasRecordedPerformance).map(s => {
       let weightStr = '', xStr = '', repsStr = '';
-      if (s.weight && +s.weight > 0) { weightStr = `${s.weight}`; xStr = '×'; repsStr = `${s.reps||s.time||'—'}`; }
+      // STAGE 4a: a workout that recorded its unit shows it ("100 kg"); older workouts as today.
+      if (s.weight && +s.weight > 0) { weightStr = workoutUnitState(w) === 'none' ? `${s.weight}` : `${s.weight} ${workoutUnitLabel(w)}`; xStr = '×'; repsStr = `${s.reps||s.time||'—'}`; }
       else if (s.reps) { weightStr = 'BW'; xStr = '×'; repsStr = `${s.reps}`; }
       else if (s.time) { weightStr = `${s.time}s`; }
       // DERIVED-FLAG CORRECTION (this round): defensive backstop, same
@@ -4808,14 +4895,15 @@ function renderCopyOutput(){
   // (previously its name heading was still printed with nothing under it).
   if(copyFormat==='txt'){
     out+=`${w.name.toUpperCase()}\n${d}\n`;if(w.duration)out+=`Duration: ${fmtDuration(w.duration)}\n`;out+='─'.repeat(40)+'\n\n';
-    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>Object.assign({},s,{isPR:prSets.has(s),isNew1RM:new1rmSets.has(s)}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`${ex?ex.name.toUpperCase():e.exerciseId}\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>Object.assign({},s,{isPR:prSets.has(s),isNew1RM:new1rmSets.has(s)}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s,w);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${workoutUnitLabel(w)}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${workoutUnitLabel(w)}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   } else {
     out+=`[u][size=200]${w.name}[/size][/u]\n[i]${d}[/i]\n`;if(w.duration)out+=`[i]Duration: ${fmtDuration(w.duration)}[/i]\n`;out+='\n';
-    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>Object.assign({},s,{isPR:prSets.has(s),isNew1RM:new1rmSets.has(s)}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${appDb.unit}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${appDb.unit}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
+    w.exercises.forEach(e=>{const performedSets=e.sets.filter(planRunSetHasRecordedPerformance);if(!performedSets.length)return;const ex=getExercise(e.exerciseId);out+=`[b][size=125]${ex?ex.name:e.exerciseId}[/b][/size]\n`;const{bestPRIdx,bestE1RMIdx,bestPRWeight,bestE1RM}=getBestPRAndE1RM({sets:performedSets.map(s=>Object.assign({},s,{isPR:prSets.has(s),isNew1RM:new1rmSets.has(s)}))});performedSets.forEach((s,si)=>{let line=formatSetStr(s,w);const parts=[];if(si===bestPRIdx)parts.push(`PR=${bestPRWeight}${workoutUnitLabel(w)}`);if(si===bestE1RMIdx)parts.push(`E1RM=${Math.round(bestE1RM)}${workoutUnitLabel(w)}`);if(parts.length)line+=` - ${parts.join(' / ')}`;out+=line+'\n';});const pv=e.perfVideos||[];if(pv.length)out+=pv.join('\n')+'\n';out+='\n';});
   }
   document.getElementById('copy-output').textContent=out;
 }
-function formatSetStr(s){if(s.weight&&+s.weight>0)return`- ${s.weight}${appDb.unit} x ${s.reps||s.time||'?'}`;if(s.reps)return`- BW x ${s.reps}`;if(s.time)return`- ${s.time}s`;return'- —';}
+// STAGE 4a: with its workout `w`, a recorded unit is shown as recorded (no unit: as today).
+function formatSetStr(s,w){if(s.weight&&+s.weight>0)return`- ${s.weight}${w?workoutUnitLabel(w):appDb.unit} x ${s.reps||s.time||'?'}`;if(s.reps)return`- BW x ${s.reps}`;if(s.time)return`- ${s.time}s`;return'- —';}
 // DERIVED-FLAG CORRECTION (this round): hardened internally with the same
 // shared predicate, even though both of this function's current callers
 // (renderCopyOutput, below) already pre-filter their input to

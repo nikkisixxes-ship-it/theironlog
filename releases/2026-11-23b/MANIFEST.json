@@ -1,0 +1,29 @@
+{
+  "build": "2026-11-23b",
+  "files": {
+    "styles.css": "0d354aab95b48c5583345e9707fe557f94259c0c7f51e90f9af732f7a157602c",
+    "app-update.js": "cbda765176ba6d5982d81f11b6032c6971fd439ed8baecc8d0030caf9e0d7307",
+    "firebase.js": "8092c59e0f779277e99eca7c40f7629cb944e78c95298992831c88dd4548faec",
+    "stats-compat.js": "9dc37e825e0af870a7f7f897cc4057d823cddf32d687ae6810ad550d1c34e874",
+    "app-data.js": "5086648dc4d99956b610a84cf76cc7121fcd1de1ec533f1762f56f79fc4dcbda",
+    "app-library.js": "757af92b9ded190d8a64a28e6808e37bf5d70ec056a4a07dbb1af2676d1be4f3",
+    "app-collections.js": "994c1a60d4151d9a0334d1c86dcc02cb3b97b5226f6e77ee7369453f103c0ca2",
+    "app-plan.js": "130fde36ffd2568d404a5b42988497e7141a4a6c5ff2b7342cdb9cc2daea5f11",
+    "firebase-plan-progression.js": "a1addd895158b13ad9a725c6696f553a93553d39a2ec03ac3dd3fd42356f43f7",
+    "plan-run-model.js": "4d2d000772b9aa0b5127ab83301c8ee55313fadafa2850034d29351284b564d4",
+    "plan-run-failure-model.js": "6566d53e4e5e8635f73b51641b1f0593f629b735c1b493c63595369b2a39f949",
+    "firebase-plan-run.js": "cfd90b314281bf40c1666648bcf757e6a3ff216c02b91fc917f50d70df7efad8",
+    "app-plan-run-ui.js": "e9805351a916216d1c3f154e06c6c2ab3790312aee501d1bc7105f7efaff426f",
+    "app-plan-run-start-ui.js": "1cdb0a834b36b38478663c1a857d1eeb528660e4541b29d78a850675904445b1",
+    "app-plan-run-training-max-ui.js": "546989202b22cc09cb578426d75ece4d83499a1e4c1bcdbd4835fc132734437e",
+    "app-plan-run-logger-ui.js": "b9be300b4116e5c3ae719af908817a7d910798b7b6c3b202c1cfb3d2d8ae2c7b",
+    "app-plan-run-failure-ui.js": "cad5782bbef8041a7239ecb9f99a46b624a23844a43012c9c6fd31e4aa2ae53a",
+    "app-plan-run-end-ui.js": "4ffc23b2946f5efa83ef90b1eb02246934b8608401e409c7bfd12742c4b7148c",
+    "app-core.js": "4a7a08015cf55c26f3d213a3fa67db98bbc53a408d9906079ddfb470bfe286b1",
+    "load-solver.js": "c38982dbc3d3d4f1a51986ba470dd780a778f5850d60b5e9b0df8814bf91d358",
+    "app-equipment.js": "8ef524ac2c295eea58a9440373c2680973ef2960a8b81ab25e30211f7e4e06cd",
+    "app-exercise-loading.js": "c7b3db1d75887cf67aec56f69909caca631b1f6a57bb3bbad1d48d1398d2cacd",
+    "app-load-calc.js": "47d6155d1848e4890cff355f38111b47927a79efeda3bfe1950a45f85641ec77",
+    "app-rest-timer.js": "b11b3f89274a65a3166dae378d55fc4e1e215a568eb852fc155ac12bba429863"
+  }
+}

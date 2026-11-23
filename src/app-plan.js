@@ -14837,7 +14837,11 @@ function planEvaluateCanonicalProgression(rule,currentValue,evidence,basis){
 
 function planSuggestProgressionInitialValueFromHistory(workouts,exerciseId,kind,unit){
   if(!Array.isArray(workouts)||!planProgressionId(exerciseId))return {outcome:'noHistory'};
-  for(var wi=workouts.length-1;wi>=0;wi--){var matches=(workouts[wi].exercises||[]).filter(function(e){return e.exerciseId===exerciseId;});if(matches.length>1)return {outcome:'ambiguousDuplicate'};if(matches.length===1){var values=[];(matches[0].sets||[]).forEach(function(s){var v=Number(s.weight);if(s.completed&&Number.isFinite(v))values.push(v);});if(values.length)return {outcome:'suggestion',kind:kind,amount:Math.max.apply(null,values),unit:unit};}}
+  // STAGE 4a: a workout that has a unit field (written by a later version) is
+  // never read as a number in `unit` -- that would guess its meaning. It ends
+  // the search with no suggestion (nothing is converted). Not called by the
+  // app today; kept safe for when it is.
+  for(var wi=workouts.length-1;wi>=0;wi--){var matches=(workouts[wi].exercises||[]).filter(function(e){return e.exerciseId===exerciseId;});if(matches.length>1)return {outcome:'ambiguousDuplicate'};if(matches.length===1&&workouts[wi].unit!==undefined&&workouts[wi].unit!==null)return {outcome:'notComparable'};if(matches.length===1){var values=[];(matches[0].sets||[]).forEach(function(s){var v=Number(s.weight);if(s.completed&&Number.isFinite(v))values.push(v);});if(values.length)return {outcome:'suggestion',kind:kind,amount:Math.max.apply(null,values),unit:unit};}}
   return {outcome:'noHistory'};
 }
 

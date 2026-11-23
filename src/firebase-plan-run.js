@@ -1211,7 +1211,10 @@
                 var sSel = M('planRunSelectQualifyingWorkingLoadWeight')(pkg.workout, assignment);
                 if (sSel.qualifies) {
                   sEstAmount = sSel.amount;
-                  sEstUnit = deps.resolveDefaultWeightUnit ? deps.resolveDefaultWeightUnit() : 'lb';
+                  // STAGE 4a: the workout's recorded unit when it has one (see the
+                  // per-Rule path below); otherwise the account unit, as before.
+                  sEstUnit = (pkg.workout && (pkg.workout.unit === 'lb' || pkg.workout.unit === 'kg')) ? pkg.workout.unit
+                    : (deps.resolveDefaultWeightUnit ? deps.resolveDefaultWeightUnit() : 'lb');
                 }
               }
               var sRecPath = colPath(pkg.ownerUid, 'applications', M('planRunBuildApplicationId')(pkg.planRunId, rid, pkg.workoutId));
@@ -1399,7 +1402,11 @@
                 // ... : ...` idiom, unedited, reused via `deps.resolveDefaultWeightUnit()`)
                 // rather than inventing a new source or leaving the
                 // established value unit-less.
-                establishedUnit = deps.resolveDefaultWeightUnit ? deps.resolveDefaultWeightUnit() : 'lb';
+                // STAGE 4a: a workout that RECORDED its unit (Draft 7 §3.4)
+                // established its number in that unit -- the account
+                // preference may have changed since, so it is not used then.
+                establishedUnit = (pkg.workout && (pkg.workout.unit === 'lb' || pkg.workout.unit === 'kg')) ? pkg.workout.unit
+                  : (deps.resolveDefaultWeightUnit ? deps.resolveDefaultWeightUnit() : 'lb');
               }
               // else: no qualifying evidence this Finish -- stays unresolved,
               // zero writes (spec Round 2 SS4.5).

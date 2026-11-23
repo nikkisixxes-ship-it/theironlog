@@ -1,16 +1,16 @@
-// ==================== STATISTICS COMPATIBILITY (pure, NOT CONNECTED) ====================
-// Stage 1: the classification rules of the specification (section 11.2) as pure
-// functions. index.html does not load this file, and the app's existing PR,
-// E1RM, volume and suggestion code is unchanged and does not call it.
+// ==================== STATISTICS COMPATIBILITY (pure) ====================
+// The classification rules of the specification (section 11.2) as pure
+// functions. Stage 1 wrote them; STAGE 4a connects them: index.html loads this
+// file so the app can keep each class's statistics apart (app-data.js,
+// statsRowClass). It needs nothing else: the two integer helpers it used from
+// calc-cv1.js (toTicks, divHalfUp) are copied below unchanged, so the
+// provisional calculation module stays unconnected.
 //
-// Classes (from a record's OWN recorded facts; preferences are never consulted):
-//   V verified  - unit known AND implement count known AND (1 implement OR basis known)
-//   L legacy    - no unit recorded: compared only with other L records, raw numbers, as today
-//   C unknown   - unit known but implement count unknown, or 2 implements with basis unknown:
-//                 never compared, combined or flagged. A missing implement count is NEVER 1.
 (function (root) {
   'use strict';
-  const C = (typeof module !== 'undefined' && module.exports) ? require('./calc-cv1.js') : root.IronCalc;
+  // Same as calc-cv1.js toTicks / divHalfUp (kept identical; see tests/stage4).
+  const C = { toTicks: value => Math.round(Number(value) * 10000),
+    divHalfUp: (n, d) => Number((2n * n + d) / (2n * d)) };
   const B = x => BigInt(x), LB = 45359237n;
   function classify(rec) {      // rec: {unit?, implements?, basis?}
     if (rec.unit !== 'lb' && rec.unit !== 'kg') return 'L';

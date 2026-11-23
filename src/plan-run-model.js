@@ -317,6 +317,53 @@ function planRunWorkoutExerciseIsPrescribedOrigin(ex) {
 var PLAN_RUN_WORKOUT_SET_KEYS = Object.freeze(['planSetId', 'weight', 'reps', 'time', 'rpe', 'completed', 'isPR', 'isNew1RM', 'isSupplemental']);
 var PLAN_RUN_WORKOUT_SET_KEYS_LEGACY = Object.freeze(['planSetId', 'weight', 'reps', 'time', 'rpe', 'completed', 'isPR', 'isNew1RM']);
 
+// STAGE 4a (reader compatibility, Draft 7 §3.3-3.4, §6.2, §12.1): workouts
+// written by Stage 4b and later may carry these OPTIONAL recorded fields.
+// This release only ACCEPTS and PRESERVES them -- it never creates them:
+//   workout:      unit        'lb' | 'kg'        (the logger's unit at start)
+//   exercise row: rowId       12 letters/digits  (stable row identity)
+//                 implements  1 | 2              (only when known)
+//                 basis       'total' | 'perImplement'
+//   set:          setId       12 letters/digits  (stable set identity)
+// Absent means "not recorded" (every workout written before 4b). A present
+// field must be well formed; anything else is still rejected exactly as
+// before.
+var PLAN_RUN_RECORDED_WORKOUT_KEYS = Object.freeze(['unit']);
+var PLAN_RUN_RECORDED_ROW_KEYS = Object.freeze(['rowId', 'implements', 'basis']);
+var PLAN_RUN_RECORDED_SET_KEYS = Object.freeze(['setId']);
+function planRunRecordedIdOk(v) { return typeof v === 'string' && /^[A-Za-z0-9]{12}$/.test(v); }
+function planRunRecordedFieldOk(key, v) {
+  switch (key) {
+    case 'unit': return v === 'lb' || v === 'kg';
+    case 'rowId': case 'setId': return planRunRecordedIdOk(v);
+    case 'implements': return v === 1 || v === 2;
+    case 'basis': return v === 'total' || v === 'perImplement';
+    default: return false;
+  }
+}
+// Exact keys, plus any of `optional` -- each present optional key well formed.
+function planRunExactKeysWithRecorded(v, keys, optional) {
+  if (!planRunIsPlainObject(v)) return false;
+  var base = {};
+  Object.keys(v).forEach(function (k) { if (optional.indexOf(k) === -1) base[k] = true; });
+  if (Object.keys(base).sort().join('\n') !== keys.slice().sort().join('\n')) return false;
+  for (var i = 0; i < optional.length; i++) {
+    if (Object.prototype.hasOwnProperty.call(v, optional[i]) && !planRunRecordedFieldOk(optional[i], v[optional[i]])) return false;
+  }
+  return true;
+}
+// Copies the well-formed recorded fields of `from` onto `to` (preserving them
+// through a rebuild). Returns false if `from` carries a malformed one.
+function planRunCopyRecordedFields(from, to, optional) {
+  for (var i = 0; i < optional.length; i++) {
+    var k = optional[i];
+    if (!from || !Object.prototype.hasOwnProperty.call(from, k) || from[k] === undefined) continue;
+    if (!planRunRecordedFieldOk(k, from[k])) return false;
+    to[k] = from[k];
+  }
+  return true;
+}
+
 // =============================================================================
 // SECTION 1 -- generic small predicates (mirrored, not re-derived, from the
 // accepted firebase-plan-progression.js/app-plan.js precedent: same bounded
@@ -1685,8 +1732,8 @@ function planRunDecodeUnresolvedTrainingMaxCursor(cursor, ownerUid) {
 // reads. `planRunWorkoutPerformedValid` itself is retired along with the
 // shape it validated.
 function planRunWorkoutSetValid(st) {
-  var isCurrentShape = planRunExactKeys(st, PLAN_RUN_WORKOUT_SET_KEYS);
-  var isLegacyShape = !isCurrentShape && planRunExactKeys(st, PLAN_RUN_WORKOUT_SET_KEYS_LEGACY);
+  var isCurrentShape = planRunExactKeysWithRecorded(st, PLAN_RUN_WORKOUT_SET_KEYS, PLAN_RUN_RECORDED_SET_KEYS);
+  var isLegacyShape = !isCurrentShape && planRunExactKeysWithRecorded(st, PLAN_RUN_WORKOUT_SET_KEYS_LEGACY, PLAN_RUN_RECORDED_SET_KEYS);
   if (!isCurrentShape && !isLegacyShape) return false;
   if (isCurrentShape) {
     if (typeof st.isSupplemental !== 'boolean') return false;
@@ -1707,7 +1754,7 @@ function planRunWorkoutSetValid(st) {
 // to decide whether a Set's planSetId carries real prescribed identity.
 function planRunWorkoutSetIsSupplemental(st) { return st.isSupplemental === true; }
 function planRunWorkoutDocValid(v) {
-  if (!planRunExactKeys(v, PLAN_RUN_WORKOUT_KEYS)) return false;
+  if (!planRunExactKeysWithRecorded(v, PLAN_RUN_WORKOUT_KEYS, PLAN_RUN_RECORDED_WORKOUT_KEYS)) return false;
   if (!planRunIsId(v.id) || !planRunIsId(v.ownerUid)) return false;
   if (!planRunIsId(v.planRunId) || !planRunIsId(v.planOccurrenceId) || !planRunIsId(v.planTemplateId)) return false;
   if (!planRunIsId(v.headRevisionId) || !planRunIsId(v.planMicrocycleId) || !planRunIsId(v.planSessionId)) return false;
@@ -1725,8 +1772,8 @@ function planRunWorkoutDocValid(v) {
     // See PLAN_RUN_WORKOUT_EXERCISE_KEYS's own comment above for the full
     // rationale; mirrors planRunWorkoutSetValid's identical dual-shape
     // convention immediately above in this file.
-    var exIsCurrentShape = planRunExactKeys(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS);
-    var exIsLegacyShape = !exIsCurrentShape && planRunExactKeys(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS_LEGACY);
+    var exIsCurrentShape = planRunExactKeysWithRecorded(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS, PLAN_RUN_RECORDED_ROW_KEYS);
+    var exIsLegacyShape = !exIsCurrentShape && planRunExactKeysWithRecorded(ex, PLAN_RUN_WORKOUT_EXERCISE_KEYS_LEGACY, PLAN_RUN_RECORDED_ROW_KEYS);
     if (!exIsCurrentShape && !exIsLegacyShape) return false;
     if (exIsCurrentShape) {
       if (PLAN_RUN_WORKOUT_EXERCISE_ORIGINS.indexOf(ex.origin) === -1) return false;
@@ -3790,6 +3837,11 @@ if (typeof module !== 'undefined' && module.exports) {
     planRunWorkoutSetIsSupplemental: planRunWorkoutSetIsSupplemental,
     planRunWorkoutDocValid: planRunWorkoutDocValid,
     planRunClassifyWorkoutDiscriminator: planRunClassifyWorkoutDiscriminator,
+    planRunRecordedFieldOk: planRunRecordedFieldOk,
+    planRunCopyRecordedFields: planRunCopyRecordedFields,
+    PLAN_RUN_RECORDED_WORKOUT_KEYS: PLAN_RUN_RECORDED_WORKOUT_KEYS,
+    PLAN_RUN_RECORDED_ROW_KEYS: PLAN_RUN_RECORDED_ROW_KEYS,
+    PLAN_RUN_RECORDED_SET_KEYS: PLAN_RUN_RECORDED_SET_KEYS,
     planRunWorkoutContextMatchesOccurrence: planRunWorkoutContextMatchesOccurrence,
     planRunSetHasValidCompletionEvidence: planRunSetHasValidCompletionEvidence,
     planRunSetHasRecordedPerformance: planRunSetHasRecordedPerformance,
