@@ -668,6 +668,8 @@ function openExerciseProfile(exId) {
   const ex = getExercise(exId);
   if (!ex) return;
   profileSetHistoryShown = PROFILE_SET_HISTORY_PAGE_SIZE;
+  // STAGE 3: start reading account loading settings and equipment (for the summary).
+  if (typeof elStartForCurrentOwner === 'function') elStartForCurrentOwner();
   renderProfilePage(ex);
   openModal('modal-ex-profile');
 }
@@ -762,6 +764,17 @@ function renderProfilePage(ex) {
     <div class="prof-section" data-testid="prof-set-history-section">
       <div class="prof-section-label">Set History</div>
       <div id="prof-set-history" data-testid="prof-set-history">${buildProfileSetHistoryHtml(ex.id)}</div>
+    </div>
+
+    <div class="prof-divider"></div>
+
+    <!-- Loading Settings (Stage 3): lasting, per exercise; the same settings the logger opens -->
+    <div class="prof-section" data-testid="prof-loading-section">
+      <div class="prof-section-label">Loading Settings</div>
+      <div class="prof-loading-row" style="display:flex;align-items:center;gap:10px">
+        <div id="prof-loading-summary" data-testid="prof-loading-summary" data-exercise="${escapeHtml(ex.id)}" style="flex:1;min-width:0">${typeof elSummaryText === 'function' ? escapeHtml(elSummaryText(ex.id)) : ''}</div>
+        <button class="btn btn-secondary btn-sm" data-testid="prof-loading-edit" onclick="openExerciseLoadingSettings(profileExId,'library')">Edit</button>
+      </div>
     </div>
 
     <div class="prof-divider"></div>

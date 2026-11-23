@@ -71,7 +71,10 @@ function lcRefreshData() {
 // ==================== UI STATE ====================
 // stack: navigation history inside the dialog. Each entry remembers its own
 // scroll position, so "Back" returns exactly where the user was.
-let lcState = { data: { profiles: [], inventories: [], lastProfileId: null }, stack: [], target: '', targetBasis: null, drafts: {}, root: 'calc', busy: false, copy: null, unsub: null };
+let lcState = { data: { profiles: [], inventories: [], lastProfileId: null }, stack: [], target: '', targetBasis: null, drafts: {}, root: 'calc', busy: false, copy: null, unsub: null, elUnsub: null,
+  // STAGE 3 exercise context: { exerciseId, name, from } when opened for one exercise, else null.
+  // ctxChosen: equipment the lifter picked by hand in this context (never chosen for them).
+  ctx: null, ctxChosen: null };
 
 // TARGET BASIS: a typed target only means something for one unit (lb/kg)
 // and one basis (per dumbbell / equipment total). Whenever the active
@@ -89,18 +92,27 @@ function lcProfile(id) { return (lcState.data.profiles || []).find(p => p.id ===
 function lcInventory(id) { return (lcState.data.inventories || []).find(i => i.id === id) || null; }
 function lcCurrentProfile() {
   const d = lcState.data;
+  if (lcState.ctx) {
+    // For one exercise: its linked equipment, or what the lifter picked here. Never a substitute.
+    if (lcState.ctxChosen && lcProfile(lcState.ctxChosen)) return lcProfile(lcState.ctxChosen);
+    const r = elResolve(lcState.ctx.exerciseId, lcDefaultUnit());
+    return r.state === 'ok' && r.availability.source === 'equipment' ? lcProfile(r.availability.profile.id) : null;
+  }
   return lcProfile(d.lastProfileId) || d.profiles[0] || null;
 }
 function lcScroller() { const ov = document.getElementById('modal-load-calc'); return ov ? ov.querySelector('.modal') : null; }
 function lcTop() { return lcState.stack[lcState.stack.length - 1]; }
 
-function lcOpen(root) {
+function lcOpen(root, ctx) {
   if (!lcUid()) return;
   if (eqState.uid !== lcUid()) eqResetForOwner(lcUid());
-  eqEnsureStarted();
+  if (elState.uid !== lcUid()) elResetForOwner(lcUid());
+  eqEnsureStarted(); elEnsureStarted();
   lcState.root = root; lcState.stack = [{ view: root, scroll: 0 }];
   lcState.drafts = {}; lcState.copy = null; lcState.busy = false;
+  lcState.ctx = ctx || null; lcState.ctxChosen = null;
   if (!lcState.unsub) lcState.unsub = eqSubscribe(lcOnEquipmentChange);
+  if (!lcState.elUnsub) lcState.elUnsub = elSubscribe(lcOnEquipmentChange);
   const ov = document.getElementById('modal-load-calc');
   ov.classList.add('lc-top');
   lcRender();
@@ -109,27 +121,58 @@ function lcOpen(root) {
 }
 function openLoadCalculator() {
   if (!(typeof currentWorkout !== 'undefined' && currentWorkout && !currentWorkout._isEdit)) return;
-  lcOpen('calc');
+  lcOpen('calc');   // workout-wide: no exercise is assumed
+}
+// STAGE 3: opened from ONE exercise's "•••" menu in the logger: that exercise's context.
+function lcRowExercise(idx) {
+  const row = typeof currentWorkout !== 'undefined' && currentWorkout && currentWorkout.exercises ? currentWorkout.exercises[idx] : null;
+  if (!row || !row.exerciseId) return null;
+  const ex = typeof getExercise === 'function' ? getExercise(row.exerciseId) : null;
+  return { exerciseId: String(row.exerciseId), name: ex ? ex.name : 'This exercise' };
+}
+function openLoadCalculatorForRow(idx) {
+  if (!(typeof currentWorkout !== 'undefined' && currentWorkout && !currentWorkout._isEdit)) return;
+  const c = lcRowExercise(idx); if (!c) return;
+  lcOpen('calc', Object.assign(c, { from: 'logger' }));
+}
+function openExerciseLoadingSettingsForRow(idx) {
+  const c = lcRowExercise(idx); if (!c) return;
+  lcOpen('exLoading', Object.assign(c, { from: 'logger' }));
+}
+// LIBRARY > an exercise's profile > Loading Settings.
+function openExerciseLoadingSettings(exId, from) {
+  const ex = typeof getExercise === 'function' ? getExercise(exId) : null; if (!ex) return;
+  lcOpen('exLoading', { exerciseId: String(exId), name: ex.name, from: from || 'library' });
 }
 // LIBRARY > Equipment: the same equipment editor, no workout needed.
 function openEquipmentEditor() { lcOpen('manage'); }
+// Closing: never while a save is on its way; ask before dropping unsaved loading settings.
+function lcRequestClose() {
+  if (lcState.busy) { showToast('Saving… please wait a moment.', 'error'); return; }
+  const d = lcState.drafts.exLoading;
+  if (d && d.dirty) { confirm2('Discard Changes?', 'Your loading settings changes haven’t been saved.', () => closeLoadCalculator(), 'Discard', true); return; }
+  closeLoadCalculator();
+}
 function closeLoadCalculator() {
   closeModal('modal-load-calc');
   if (lcState.unsub) { lcState.unsub(); lcState.unsub = null; }
-  lcState.drafts = {}; lcState.copy = null; lcState.stack = [];
+  if (lcState.elUnsub) { lcState.elUnsub(); lcState.elUnsub = null; }
+  lcState.drafts = {}; lcState.copy = null; lcState.stack = []; lcState.ctx = null; lcState.ctxChosen = null;
 }
 // Account changed (sign-out, sign-in, switch): close and forget everything shown.
 function lcResetForOwner() {
   const ov = document.getElementById('modal-load-calc');
   if (ov && ov.classList.contains('open')) closeLoadCalculator();
-  else { if (lcState.unsub) { lcState.unsub(); lcState.unsub = null; } lcState.drafts = {}; lcState.copy = null; lcState.stack = []; }
+  else { if (lcState.unsub) { lcState.unsub(); lcState.unsub = null; } if (lcState.elUnsub) { lcState.elUnsub(); lcState.elUnsub = null; } lcState.drafts = {}; lcState.copy = null; lcState.stack = []; }
+  lcState.ctx = null; lcState.ctxChosen = null; lcState.busy = false;
   lcState.target = ''; lcState.targetBasis = null;
   lcState.data = { profiles: [], inventories: [], lastProfileId: null };
 }
 // Live updates: redraw read-only views; editors keep the typed input (conflicts are caught on save).
 function lcOnEquipmentChange() {
   const top = lcTop(); if (!top) return;
-  if (['calc', 'manage', 'invUsers', 'copy'].indexOf(top.view) === -1 || lcState.busy) return;
+  const redraw = ['calc', 'manage', 'invUsers', 'copy', 'profUsers'].indexOf(top.view) !== -1 || (top.view === 'exLoading' && !lcState.drafts.exLoading);
+  if (!redraw || lcState.busy) return;
   const sc = lcScroller(); const y = sc ? sc.scrollTop : 0;
   const active = document.activeElement && document.activeElement.id;
   const caret = active === 'lc-target' ? document.activeElement.selectionStart : null;
@@ -176,6 +219,8 @@ function lcRender() {
     case 'editInventory': title = top.params.isNew ? 'New Plate Inventory' : 'Edit Plate Inventory'; html = lcEditInventoryHtml(); break;
     case 'guide': title = 'Weight Guide'; html = lcGuideHtml(); break;
     case 'diagram': title = 'REP QuickDraw'; html = lcDiagramViewHtml(); break;
+    case 'exLoading': title = 'Loading Settings'; html = lcExLoadingHtml(); break;
+    case 'profUsers': title = 'Equipment In Use'; html = lcProfUsersHtml(); break;
   }
   titleEl.textContent = title;
   body.innerHTML = html;
@@ -227,8 +272,17 @@ function lcDeviceCopyBannerHtml() {
 }
 function lcCalcHtml() {
   const d = lcState.data;
-  const blocked = lcStatusHtml(); if (blocked) return blocked;
-  const notice = lcNoticesHtml();
+  const ctxHtml = lcState.ctx ? lcCtxHtml() : '';
+  const blocked = lcStatusHtml(); if (blocked) return ctxHtml + blocked;
+  const notice = ctxHtml + lcNoticesHtml();
+  if (lcState.ctx && d.profiles.length && !lcCurrentProfile()) {
+    // Exercise context without usable linked equipment: the lifter picks; nothing is pre-selected.
+    const opts = d.profiles.map(x => `<option value="${escapeHtml(x.id)}">${escapeHtml(x.name)} · ${escapeHtml(x.unit)}</option>`).join('');
+    return notice + `<div class="lc-profile-head"><label for="lc-profile-select">Equipment</label>
+      <button class="btn btn-ghost btn-sm lc-manage-btn" onclick="lcNav('manage')">Manage Equipment</button></div>
+      <select id="lc-profile-select" data-testid="lc-ctx-choose" onchange="lcSelectProfile(this.value)"><option value="" selected>Choose equipment…</option>${opts}</select>
+      <div id="lc-result" class="lc-result" aria-live="polite"></div>`;
+  }
   if (!d.profiles.length) {
     return notice + `<div class="lc-empty" data-testid="lc-empty">
       <div class="lc-empty-title">No equipment yet</div>
@@ -262,7 +316,8 @@ function lcCalcHtml() {
 }
 function lcSelectProfile(id) {
   if (!lcProfile(id)) return;
-  eqSetLastProfile(lcUid(), id);
+  if (lcState.ctx) lcState.ctxChosen = id;   // for this exercise only, this time; settings unchanged
+  else eqSetLastProfile(lcUid(), id);
   lcRender();
 }
 function lcWeightText(m, p) { return `${lcFmt(m)} ${p.unit}${lcIsPerDumbbell(p) ? ' per dumbbell' : ''}`; }
@@ -281,7 +336,7 @@ function lcPlateOptionHtml(kind, o, p) {
 }
 function lcRenderResult() {
   const el = document.getElementById('lc-result'); if (!el) return;
-  const p = lcCurrentProfile(); if (!p) { el.innerHTML = ''; return; }
+  const p = lcCurrentProfile(); if (!p) { el.innerHTML = lcState.ctx ? '<div class="lc-muted lc-hint">Choose equipment to calculate.</div>' : ''; return; }
   const raw = String(lcState.target || '').trim();
   if (!raw) { el.innerHTML = `<div class="lc-muted lc-hint">Enter a target to see the ${p.type === 'plate' ? 'plates' : 'setting'}.</div>`; return; }
   const t = lcParseWeight(raw, { allowZero: true });
@@ -379,7 +434,7 @@ function lcManageHtml() {
   const notices = lcNoticesHtml();
   const profs = d.profiles.length ? d.profiles.map(p => `
     <div class="lc-list-row" data-testid="lc-profile-row">
-      <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(p.name)}</div><div class="lc-muted lc-small">${escapeHtml(lcTypeLabel(p))} · ${escapeHtml(p.unit)}</div></div>
+      <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(p.name)}</div><div class="lc-muted lc-small">${escapeHtml(lcTypeLabel(p))} · ${escapeHtml(p.unit)}${lcExUsersCount(p.id) ? ' · used by ' + lcExUsersCount(p.id) + ' exercise' + (lcExUsersCount(p.id) === 1 ? '' : 's') : ''}</div></div>
       <button class="btn btn-ghost btn-sm" onclick="lcStartEditProfile('${escapeHtml(p.id)}')">Edit</button>
       <button class="btn btn-danger btn-sm" onclick="lcDeleteProfile('${escapeHtml(p.id)}')">Delete</button>
     </div>`).join('') : '<div class="lc-muted lc-small">No equipment profiles yet.</div>';
@@ -414,8 +469,12 @@ async function lcWrite(fn, okMsg) {
 function lcSetBusyUi(on) { document.querySelectorAll('#lc-body .lc-save-btn').forEach(b => { b.disabled = on; if (on) b.dataset.label = b.dataset.label || b.textContent; b.textContent = on ? 'Saving…' : (b.dataset.label || b.textContent); }); }
 function lcDeleteProfile(id) {
   const p = lcProfile(id); if (!p) return;
+  // STAGE 3: equipment linked from exercises' loading settings can't be deleted; show them with Reassign / Unlink.
+  if (lcExUsersCount(id)) { lcNav('profUsers', { profileId: id }); return; }
   confirm2('Delete Equipment', `Delete "${p.name}"?`, async () => {
-    if (await lcWrite(() => eqDeleteProfile(id, p), 'Equipment deleted')) lcRender();
+    let code = null;
+    const ok = await lcWrite(async () => { try { return await eqDeleteProfile(id, p); } catch (e) { code = e && e.eqCode; throw e; } }, 'Equipment deleted');
+    if (ok) lcRender(); else if (code === 'inUseByExercises') lcNav('profUsers', { profileId: id });
   });
 }
 function lcDeleteInventory(id) {
@@ -726,3 +785,230 @@ async function lcRunCopy() {
   finally { c.running = false; c.progress = null; lcState.busy = false; }
   if (lcState.copy === c && lcUid() === uid) lcRender();
 }
+
+// ==================== EXERCISE CONTEXT AND LOADING SETTINGS (Stage 3) ====================
+// The Loading Settings editor is a view of this dialog, opened from LIBRARY (an
+// exercise's profile) and from the logger (one exercise's "•••" menu). Both
+// open the same account document (app-exercise-loading.js). Saving never
+// touches the open workout: sets, weights, timer and recovery draft are left
+// exactly as they are.
+
+// A tap on the dim background closes through the same guarded path as ✕.
+if (typeof document !== 'undefined' && document && typeof document.addEventListener === 'function') document.addEventListener('click', e => {
+  const ov = document.getElementById('modal-load-calc');
+  if (ov && e.target === ov && ov.classList.contains('open')) { e.stopPropagation(); e.preventDefault(); lcRequestClose(); }
+}, true);
+
+function lcExUsersCount(profileId) { return elDependents(profileId).length; }
+
+// Header for the calculator when it was opened for one exercise.
+function lcCtxHtml() {
+  const c = lcState.ctx; const r = elResolve(c.exerciseId, lcDefaultUnit());
+  const name = `<b>${escapeHtml(c.name)}</b>`;
+  let line = '', state = r.state, fix = '';
+  if (r.state === 'loading') line = 'Loading this exercise’s loading settings…';
+  else if (r.state === 'failed') { line = 'Couldn’t load this exercise’s loading settings. Nothing is pre-selected.'; fix = '<button class="btn btn-ghost btn-sm" onclick="elRetry();eqRetry()">Try again</button>'; }
+  else if (r.state === 'unconfirmed') line = 'Offline: this exercise’s loading settings can’t be confirmed yet, so nothing is pre-selected.';
+  else if (r.state === 'problem') {
+    state = r.problem;
+    line = r.problem === 'missingEquipment' ? 'This exercise’s loading settings link to equipment that no longer exists. Nothing has been substituted.'
+      : r.problem === 'unreadableEquipment' ? 'This exercise’s linked equipment can’t be read. Nothing has been substituted.'
+      : r.problem === 'unconfirmedEquipment' ? 'Offline: this exercise’s linked equipment can’t be confirmed yet. Nothing has been substituted.'
+      : 'This exercise’s saved loading settings can’t be read. Nothing has been substituted.';
+    line += ' Choose equipment below for now, or fix the settings.';
+    fix = '<button class="btn btn-secondary btn-sm" data-testid="lc-ctx-fix" onclick="lcNav(\'exLoading\')">Fix loading settings</button>';
+  } else {
+    const a = r.availability; state = a.source;
+    if (a.source === 'equipment') {
+      line = `Linked equipment: ${escapeHtml(a.profile.name)}.`;
+      if (lcState.ctxChosen && lcState.ctxChosen !== a.profile.id && lcProfile(lcState.ctxChosen)) { state = 'chosen'; line += ` You’re using ${escapeHtml(lcProfile(lcState.ctxChosen).name)} for now; the settings are unchanged.`; }
+    } else if (a.source === 'direct') line = `This exercise uses typed settings (${escapeHtml(elDirectText(a.direct))}). The calculator works with saved equipment, so choose equipment below.`;
+    else line = 'This exercise has no loading settings yet. Choose equipment below, or set them.';
+  }
+  return `<div class="lc-notice lc-ctx" data-testid="lc-ctx" data-state="${escapeHtml(state)}" data-exercise="${escapeHtml(c.exerciseId)}">
+    <div>For ${name}</div><div class="lc-small" style="margin-top:4px">${line}</div>
+    <div style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap">${fix}${fix && fix.indexOf('exLoading') !== -1 ? '' : '<button class="btn btn-ghost btn-sm" data-testid="lc-ctx-settings" onclick="lcNav(\'exLoading\')">Loading settings</button>'}</div></div>`;
+}
+
+// ---- the editor ----
+function lcElDraftFrom(exId) {
+  const p = elPref(exId), bad = elState.unreadable[exId];
+  const m = p || elEmptyModel(exId);
+  const dir = m.direct || null;
+  return { exerciseId: exId, dirty: false, conflict: null,
+    baseRevision: p ? p.revision : (bad && bad.raw && Number.isInteger(bad.raw.revision) ? bad.raw.revision : 0),
+    replacing: !!bad, mode: m.mode, equipmentId: m.equipmentId || '',
+    dirKind: dir ? dir.kind : 'step', dirUnit: dir ? dir.unit : lcDefaultUnit(),
+    origin: dir && dir.kind === 'step' ? elFmt(dir.origin) : '', step: dir && dir.kind === 'step' ? elFmt(dir.step) : '',
+    list: dir && dir.kind === 'list' ? dir.list.map(elFmt).join(', ') : '',
+    minValue: m.minimum ? elFmt(m.minimum.value) : '', minUnit: m.minimum ? m.minimum.unit : lcDefaultUnit(),
+    implements: m.implements ? String(m.implements) : '', basis: m.defaultBasis || '' };
+}
+function lcElSet(field, value, rerender) {
+  const d = lcState.drafts.exLoading; if (!d) return;
+  d[field] = value; d.dirty = true;
+  if (field === 'implements' && value !== '2') d.basis = '';
+  if (rerender) { const sc = lcScroller(); const y = sc ? sc.scrollTop : 0; lcRender(); if (sc) sc.scrollTop = y; }
+}
+function lcElStatusHtml(exId) {
+  const st = elState.status;
+  if (st === 'idle' || st === 'loading' || st === 'signedOut') return '<div class="lc-state" data-testid="el-state" data-state="loading"><div class="lc-empty-title">Loading loading settings…</div></div>';
+  if (st === 'failed') return `<div class="lc-state" data-testid="el-state" data-state="failed"><div class="lc-empty-title">Couldn’t load loading settings</div>
+    <div class="lc-muted">${elState.error === 'permission-denied' ? 'The server refused the request. Try signing out and in again.' : 'Something went wrong while reading your account' + (elState.error ? ' (' + escapeHtml(elState.error) + ')' : '') + '.'} Nothing has been changed.</div>
+    <button class="btn btn-primary lc-full-btn" onclick="elRetry();eqRetry()">Try again</button></div>`;
+  if (st === 'cachedOnly' && !elPref(exId) && !elState.unreadable[exId]) return `<div class="lc-state" data-testid="el-state" data-state="offline"><div class="lc-empty-title">Can’t reach your account</div>
+    <div class="lc-muted">You seem to be offline, and this device has no saved copy of this exercise’s loading settings. They aren’t gone; they’ll appear when you’re back online.</div>
+    <button class="btn btn-secondary lc-full-btn" onclick="elRetry()">Try again</button></div>`;
+  return null;
+}
+function lcExLoadingHtml() {
+  const c = lcState.ctx; if (!c) return '<div class="lc-muted">No exercise chosen.</div>';
+  const head = `<div class="lc-ctx-title" data-testid="el-exercise" data-exercise="${escapeHtml(c.exerciseId)}"><b>${escapeHtml(c.name)}</b></div>
+    <div class="lc-muted lc-small" style="margin-bottom:10px">Lasting settings for this exercise, saved to your account and used in every program. Saving doesn’t change any workout’s weights. Filling in weights from these settings comes in a later update.</div>`;
+  const blocked = lcElStatusHtml(c.exerciseId); if (blocked && !lcState.drafts.exLoading) return head + blocked;
+  if (!lcState.drafts.exLoading) lcState.drafts.exLoading = lcElDraftFrom(c.exerciseId);
+  const d = lcState.drafts.exLoading;
+  let notes = '';
+  if (elState.offline || elState.status === 'cachedOnly' || eqState.offline) notes += '<div class="lc-notice" data-testid="el-offline">Offline: showing the copy saved on this device. Changes can’t be saved until you’re back online.</div>';
+  if (d.replacing) notes += `<div class="lc-notice" data-testid="el-unreadable">This exercise’s saved loading settings can’t be read (${escapeHtml((elState.unreadable[c.exerciseId] || {}).reason || 'unknown format')}). Nothing has been changed. Saving here replaces them.</div>`;
+  if (d.exerciseGone) notes += `<div class="lc-notice" data-testid="el-exercise-gone">${escapeHtml(EL_EXERCISE_DELETED)}</div>`;
+  if (d.conflict && !d.exerciseGone) notes += `<div class="lc-notice" data-testid="el-conflict">${escapeHtml(d.conflict)} <button class="btn btn-ghost btn-sm" data-testid="el-reload" onclick="lcElReload()">Load latest (drops my edits)</button></div>`;
+  const sel = (v, cur) => v === cur ? 'selected' : '';
+  let body = `<div class="form-group"><label for="el-mode">Available weights</label>
+    <select id="el-mode" data-testid="el-mode" onchange="lcElSet('mode',this.value,true)">
+      <option value="none" ${sel('none', d.mode)}>Not set</option>
+      <option value="equipment" ${sel('equipment', d.mode)}>Equipment from my account</option>
+      <option value="direct" ${sel('direct', d.mode)}>Type the settings</option></select></div>`;
+  if (d.mode === 'equipment') {
+    const profs = eqState.profiles; const linkedMissing = d.equipmentId && !eqProfileById(d.equipmentId);
+    if (eqState.status === 'idle' || eqState.status === 'loading') body += '<div class="lc-muted lc-small" data-testid="el-eq-loading">Loading your equipment…</div>';
+    else if (eqState.status === 'failed') body += '<div class="lc-error" data-testid="el-eq-failed">Couldn’t load your equipment. <button class="btn btn-ghost btn-sm" onclick="eqRetry()">Try again</button></div>';
+    if (linkedMissing && eqState.status === 'ready') body += `<div class="lc-notice" data-testid="el-missing">The linked equipment ${eqState.unreadable.some(u => u.id === d.equipmentId) ? 'can’t be read' : 'no longer exists'}. Choose other equipment, or another option above. Nothing has been substituted.</div>`;
+    body += `<div class="form-group"><label for="el-equipment">Equipment</label>
+      <select id="el-equipment" data-testid="el-equipment" onchange="lcElSet('equipmentId',this.value,true)">
+        <option value="" ${linkedMissing || !d.equipmentId ? 'selected' : ''}>Choose equipment…</option>
+        ${profs.map(p => `<option value="${escapeHtml(p.id)}" ${sel(p.id, d.equipmentId)}>${escapeHtml(p.name)} · ${escapeHtml(p.unit)}</option>`).join('')}</select>
+      <button class="btn btn-ghost btn-sm" style="margin-top:6px" onclick="lcNav('manage')">Manage Equipment</button></div>`;
+  } else if (d.mode === 'direct') {
+    body += `<div class="lc-row2"><div class="form-group"><label for="el-dir-kind">Kind</label>
+        <select id="el-dir-kind" data-testid="el-dir-kind" onchange="lcElSet('dirKind',this.value,true)"><option value="step" ${sel('step', d.dirKind)}>Even steps</option><option value="list" ${sel('list', d.dirKind)}>A list of weights</option></select></div>
+      <div class="form-group"><label for="el-dir-unit">Unit</label>
+        <select id="el-dir-unit" data-testid="el-dir-unit" onchange="lcElSet('dirUnit',this.value,true)"><option value="lb" ${sel('lb', d.dirUnit)}>lb</option><option value="kg" ${sel('kg', d.dirUnit)}>kg</option></select></div></div>`;
+    if (d.dirKind === 'step') body += `<div class="lc-row2"><div class="form-group"><label for="el-origin">Lightest weight</label>
+        <input id="el-origin" data-testid="el-origin" type="text" inputmode="decimal" autocomplete="off" value="${escapeHtml(d.origin)}" placeholder="e.g. 0" oninput="lcElSet('origin',this.value)"></div>
+      <div class="form-group"><label for="el-step">Loading increment</label>
+        <input id="el-step" data-testid="el-step" type="text" inputmode="decimal" autocomplete="off" value="${escapeHtml(d.step)}" placeholder="e.g. 2.5" oninput="lcElSet('step',this.value)"></div></div>
+      <div class="lc-muted lc-small el-note" data-testid="el-increment-note">The loading increment is the smallest change your equipment allows. It isn’t the amount a program adds when you pass.</div>`;
+    else body += `<div class="form-group"><label for="el-list">Available weights (${escapeHtml(d.dirUnit)})</label>
+        <textarea id="el-list" data-testid="el-list" rows="3" placeholder="e.g. 5, 7.5, 10, 12.5, 15, 20, 25" oninput="lcElSet('list',this.value)">${escapeHtml(d.list)}</textarea>
+        <div class="lc-muted lc-small el-note">Separate weights with commas. Any spacing is fine, regular or not (up to ${LC_MAX_SETTINGS}).</div></div>`;
+  }
+  body += `<div class="lc-section-label">Minimum usable load <span class="lc-muted lc-small">(optional)</span></div>
+    <div class="lc-row2"><div class="form-group"><input id="el-min" data-testid="el-min" type="text" inputmode="decimal" autocomplete="off" aria-label="Minimum usable load" value="${escapeHtml(d.minValue)}" placeholder="None" oninput="lcElSet('minValue',this.value)"></div>
+      <div class="form-group"><select id="el-min-unit" data-testid="el-min-unit" aria-label="Minimum unit" onchange="lcElSet('minUnit',this.value)"><option value="lb" ${sel('lb', d.minUnit)}>lb</option><option value="kg" ${sel('kg', d.minUnit)}>kg</option></select></div></div>
+    <div class="lc-muted lc-small el-note">The lightest load you’d actually use. Separate from the lightest weight and the increment. Leave blank for none.</div>
+    <div class="lc-section-label">Implements per set <span class="lc-muted lc-small">(optional)</span></div>
+    <select id="el-impl" data-testid="el-impl" aria-label="Implements per set" onchange="lcElSet('implements',this.value,true)">
+      <option value="" ${sel('', d.implements)}>Not set</option><option value="1" ${sel('1', d.implements)}>One (one bar, dumbbell, handle or stack)</option><option value="2" ${sel('2', d.implements)}>Two (a pair, one in each hand)</option></select>
+    ${d.implements === '2' ? `<div class="form-group" style="margin-top:8px"><label for="el-basis">Weight is recorded</label>
+      <select id="el-basis" data-testid="el-basis" onchange="lcElSet('basis',this.value)"><option value="" ${sel('', d.basis)}>Not set</option><option value="perImplement" ${sel('perImplement', d.basis)}>Per implement (25 = two 25s)</option><option value="total" ${sel('total', d.basis)}>Combined (50 = two 25s)</option></select></div>` : ''}
+    <div class="lc-muted lc-small el-note" style="margin-top:12px" data-testid="el-default-note">When nothing is set, the app’s default is ${EL_DEFAULT_STEP.lb} lb (${EL_DEFAULT_STEP.kg} kg) steps from 0, with no minimum. That default isn’t a program’s increase.</div>
+    <div id="lc-form-error" class="lc-error" style="display:none"></div>
+    <button class="btn btn-primary lc-full-btn lc-save-btn" data-testid="el-save" onclick="lcElSave()" ${d.exerciseGone ? 'disabled' : ''}>${d.exerciseGone ? 'Can’t save: exercise deleted' : 'Save'}</button>`;
+  return head + notes + body;
+}
+function lcElReload() { lcState.drafts.exLoading = null; lcRender(); }
+// Draft -> model, or an error message.
+function lcElModel(d) {
+  const m = elEmptyModel(d.exerciseId); m.mode = d.mode;
+  const prev = elPref(d.exerciseId);
+  if (d.mode === 'equipment') {
+    if (!d.equipmentId) return 'Choose equipment, or choose another option for “Available weights”.';
+    if (!eqProfileById(d.equipmentId)) return 'That equipment isn’t available. Choose other equipment.';
+    m.equipmentId = d.equipmentId;
+  }
+  // Typed settings are kept when another option is chosen (switching back restores them).
+  const anyTyped = String(d.origin).trim() || String(d.step).trim() || String(d.list).trim();
+  if (d.mode === 'direct' || anyTyped) {
+    if (d.dirUnit !== 'lb' && d.dirUnit !== 'kg') return 'Choose lb or kg.';
+    if (d.dirKind === 'step') {
+      const o = lcParseWeight(d.origin, { allowZero: true }), st = lcParseWeight(d.step);
+      if (o === null || st === null) { if (d.mode !== 'direct' && prev && prev.direct) m.direct = prev.direct; else if (d.mode === 'direct') return 'Enter the lightest weight (0 or more) and the loading increment (more than 0), up to 3 decimals.'; }
+      else m.direct = { kind: 'step', unit: d.dirUnit, origin: o / 1000, step: st / 1000 };
+    } else {
+      const parts = String(d.list).split(/[\s,]+/).filter(Boolean); const ms = [];
+      for (const x of parts) { const v = lcParseWeight(x); if (v === null) return `"${x}" isn’t a valid weight.`; if (ms.indexOf(v) === -1) ms.push(v); }
+      if (!ms.length) { if (d.mode === 'direct') return 'List at least one weight.'; }
+      else if (ms.length > LC_MAX_SETTINGS) return `Use ${LC_MAX_SETTINGS} weights or fewer.`;
+      else m.direct = { kind: 'list', unit: d.dirUnit, list: ms.sort((a, b) => a - b).map(v => v / 1000) };
+    }
+  }
+  if (String(d.minValue).trim()) {
+    const v = lcParseWeight(d.minValue); if (v === null) return 'Enter the minimum as a number greater than 0 (up to 3 decimals), or leave it blank.';
+    if (d.minUnit !== 'lb' && d.minUnit !== 'kg') return 'Choose lb or kg for the minimum.';
+    m.minimum = { value: v / 1000, unit: d.minUnit };
+  }
+  if (d.implements === '1' || d.implements === '2') m.implements = Number(d.implements);
+  if (m.implements === 2 && (d.basis === 'total' || d.basis === 'perImplement')) m.defaultBasis = d.basis;
+  return m;
+}
+async function lcElSave() {
+  const d = lcState.drafts.exLoading; if (!d || lcState.busy || d.exerciseGone) return false;
+  const m = lcElModel(d); if (typeof m === 'string') return lcFormError(m);
+  let code = null, latest = null;
+  const fromWorkout = typeof currentWorkout !== 'undefined' && currentWorkout;
+  const rev = await lcWrite(async () => { try { return await elSavePreference(d.exerciseId, m, d.baseRevision); } catch (e) { code = e && e.eqCode; latest = e && e.latest; throw e; } },
+    fromWorkout ? 'Saved. This workout wasn’t changed.' : 'Loading settings saved.');
+  if (rev) { d.baseRevision = rev; d.dirty = false; d.replacing = false; d.conflict = null; const sc = lcScroller(); const y = sc ? sc.scrollTop : 0; lcRender(); if (sc) sc.scrollTop = y; return true; }
+  if (code === 'exerciseDeleted') {
+    // Keep every entered value; saving stays unavailable (never offered as "create again").
+    const msg = EL_EXERCISE_DELETED; d.exerciseGone = true; d.conflict = null;
+    const sc = lcScroller(); const y = sc ? sc.scrollTop : 0; lcRender(); if (sc) sc.scrollTop = y; lcFormError(msg, code);
+    return false;
+  }
+  if (code === 'conflict' || code === 'deleted') {
+    const el = document.getElementById('lc-form-error'); const msg = el ? el.textContent : '';
+    d.conflict = msg;
+    if (code === 'deleted') { d.baseRevision = 0; d.conflict += ' Saving again will create them again.'; }
+    const sc = lcScroller(); const y = sc ? sc.scrollTop : 0; lcRender(); if (sc) sc.scrollTop = y; lcFormError(msg, code);
+  }
+  return false;
+}
+
+// ---- equipment that exercises use: Reassign / Unlink before deleting ----
+function lcProfUsersHtml() {
+  const pid = lcTop().params.profileId; const p = lcProfile(pid);
+  const users = elDependents(pid);
+  if (!p && !users.length) return '<div class="lc-muted" data-testid="lc-prof-gone">This equipment no longer exists.</div>';
+  const name = p ? p.name : 'This equipment';
+  const others = lcState.data.profiles.filter(x => x.id !== pid);
+  const waiting = elState.status !== 'ready' ? '<div class="lc-notice" data-testid="lc-prof-users-wait">Still checking which exercises use this equipment…</div>' : '';
+  const rows = users.map(u => `<div class="lc-list-row" data-testid="lc-ex-dependent-row" data-id="${escapeHtml(u.exerciseId)}">
+      <div class="lc-list-main"><div class="lc-list-name">${escapeHtml(u.name)}</div>${!u.linked ? '<div class="lc-muted lc-small">Leftover listing (the exercise no longer links here)</div>' : !u.exists ? '<div class="lc-muted lc-small">Leftover settings of a deleted exercise</div>' : ''}</div>
+      ${u.linked && u.exists && others.length ? `<select aria-label="Reassign ${escapeHtml(u.name)} to" data-testid="lc-reassign-select" onchange="if(this.value)lcRelinkOne('${escapeHtml(u.exerciseId)}','${escapeHtml(pid)}',this.value)"><option value="">Reassign…</option>${others.map(o => `<option value="${escapeHtml(o.id)}">${escapeHtml(o.name)}</option>`).join('')}</select>` : ''}
+      <button class="btn btn-ghost btn-sm" data-testid="lc-unlink" onclick="lcRelinkOne('${escapeHtml(u.exerciseId)}','${escapeHtml(pid)}',null)">${u.linked && u.exists ? 'Unlink' : 'Remove'}</button></div>`).join('');
+  return waiting + `<div class="lc-notice" data-testid="lc-ex-in-use">“${escapeHtml(name)}” is used in the loading settings of ${users.length} exercise${users.length === 1 ? '' : 's'}. Reassign each to other equipment, or unlink it (its other settings stay), before deleting.</div>
+    ${rows || '<div class="lc-muted lc-small">No exercises use it any more.</div>'}
+    <div id="lc-form-error" class="lc-error" style="display:none"></div>
+    ${users.length > 1 ? `<button class="btn btn-secondary lc-full-btn" data-testid="lc-unlink-all" onclick="lcUnlinkAll('${escapeHtml(pid)}')">Unlink all</button>` : ''}
+    ${!users.length && p && elState.status === 'ready' ? `<button class="btn btn-danger lc-full-btn" data-testid="lc-delete-profile-now" onclick="lcDeleteProfile('${escapeHtml(pid)}')">Delete “${escapeHtml(name)}”</button>` : ''}`;
+}
+async function lcRelinkOne(exId, fromId, toId) {
+  const r = await lcWrite(() => elRelink(exId, fromId, toId), null);
+  if (r) showToast(r === 'moved' ? 'Exercise reassigned' : r === 'unchanged' ? 'Nothing to change; it was already updated' : r === 'cleaned' ? 'Leftover removed' : 'Exercise unlinked', 'success');
+  lcRender();
+}
+async function lcUnlinkAll(pid) {
+  const ids = elDependents(pid).map(u => u.exerciseId);
+  const r = await lcWrite(async () => { for (const id of ids) await elRelink(id, pid, null); return ids.length; }, null);
+  if (r) showToast('Exercises unlinked', 'success');
+  lcRender();
+}
+
+// ---- LIBRARY: the summary on an exercise's profile stays current ----
+function lcRefreshLibrarySummary() {
+  const el = document.getElementById('prof-loading-summary'); if (!el) return;
+  const id = el.getAttribute('data-exercise'); if (!id) return;
+  el.textContent = elSummaryText(id);
+}
+if (typeof elSubscribe === 'function') { elSubscribe(lcRefreshLibrarySummary); eqSubscribe(lcRefreshLibrarySummary); }

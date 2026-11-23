@@ -90,6 +90,8 @@
       // Ending a Program, or setting a Training Max: in flight or unconfirmed.
       if (typeof planRunEndStateByRunId !== 'undefined' && anyPhase(planRunEndStateByRunId, ['pending', 'uncertain', 'uncertainDismissed'])) return 'saving';
       if (typeof planRunTmAttemptByKey !== 'undefined' && anyPhase(planRunTmAttemptByKey, ['pending', 'uncertain'])) return 'saving';
+      // Account equipment / exercise loading settings: a save on its way, or unsaved settings.
+      if (typeof lcState !== 'undefined' && lcState && (lcState.busy || (lcState.drafts && lcState.drafts.exLoading && lcState.drafts.exLoading.dirty))) return lcState.busy ? 'saving' : 'dialog';
       // Any open dialog: the confirmation dialog, modal windows, prompts.
       if (document.querySelector('#confirm-overlay.open, .modal-overlay.open, #tm-prompt-overlay.open')) return 'dialog';
       // Any database write still on its way.

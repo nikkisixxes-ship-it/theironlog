@@ -1282,8 +1282,13 @@ async function collDeleteCustomExerciseWithDisclosure(exId, callbacks, attempt) 
 // disclosure for the actual writes -- only the freshly re-read documents.
 async function collRunCustomExerciseDeletion(exId, disclosure, callbacks) {
   let result;
+  const ownerUid = auth.currentUser && auth.currentUser.uid;
   try {
     result = await fsDb.runTransaction(async (tx) => {
+      // STAGE 3: the exercise's loading settings (and the equipment listing it)
+      // are removed in this same transaction. Read first: Firestore needs every
+      // read before the first write.
+      const loadingPlan = (typeof elPrepareExerciseDeletion === 'function' && ownerUid) ? await elPrepareExerciseDeletion(tx, ownerUid, exId) : null;
       const memberRef = COL_EX_COLLECTION_MEMBERSHIP.doc(exId);
       const memberSnap = await tx.get(memberRef); // 1. deleted-Exercise membership doc, fresh
       const liveMemberOfCollectionIds = memberSnap.exists
@@ -1402,6 +1407,7 @@ async function collRunCustomExerciseDeletion(exId, disclosure, callbacks) {
       });
 
       tx.delete(COL_CUSTOM_EX.doc(exId));
+      if (loadingPlan) elApplyExerciseDeletion(tx, ownerUid, loadingPlan);
       collectionWrites.forEach(w => tx.set(COL_EX_COLLECTIONS.doc(w.id), w.payload));
       collApplyMembershipWrites(tx, displayWrites);
       // The Exercise no longer exists, so its membership-index document is

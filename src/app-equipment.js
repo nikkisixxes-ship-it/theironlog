@@ -113,6 +113,7 @@ function eqParseListText(t) {
   return out.length >= 1 && out.length <= LC_MAX_SETTINGS ? out.sort((a, b) => a - b) : null; }
 const eqWeightOk = (w, positive) => typeof w === 'number' && isFinite(w) && w >= 0 && w <= 100000 && (!positive || w > 0) && eqThreeDp(w);
 const eqW = w => lcToM(w) / 1000;    // the exact 3-decimal value
+const eqTrueMapOk = m => !!m && typeof m === 'object' && !Array.isArray(m) && Object.keys(m).length <= 500 && Object.values(m).every(v => v === true);
 // Names: the editor saves 1-40 characters (trimmed); reading accepts anything
 // the rules accept (1-40 characters however counted), so nothing becomes unreadable.
 const eqNameOk = n => typeof n === 'string' && n.length >= 1 && n.length <= 80;
@@ -125,7 +126,9 @@ function eqInventoryFromDoc(id, d) {
 function eqProfileFromDoc(id, d) {
   if (!d || typeof d !== 'object') return { ok: false, reason: 'not a document' };
   if (d.id !== id || !eqNameOk(d.name) || (d.unit !== 'lb' && d.unit !== 'kg') || !Number.isInteger(d.revision) || d.revision < 1) return { ok: false, reason: 'name, unit, id or revision' };
-  const base = { id, name: d.name, type: d.type, unit: d.unit, revision: d.revision, copyKey: d.copyKey || null };
+  // Stage 3: exercises whose loading settings link here (exerciseId -> true). Optional; absent = none.
+  if ('usedByExercises' in d && !eqTrueMapOk(d.usedByExercises)) return { ok: false, reason: 'exercise references' };
+  const base = { id, name: d.name, type: d.type, unit: d.unit, revision: d.revision, copyKey: d.copyKey || null, exerciseUsers: Object.assign({}, d.usedByExercises || {}) };
   if (d.type === 'plate') {
     if (!eqWeightOk(d.startWeight) || typeof d.inventoryId !== 'string' || !d.inventoryId || (d.targetMode !== 'total' && d.targetMode !== 'perDumbbell')) return { ok: false, reason: 'plate settings' };
     return { ok: true, value: Object.assign(base, { startWeight: eqW(d.startWeight), inventoryId: d.inventoryId, targetMode: d.targetMode }) }; }
@@ -210,11 +213,15 @@ async function eqSaveProfile(model, base) {
     const newInvRef = model.type === 'plate' ? eqCol(EQ_COL_INVENTORIES).doc(model.inventoryId) : null;
     const oldInvRef = oldInvId && (!newInvRef || oldInvId !== model.inventoryId) ? eqCol(EQ_COL_INVENTORIES).doc(oldInvId) : null;
     const newInv = newInvRef ? await tx.get(newInvRef) : null, oldInv = oldInvRef ? await tx.get(oldInvRef) : null;
-    let revision = 1, createdAt = eqServerTime(), copyKey = null;
+    let revision = 1, createdAt = eqServerTime(), copyKey = null, exUsers;
     if (base) {
       if (!snap.exists) throw eqError('deleted', 'This equipment was deleted on another device. Your edits are still here.');
-      const cur = snap.data(); copyKey = cur.copyKey || null;
-      if (cur.revision !== base.revision) throw eqError('conflict', 'This equipment was changed on another device. Your edits are still here.', { latest: cur });
+      const cur = snap.data(); copyKey = cur.copyKey || null; exUsers = cur.usedByExercises;
+      // A newer revision whose settings still equal what the editor started from
+      // only changed references (an exercise linked or unlinked): safe to apply.
+      const curModel = eqProfileFromDoc(id, cur);
+      if (cur.revision !== base.revision && !(cur.revision > base.revision && curModel.ok && eqSame(eqProfileFields(curModel.value), eqProfileFields(base))))
+        throw eqError('conflict', 'This equipment was changed on another device. Your edits are still here.', { latest: cur });
       revision = cur.revision + 1; createdAt = cur.createdAt;
     } else if (snap.exists) throw eqError('exists', 'That equipment already exists.');
     if (newInvRef) {
@@ -223,6 +230,7 @@ async function eqSaveProfile(model, base) {
     }
     const doc = Object.assign({ id, ownerUid: uid }, eqProfileFields(model), { revision, createdAt, updatedAt: eqServerTime() });
     if (copyKey) doc.copyKey = copyKey;
+    if (exUsers !== undefined) doc.usedByExercises = exUsers;   // never dropped: exercise links stay intact
     tx.set(ref, doc);
     if (newInvRef) { const d = newInv.data(); if (!(d.usedBy || {})[id]) tx.set(newInvRef, Object.assign({}, d, { usedBy: Object.assign({}, d.usedBy, { [id]: true }), revision: d.revision + 1, updatedAt: eqServerTime() })); }
     if (oldInvRef && oldInv.exists) { const d = oldInv.data(); if ((d.usedBy || {})[id]) { const u = Object.assign({}, d.usedBy); delete u[id]; tx.set(oldInvRef, Object.assign({}, d, { usedBy: u, revision: d.revision + 1, updatedAt: eqServerTime() })); } }
@@ -233,6 +241,8 @@ async function eqDeleteProfile(id, base) {
     const ref = eqCol(EQ_COL_PROFILES).doc(id); const snap = await tx.get(ref);
     if (!snap.exists) return 'gone';
     const cur = snap.data();
+    const exUsers = Object.keys(cur.usedByExercises || {});
+    if (exUsers.length) throw eqError('inUseByExercises', 'Exercises use this equipment in their loading settings. Reassign or unlink them first.', { exercises: exUsers });
     if (base && cur.revision !== base.revision) throw eqError('conflict', 'This equipment was changed on another device. Review it before deleting.');
     const invRef = cur.type === 'plate' ? eqCol(EQ_COL_INVENTORIES).doc(cur.inventoryId) : null; const inv = invRef ? await tx.get(invRef) : null;
     tx.delete(ref);

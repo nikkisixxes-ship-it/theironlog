@@ -2159,6 +2159,13 @@ input[type=number]::-webkit-outer-spin-button, input[type=number]::-webkit-inner
   .modal-overlay.lc-top { align-items: flex-start; padding-top: calc(env(safe-area-inset-top, 0px) + 12px); }
   .modal-overlay.lc-top .modal { width: calc(100% - 16px); border-radius: var(--radius); max-height: calc(100% - 24px); padding-bottom: 20px; }
 }
+/* Stage 3: Loading Settings opens over an exercise's LIBRARY profile (210) and
+   edit dialogs (220); the confirmation dialog (300) still sits above it. */
+#modal-load-calc { z-index: 230; }
+#lc-body .lc-row2 { display: flex; gap: 10px; }
+#lc-body .lc-row2 > .form-group { flex: 1; min-width: 0; }
+#lc-body .el-note { margin: -4px 0 14px; }
+#lc-body .lc-ctx-title { font-size: 17px; margin-bottom: 4px; }
 #modal-load-calc .modal-header { margin-bottom: 14px; }
 #lc-back-btn { font-size: 22px; line-height: 1; }
 /* Larger ‹ and ✕ symbols in the Load Calculator / Equipment header. Only the

@@ -302,6 +302,8 @@ auth.onAuthStateChanged(async user => {
   // STAGE 2 ACCOUNT EQUIPMENT: forget the previous owner's equipment, close
   // the Load Calculator and its drafts, before anything of the new session runs.
   if (typeof eqResetForOwner === 'function') eqResetForOwner(user ? user.uid : null);
+  // STAGE 3: the same for exercise loading settings (the editor lives in the calculator dialog, closed just below).
+  if (typeof elResetForOwner === 'function') elResetForOwner(user ? user.uid : null);
   if (typeof lcResetForOwner === 'function') lcResetForOwner();
   // Every auth transition (sign-in, sign-out, user switch) unsubscribes all
   // previously-attached listeners immediately -- not only via the manual Sign Out
@@ -2066,8 +2068,8 @@ function openLogHeaderMenu(e) {
     ...(workoutTimeEditAvailable() ? [{ label: 'Edit Workout Time', icon: '⏱', action: 'openEditWorkoutTimeModal()' }] : []),
     // REST TIMER (app-rest-timer.js); live workouts only, never HISTORY edits.
     ...(currentWorkout && !currentWorkout._isEdit ? [{ label: 'Rest Timer', icon: '◷', action: 'openRestTimerDialog()' }] : []),
-    // LOAD CALCULATOR: standalone tool (app-load-calc.js); live workouts only.
-    ...(currentWorkout && !currentWorkout._isEdit ? [{ label: 'Load Calculator', icon: '▦', action: 'openLoadCalculator()' }] : []),
+    // LOAD CALCULATOR: no longer here (Stage 3 r2). It opens from each exercise's own
+    // ••• menu, for that exercise (openExerciseMenu); live workouts only.
     { label: 'RPE',              icon: '',  action: 'toggleRPEFromMenu()', toggle: currentWorkout?.rpeEnabled ? '✓ ' : '' },
     { divider: true },
     { label: 'Cancel Workout', icon: '✕', action: 'cancelWorkout()', danger: true },
@@ -2164,6 +2166,13 @@ function openExerciseMenu(e, idx) {
     ...(planRunPendingReplacementForRow(idx) && planRunSeriesForRow(idx) ? [
       { label: 'Edit Run Replacement Value', icon: '✎', action: `planRunEditPendingReplacement(${idx})` },
       { label: 'Cancel Run Replacement', icon: '↺', action: `planRunCancelPendingReplacement(${idx})` }
+    ] : []),
+    // STAGE 3: this exercise's lasting loading settings, and the Load Calculator
+    // opened for THIS exercise (its linked equipment pre-selected). Neither
+    // changes this workout.
+    ...(ex && ex.exerciseId ? [
+      { label: 'Loading Settings', icon: '⚙', action: `openExerciseLoadingSettingsForRow(${idx})` },
+      ...(!currentWorkout._isEdit ? [{ label: 'Load Calculator', icon: '▦', action: `openLoadCalculatorForRow(${idx})` }] : [])
     ] : []),
     { divider: true }, { label: 'Delete Exercise', icon: '✕', action: `deleteExercise(${idx})`, danger: true },
   ];

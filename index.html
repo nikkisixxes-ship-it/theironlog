@@ -6,16 +6,16 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <title>IRON LOG</title>
-<meta name="ironlog-build" content="2026-11-21e">
+<meta name="ironlog-build" content="2026-11-22c">
 <script>window.__ironlogPreviewFeatures = { failureRecommendations: true };</script>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Barlow:wght@300;400;500;600&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="releases/2026-11-21e/styles.css">
+<link rel="stylesheet" href="releases/2026-11-22c/styles.css">
 <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
 <!-- Chart.js for E1RM progress graph -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<script src="releases/2026-11-21e/app-update.js"></script>
+<script src="releases/2026-11-22c/app-update.js"></script>
 </head>
 <body>
 
@@ -369,7 +369,7 @@
         <button class="btn-icon" id="lc-back-btn" aria-label="Back" onclick="lcBack()" style="display:none"><span class="lc-hdr-sym" aria-hidden="true">‹</span></button>
         <div class="modal-title" id="lc-title">Load Calculator</div>
       </div>
-      <button class="btn-icon" id="lc-close-btn" aria-label="Close" onclick="closeLoadCalculator()"><span class="lc-hdr-sym" aria-hidden="true">✕</span></button>
+      <button class="btn-icon" id="lc-close-btn" aria-label="Close" onclick="lcRequestClose()"><span class="lc-hdr-sym" aria-hidden="true">✕</span></button>
     </div>
     <div id="lc-body"></div>
   </div>
@@ -664,12 +664,12 @@
 <div id="toast"></div>
 
 <!-- Scripts — order matters: firebase -> data -> library -> core -->
-<script src="releases/2026-11-21e/firebase.js"></script>
-<script src="releases/2026-11-21e/app-data.js"></script>
-<script src="releases/2026-11-21e/app-library.js"></script>
-<script src="releases/2026-11-21e/app-collections.js"></script>
-<script src="releases/2026-11-21e/app-plan.js"></script>
-<script src="releases/2026-11-21e/firebase-plan-progression.js"></script>
+<script src="releases/2026-11-22c/firebase.js"></script>
+<script src="releases/2026-11-22c/app-data.js"></script>
+<script src="releases/2026-11-22c/app-library.js"></script>
+<script src="releases/2026-11-22c/app-collections.js"></script>
+<script src="releases/2026-11-22c/app-plan.js"></script>
+<script src="releases/2026-11-22c/firebase-plan-progression.js"></script>
 <!-- SLICE 1 ADDITION -- canonical Program-Run persistence + UI.
      ROUND 5 CORRECTION: this comment previously said
      "CANONICAL_PLAN_RUN_CAPABILITY_ENABLED is hardcoded false in
@@ -680,11 +680,11 @@
      supplemental-set deployment, a confirmed baseline fact for this round,
      not a new finding), so loading these scripts DOES change what a real
      user sees today. -->
-<script src="releases/2026-11-21e/plan-run-model.js"></script>
-<script src="releases/2026-11-21e/plan-run-failure-model.js"></script>
-<script src="releases/2026-11-21e/firebase-plan-run.js"></script>
-<script src="releases/2026-11-21e/app-plan-run-ui.js"></script>
-<script src="releases/2026-11-21e/app-plan-run-start-ui.js"></script>
+<script src="releases/2026-11-22c/plan-run-model.js"></script>
+<script src="releases/2026-11-22c/plan-run-failure-model.js"></script>
+<script src="releases/2026-11-22c/firebase-plan-run.js"></script>
+<script src="releases/2026-11-22c/app-plan-run-ui.js"></script>
+<script src="releases/2026-11-22c/app-plan-run-start-ui.js"></script>
 <!-- OPTIONAL PROGRESSION STARTING VALUES ROUND 6 CORRECTION ADDITION -- the
      "Needs Attention" (unresolved training-max) surface (see this file's
      own header). ROUND 5 CORRECTION: this previously said loading it
@@ -694,15 +694,15 @@
      been enabled since Stage 6, so this DOES change what a real user sees
      today. VISUAL-ALIGNMENT CORRECTION: this file is now the contextual
      Training Max prompt (#modal-planrun-tm), not a TRAIN section. -->
-<script src="releases/2026-11-21e/app-plan-run-training-max-ui.js"></script>
+<script src="releases/2026-11-22c/app-plan-run-training-max-ui.js"></script>
 <!-- LOGGER-FINISH SLICE ADDITION -- Run-aware real logger launch + Finish
      (see this file's own header). ROUND 5 CORRECTION: this previously said
      loading it "changes nothing a real user sees until CANONICAL_PLAN_RUN_
      CAPABILITY_ENABLED is separately, explicitly activated" -- stale/
      wrong, same correction as above: the capability has been enabled since
      Stage 6, so this DOES change what a real user sees today. -->
-<script src="releases/2026-11-21e/app-plan-run-logger-ui.js"></script>
-<script src="releases/2026-11-21e/app-plan-run-failure-ui.js"></script>
+<script src="releases/2026-11-22c/app-plan-run-logger-ui.js"></script>
+<script src="releases/2026-11-22c/app-plan-run-failure-ui.js"></script>
 <!-- END RUN SLICE ADDITION -- the End Run control on the active-Run card
      (see this file's own header). ROUND 5 CORRECTION: this previously said
      loading it "changes nothing a real user sees until CANONICAL_PLAN_RUN_
@@ -710,11 +710,12 @@
      wrong, same correction as the script-tag comments above: the
      capability has been enabled since Stage 6, so this DOES change what a
      real user sees today. -->
-<script src="releases/2026-11-21e/app-plan-run-end-ui.js"></script>
-<script src="releases/2026-11-21e/app-core.js"></script>
-<script src="releases/2026-11-21e/load-solver.js"></script>
-<script src="releases/2026-11-21e/app-equipment.js"></script>
-<script src="releases/2026-11-21e/app-load-calc.js"></script>
-<script src="releases/2026-11-21e/app-rest-timer.js"></script>
+<script src="releases/2026-11-22c/app-plan-run-end-ui.js"></script>
+<script src="releases/2026-11-22c/app-core.js"></script>
+<script src="releases/2026-11-22c/load-solver.js"></script>
+<script src="releases/2026-11-22c/app-equipment.js"></script>
+<script src="releases/2026-11-22c/app-exercise-loading.js"></script>
+<script src="releases/2026-11-22c/app-load-calc.js"></script>
+<script src="releases/2026-11-22c/app-rest-timer.js"></script>
 </body>
 </html>
